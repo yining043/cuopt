@@ -55,12 +55,12 @@ static void init_handler(const raft::handle_t* handle_ptr)
     handle_ptr->get_cusparse_handle(), CUSPARSE_POINTER_MODE_DEVICE, handle_ptr->get_stream()));
 }
 
-static void setup_device_symbols()
+static void setup_device_symbols(rmm::cuda_stream_view stream_view)
 {
   raft::common::nvtx::range fun_scope("Setting device symbol");
-  detail::set_adaptive_step_size_hyper_parameters();
-  detail::set_restart_hyper_parameters();
-  detail::set_pdlp_hyper_parameters();
+  detail::set_adaptive_step_size_hyper_parameters(stream_view);
+  detail::set_restart_hyper_parameters(stream_view);
+  detail::set_pdlp_hyper_parameters(stream_view);
 }
 
 template <typename i_t, typename f_t>
@@ -136,16 +136,6 @@ mip_solution_t<i_t, f_t> run_mip(detail::problem_t<i_t, f_t>& problem,
       "please provide a more numerically stable problem.");
   }
 
-  // If the trivial presolve fully reduced the problem:
-  if (scaled_problem.empty) {
-    detail::solution_t<i_t, f_t> fixed_assignment_solution(problem);
-    if (fixed_assignment_solution.compute_feasibility()) {
-      solver.get_solver_stats().solution_bound = scaled_sol.get_user_objective();
-    } else {
-      scaled_sol.set_problem_infeasible();
-    }
-  }
-
   auto sol = scaled_sol.get_solution(is_feasible_before_scaling || is_feasible_after_unscaling,
                                      solver.get_solver_stats());
   detail::print_solution(scaled_problem.handle_ptr, sol.get_solution());
@@ -159,9 +149,6 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
   try {
     // Create log stream for file logging and add it to default logger
     init_logger_t log(settings.log_file, settings.log_to_console);
-#if CUOPT_LOG_ACTIVE_LEVEL >= RAPIDS_LOGGER_LOG_LEVEL_INFO
-    cuopt::default_logger().set_pattern("%v");
-#endif
     // Init libraies before to not include it in solve time
     // This needs to be called before pdlp is initialized
     init_handler(op_problem.get_handle_ptr());
@@ -176,7 +163,7 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
     detail::problem_t<i_t, f_t> problem(op_problem);
 
     // this is for PDLP, i think this should be part of pdlp solver
-    setup_device_symbols();
+    setup_device_symbols(op_problem.get_handle_ptr()->get_stream());
 
     auto sol = run_mip(problem, settings);
 
@@ -189,6 +176,11 @@ mip_solution_t<i_t, f_t> solve_mip(optimization_problem_t<i_t, f_t>& op_problem,
   } catch (const cuopt::logic_error& e) {
     CUOPT_LOG_ERROR("Error in solve_mip: %s", e.what());
     return mip_solution_t<i_t, f_t>{e, op_problem.get_handle_ptr()->get_stream()};
+  } catch (const std::bad_alloc& e) {
+    CUOPT_LOG_ERROR("Error in solve_mip: %s", e.what());
+    return mip_solution_t<i_t, f_t>{
+      cuopt::logic_error("Memory allocation failed", cuopt::error_type_t::RuntimeError),
+      op_problem.get_handle_ptr()->get_stream()};
   }
 }
 
