@@ -1,5 +1,7 @@
 # cuOpt - GPU accelerated Optimization Engine
 
+[![Build Status](https://github.com/NVIDIA/cuopt/actions/workflows/build.yaml/badge.svg)](https://github.com/NVIDIA/cuopt/actions/workflows/build.yaml)
+
 NVIDIA® cuOpt™ is a GPU-accelerated optimization engine that excels in mixed integer programming (MIP), linear programming (LP), and vehicle routing problems (VRP). It enables near real-time solutions for large-scale challenges with millions of variables and constraints, offering easy integration into existing solvers and seamless deployment across hybrid and multi-cloud environments.
 
 For the latest stable version ensure you are on the `main` branch.
@@ -17,6 +19,7 @@ Review the [CONTRIBUTING.md](CONTRIBUTING.md) file for information on how to con
 - [cuopt (Python) documentation](https://docs.nvidia.com/cuopt/user-guide/latest/introduction.html)
 - [libcuopt (C++/CUDA) documentation](https://docs.nvidia.com/cuopt/user-guide/latest/introduction.html)
 - [Examples and Notebooks](https://github.com/NVIDIA/cuopt-examples)
+- [Test cuopt with Brev](https://brev.nvidia.com/launchable/deploy?launchableID=env-2qIG6yjGKDtdMSjXHcuZX12mDNJ): Examples notebooks are pulled and hosted on [Brev](https://docs.nvidia.com/brev/latest/).
 
 ## Installation
 
