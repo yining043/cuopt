@@ -71,17 +71,29 @@ for a minimal build of NVIDIA cuOpt without using conda are also listed below.
 
 Compilers:
 
-* `gcc` version 11.4+
-* `nvcc` version 11.8+
-* `cmake` version 3.29.6+
+These will be installed while creating the Conda environment
+
+* `gcc` version 13.0+
+* `nvcc` version 12.8+
+* `cmake` version 3.30.4+
 
 CUDA/GPU Runtime:
 
-* CUDA 11.4+
+* CUDA 12.8
 * Volta architecture or better ([Compute Capability](https://docs.nvidia.com/deploy/cuda-compatibility/) >=7.0)
 
-You can obtain CUDA from
-[https://developer.nvidia.com/cuda-downloads](https://developer.nvidia.com/cuda-downloads).
+Python:
+
+* Python >=3.10.x, <= 3.12.x
+
+OS:
+
+* Only Linux is supported
+
+Architecture:
+
+* x86_64 (64-bit)
+* aarch64 (64-bit)
 
 ### Build NVIDIA cuOpt from source
 
@@ -219,6 +231,12 @@ set_source_files_properties(src/routing/data_model_view.cu PROPERTIES COMPILE_OP
 This will add the device debug symbols for this object file in `libcuopt.so`.  You can then use
 `cuda-dbg` to debug into the kernels in that source file.
 
+## Adding dependencies
+
+Please refer to the [dependencies.yaml](dependencies.yaml) file for details on how to add new dependencies.
+Add any new dependencies in the `dependencies.yaml` file. It takes care of conda, requirements (pip based dependencies) and pyproject. 
+Please don't try to add dependencies directly to environment.yaml files under `conda/environments` directory and pyproject.toml files under `python` directories.
+
 ## Code Formatting
 
 ### Using pre-commit hooks
@@ -303,6 +321,5 @@ You can skip these checks with `git commit --no-verify` or with the short versio
 
     (d) I understand and agree that this project and the contribution are public and that a record of the contribution (including all personal information I submit with it, including my sign-off) is maintained indefinitely and may be redistributed consistent with this project or the open source license(s) involved.
   ```
-
   
 
