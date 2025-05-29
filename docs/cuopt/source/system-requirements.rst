@@ -2,6 +2,8 @@
 System Requirements
 ===================
 
+Dependencies are installed automatically when using the pip and Conda installation methods. However, users would still need to make sure the system meets the minimum requirements.
+
 .. dropdown:: Minimum Requirements
 
    * System Architecture:
@@ -23,9 +25,13 @@ System Requirements
    * CUDA:
       - 12.0+
 
+   * Python:
+      - >= 3.10.* and <= 3.12.*
+
    * NVIDIA drivers:
-      - 525.60.13+ (linux)
-      - 527.41+ (windows)
+      - 525.60.13+ (Linux)
+      - 527.41+ (Windows)
+
    * OS:
       - Linux distributions with glibc>=2.28 (released in August 2018):
          * Arch Linux (minimum version 2018-08-02)
@@ -91,4 +97,4 @@ Thin-client for Self-Hosted
    - x86-64
    - ARM64
 
-* Python > 3.10.x
+* Python >= 3.10.x <= 3.12.x

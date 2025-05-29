@@ -11,7 +11,6 @@ General FAQ
     - NVIDIA docker hub (https://hub.docker.com/r/nvidia/)
     - NVIDIA NGC registry (https://catalog.ngc.nvidia.com/orgs/nvidia/teams/cuopt/containers/cuopt/tags) with NVAIE license.
 
-
 .. dropdown:: How to get a NVAIE license?
 
     Please refer to `NVIDIA NVAIE <https://www.nvidia.com/en-us/technologies/ai-enterprise/nvaie/>`_ for more information.
@@ -44,14 +43,13 @@ General FAQ
 
         docker pull <COPIED_IMAGE_TAG>
 
-
 .. dropdown:: Do I need a GPU to use cuOpt?
 
     Yes, please refer to `system requirements <system-requirements.html>`_ for GPU specifications. You can acquire a cloud instance with a supported GPU and launch cuOpt; alternatively, you can launch it in your local machine if it meets the requirements.
 
-.. dropdown:: Does cuOpt use multiple GPUs?
+.. dropdown:: Does cuOpt use multiple GPUs/multi-GPUs/multi GPUs?
 
-    #. Yes, in cuOpt self-hosted server, a solver process per GPU can be configured to run multiple solvers. Requests are accepted in a round-robin queue. More details are available in `server api <cuopt-server/server-api.html>`_.
+    #. Yes, in cuOpt self-hosted server, a solver process per GPU can be configured to run multiple solvers. Requests are accepted in a round-robin queue. More details are available in `server api <cuopt-server/server-api/server-cli.html>`_.
     #. There is no support for leveraging multiple GPUs to solve a single problem or oversubscribing a single GPU for multiple solvers.
 
 .. dropdown:: The cuOpt Service is not starting: Issue with port?
@@ -83,6 +81,19 @@ General FAQ
 
    #. The complete round-trip solve time might be more than what was set.
 
+.. dropdown:: Why am I getting "libcuopt.so: cannot open shared object file: No such file or directory" error?
+
+   This error indicates that the cuOpt shared library is not found. Please check the following:
+
+   - The cuOpt is installed 
+   - Use ``find / -name libcuopt.so`` to search for the library path from root directory. You might need to run this command as root user.
+   - If the library is found, please add it to the ``LD_LIBRARY_PATH`` environment variable as shown below:
+
+   .. code-block:: bash
+
+       export LD_LIBRARY_PATH=/path/to/cuopt/lib:$LD_LIBRARY_PATH
+
+   - If the library is not found, it means it is not yet installed. Please check the cuOpt installation guide for more details.
 
 .. dropdown:: Is there a way to make cuOpt also account for other overheads in the same time limit provided?
 
