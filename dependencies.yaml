@@ -473,7 +473,7 @@ dependencies:
     common:
       - output_types: conda
         packages:
-          - &cuopt_server_unsuffixed cuopt-server==25.8.*,>=0.0.0a0
+          - &cuopt_server_unsuffixed cuopt-server==25.10.*,>=0.0.0a0
       - output_types: requirements
         packages:
           # pip recognizes the index as a global option for the requirements.txt file
@@ -486,13 +486,13 @@ dependencies:
               cuda: "12.*"
               cuda_suffixed: "true"
             packages:
-              - cuopt-server-cu12==25.8.*,>=0.0.0a0
+              - cuopt-server-cu12==25.10.*,>=0.0.0a0
           - {matrix: null, packages: [*cuopt_server_unsuffixed]}
   depends_on_cuopt_sh_client:
     common:
       - output_types: [conda, requirements, pyproject]
         packages:
-          - &cuopt_sh_client_unsuffixed cuopt-sh-client==25.8.*,>=0.0.0a0
+          - &cuopt_sh_client_unsuffixed cuopt-sh-client==25.10.*,>=0.0.0a0
       - output_types: requirements
         packages:
           # pip recognizes the index as a global option for the requirements.txt file
