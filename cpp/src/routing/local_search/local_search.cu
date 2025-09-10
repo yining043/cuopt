@@ -150,7 +150,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
                                                         bool full_set)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
-
   std::vector<fast_operators_t> fast_operators{fast_operators_t::SLIDING, fast_operators_t::CROSS};
   if (!sol.problem_ptr->fleet_info.is_homogenous_ && !sol.problem_ptr->has_non_uniform_breaks()) {
     fast_operators.push_back(fast_operators_t::REGRET);
@@ -192,6 +191,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
                                                         bool full_set)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
+  // printf("run_fast_search\n");
+  // full_set = true; // for debug, always use full set
 
   std::vector<fast_operators_t> fast_operators{fast_operators_t::SLIDING};
 
@@ -212,14 +213,21 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     sol.set_routes_to_search();
     extract_nodes_to_search(sol, move_candidates);
   }
-  if (!nodes_to_search.sample_nodes_to_search(sol, rng, full_set)) { return false; }
+  if (!nodes_to_search.sample_nodes_to_search(sol, rng, full_set)) { 
+    printf("No nodes to search, returning False\n");
+    return false; 
+  }
 
   bool move_found = false;
 
   for (auto const& op : fast_operators) {
     switch (op) {
       case fast_operators_t::SLIDING: {
+        printf("perform_sliding_search ");
+        f_t cost_before = sol.get_cost(true, move_candidates.weights);
         move_found = run_sliding_search(sol) || move_found;
+        f_t cost_after = sol.get_cost(true, move_candidates.weights);
+        printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
         break;
       }
       case fast_operators_t::VRP: {
@@ -227,13 +235,21 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         break;
       }
       case fast_operators_t::REGRET: {
+        printf("perform_vehicle_assignment ");
+        f_t cost_before = sol.get_cost(true, move_candidates.weights);
         move_found =
           run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
           move_found;
+        f_t cost_after = sol.get_cost(true, move_candidates.weights);
+        printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
         break;
       }
       case fast_operators_t::TWO_OPT: {
+        printf("perform_two_opt_search ");
+        f_t cost_before = sol.get_cost(true, move_candidates.weights);
         move_found = run_two_opt_search(sol) || move_found;
+        f_t cost_after = sol.get_cost(true, move_candidates.weights);
+        printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
         break;
       }
       case fast_operators_t::CROSS: {
@@ -241,11 +257,17 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       }
     }
   }
-
-  move_candidates.nodes_to_search.restore_found_nodes(sol);
-  if (full_set) { return move_found; }
+  i_t n_nodes_to_search_before = nodes_to_search.h_nodes_to_search.size();
+  move_candidates.nodes_to_search.restore_found_nodes(sol); //!!!!!!!!!!!!!!
+  i_t n_nodes_to_search_after = nodes_to_search.h_nodes_to_search.size();
+  printf("n_nodes_to_search_before: %d, n_nodes_to_search_after: %d\n", n_nodes_to_search_before, n_nodes_to_search_after);
+  if (full_set) { return move_found; 
+  printf("full_set: %d, final move_found: %d\n", full_set, move_found);
+  }
+  printf("full_set: %d, final move_found: 1 [forced]\n", full_set);
   return true;
 }
+
 
 template <typename i_t, typename f_t, request_t REQUEST>
 void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
@@ -253,6 +275,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                                                               const bool time_limit_enabled,
                                                               const bool run_cycle_finder)
 {
+  printf("run_best_local_search\n");
   // Handle a corner case when there is no single task that is feasible
   if (sol.n_routes == 0) { return; }
   // for production use working weights
@@ -280,17 +303,25 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
     while (true) {
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
+      printf("run_best_local_search iter %d\n", iter);
       if (run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2)) { continue; }
+      // printf("check if %d\n", consider_unserviced && sol.problem_ptr->has_prize_collection());
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;
       }
+      // printf("check if %d\n", !sol.problem_ptr->special_nodes.is_empty());
       if (!sol.problem_ptr->special_nodes.is_empty() && perform_break_moves(sol)) { continue; }
+      printf("ends fast loop\n");
       break;
     }
 
     sol.global_runtime_checks(
       should_all_nodes_be_served, false, "run_best_local_search_after_fast_search");
+    
+    // added
+    printf("perform_cyclefinder_search ");
+    f_t cost_cycle_before = sol.get_cost(true, move_candidates.weights);
 
     if (!run_cycle_finder || (sol.n_routes > 1023)) { break; }
     // cycle finder is needed even for single route in PDP cases
@@ -311,7 +342,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
     populate_move_path(sol, move_candidates);
 
     bool improved = move_candidates.move_path.n_insertions.value(sol.sol_handle->get_stream()) != 0;
-
+    // improved = false; // disable cyclefinder for now
     if (improved) {
       // printf("cycle found\n");
       sol.unset_routes_to_search();
@@ -326,11 +357,14 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                    "Cost mismatch after a move");
       sol.sol_handle->sync_stream();
     }
+    f_t cost_cycle_after = sol.get_cost(true, move_candidates.weights);
+    printf("cost before: %f, cost after: %f, move_found: %d\n", cost_cycle_before, cost_cycle_after, improved);
 
     // If there is no improvement at all, break the local search loop
     bool time_limit_reached =
       (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit());
     if (time_limit_reached || !improved) {
+      printf("No more moves found, breaking local search loop\n");
       cuopt_func_call(sol.check_cost_coherence(move_candidates.weights));
       break;
     }

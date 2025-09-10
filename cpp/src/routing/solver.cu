@@ -67,7 +67,7 @@ solver_t<i_t, f_t>::solver_t(data_model_view_t<i_t, f_t> const& data_model,
 template <typename i_t, typename f_t>
 assignment_t<i_t> solver_t<i_t, f_t>::solve()
 {
-  if (settings_.dump_best_results_) { best_result_file_.open(settings_.best_result_file_name_); }
+  // if (settings_.dump_best_results_) { best_result_file_.open(settings_.best_result_file_name_); }
   if (settings_.time_limit_ == std::numeric_limits<f_t>::max()) {
     // order_info_ is populated in ges_solver_t constructor, so use data_model here
     settings_.time_limit_ = data_view_ptr_->get_num_orders() / 5;

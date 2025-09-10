@@ -652,6 +652,7 @@ __global__ void find_insertions_kernel(typename solution_t<i_t, f_t, REQUEST>::v
                                        typename move_candidates_t<i_t, f_t>::view_t move_candidates,
                                        int64_t seed)
 {
+
   extern __shared__ i_t shmem[];
 
   i_t route_idx;
@@ -845,7 +846,7 @@ void find_insertions(solution_t<i_t, f_t, REQUEST>& sol,
   } else {
     // for cross the load-balance factor is always 4
     move_candidates.number_of_blocks_per_ls_route =
-      std::max(1, sol.get_max_active_nodes_for_all_routes() / 4);
+      max(1, sol.get_max_active_nodes_for_all_routes() / 4);
     if (search_type == search_type_t::CROSS) {
       n_blocks =
         move_candidates.number_of_blocks_per_ls_route * sol.get_n_routes() + sol.get_num_requests();

@@ -117,7 +117,7 @@ bool nodes_to_search_t<i_t, f_t>::sample_nodes_for_recycle(
              move_candidates.vrp_move_candidates.best_id_per_node.data(),
              h_best_id_per_node.size(),
              sol.sol_handle->get_stream());
-
+  
   h_recycled_node_pairs.clear();
   for (i_t i = 0; i < (i_t)h_best_id_per_node.size(); ++i) {
     if (h_best_id_per_node[i] != -1) {
@@ -139,16 +139,20 @@ bool nodes_to_search_t<i_t, f_t>::sample_nodes_to_search(
 {
   raft::common::nvtx::range fun_scope("sample_nodes_to_search");
   i_t curr_n_nodes_to_search = h_nodes_to_search.size();
+  printf("curr_n_nodes_to_search: %d\n", curr_n_nodes_to_search);
   if (curr_n_nodes_to_search == 0) return false;
   if (!full_set) {
     n_sampled_nodes = get_sample_size_vrp<i_t>(curr_n_nodes_to_search);
   } else {
     n_sampled_nodes = curr_n_nodes_to_search;
   }
+  // n_sampled_nodes = get_sample_size_vrp<i_t>(curr_n_nodes_to_search);
   cuopt_assert(n_sampled_nodes > 0, "There must be at least one operator!");
   cuopt_assert(curr_n_nodes_to_search > 0, "There must be at least one operator!");
-  n_sampled_nodes = std::min(n_sampled_nodes, curr_n_nodes_to_search);
+  n_sampled_nodes = min(n_sampled_nodes, curr_n_nodes_to_search);
   h_sampled_nodes.clear();
+  // ！！！！ random sample at most 40 nodes to search 
+  printf("sample %d nodes from %d nodes\n", n_sampled_nodes, curr_n_nodes_to_search);
   for (i_t i = 0; i < n_sampled_nodes; ++i) {
     std::uniform_int_distribution<i_t> rng_dist(0, h_nodes_to_search.size() - 1);
     i_t node_idx   = rng_dist(rng);
@@ -156,6 +160,7 @@ bool nodes_to_search_t<i_t, f_t>::sample_nodes_to_search(
     h_sampled_nodes.push_back(node_info);
     h_nodes_to_search.erase(h_nodes_to_search.begin() + node_idx);
   }
+  // end!!!
   sample_nodes_graph.start_capture(sol.sol_handle->get_stream());
   raft::copy(sampled_nodes_to_search.data(),
              h_sampled_nodes.data(),
@@ -168,7 +173,7 @@ bool nodes_to_search_t<i_t, f_t>::sample_nodes_to_search(
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-void extract_nodes_to_search(solution_t<i_t, f_t, REQUEST>& sol,
+void  extract_nodes_to_search(solution_t<i_t, f_t, REQUEST>& sol,
                              move_candidates_t<i_t, f_t>& move_candidates)
 {
   raft::common::nvtx::range fun_scope("extract_nodes_to_search");
@@ -186,6 +191,11 @@ void extract_nodes_to_search(solution_t<i_t, f_t, REQUEST>& sol,
              n_nodes_extracted,
              sol.sol_handle->get_stream());
   sol.sol_handle->sync_stream();
+  // print extracted_nodes
+  std::cout << "extracted nodes(size= " << nodes_to_search.h_nodes_to_search.size() << "): ";
+  for (const auto& node : nodes_to_search.h_nodes_to_search) {
+    std::cout << "(" << node.node() << "," << node.location() << ") ";
+  }
 }
 
 template bool nodes_to_search_t<int, float>::sample_nodes_for_recycle(

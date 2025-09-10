@@ -243,12 +243,10 @@ DI node_t<i_t, f_t, REQUEST> create_depot_node(const typename problem_t<i_t, f_t
       ? problem.fleet_info.latest_time[vehicle_id]
       : min(problem.order_info.latest_time[DEPOT], problem.fleet_info.latest_time[vehicle_id]);
 
-  node.time_dim.window_start              = earliest;
-  node.time_dim.window_end                = latest;
-  node.time_dim.departure_forward         = node.time_dim.window_start;
-  node.time_dim.departure_backward        = node.time_dim.window_end;
-  node.time_dim.latest_arrival_forward    = latest;
-  node.time_dim.earliest_arrival_backward = earliest;
+  node.time_dim.window_start       = earliest;
+  node.time_dim.window_end         = latest;
+  node.time_dim.departure_forward  = node.time_dim.window_start;
+  node.time_dim.departure_backward = node.time_dim.window_end;
 
   constexpr_for<node_t<i_t, f_t, REQUEST>::max_capacity_dim>([&](auto i) {
     if (i < node.capacity_dim.n_capacity_dimensions) { node.capacity_dim.demand[i] = 0; }
@@ -279,12 +277,10 @@ constexpr node_t<i_t, f_t, REQUEST> create_depot_node(const problem_t<i_t, f_t>*
                     : min(problem->order_info_h.latest_time[DEPOT],
                           problem->fleet_info_h.latest_time[vehicle_id]);
 
-  node.time_dim.window_start              = earliest;
-  node.time_dim.window_end                = latest;
-  node.time_dim.departure_forward         = node.time_dim.window_start;
-  node.time_dim.departure_backward        = node.time_dim.window_end;
-  node.time_dim.latest_arrival_forward    = latest;
-  node.time_dim.earliest_arrival_backward = earliest;
+  node.time_dim.window_start       = earliest;
+  node.time_dim.window_end         = latest;
+  node.time_dim.departure_forward  = node.time_dim.window_start;
+  node.time_dim.departure_backward = node.time_dim.window_end;
 
   constexpr_for<node_t<i_t, f_t, REQUEST>::max_capacity_dim>([&](auto i) {
     if (i < node.capacity_dim.n_capacity_dimensions) { node.capacity_dim.demand[i] = 0; }
@@ -316,6 +312,24 @@ DI node_t<i_t, f_t, REQUEST> create_break_node(
 
   node.request = request_info_t<i_t, REQUEST>(node_info, node_info);
   return node;
+}
+
+struct CostBreakdown {
+    double constraint_cost;
+    double obj_cost;
+    infeasible_cost_t constraint_weights;
+    objective_cost_t obj_weights;
+};
+
+template <typename VecT>
+void print_static_vec(const VecT& v, int N, const char* name=nullptr) {
+    if (name) printf("%s = [", name);
+    else      printf("[");
+    for (int i = 0; i < N; ++i) {
+        printf("%f", v[i]);
+        if (i + 1 < N) printf(", ");
+    }
+    printf("]\n");
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -353,7 +367,7 @@ class solution_t {
       max_active_nodes_for_all_routes(sol_handle_->get_stream()),
       temp_nodes(problem_.get_num_orders(), sol_handle_->get_stream()),
       temp_stack_counter(sol_handle_->get_stream()),
-      temp_int_vector(std::max(problem_.get_num_orders(), problem_.get_fleet_size()),
+      temp_int_vector(max(problem_.get_num_orders(), problem_.get_fleet_size()),
                       sol_handle_->get_stream())
   {
     raft::common::nvtx::range fun_scope("solution_t");
@@ -491,6 +505,7 @@ class solution_t {
   bool is_feasible() const;
   double get_total_cost(const infeasible_cost_t weights) const;
   double get_cost(const bool include_objective, const infeasible_cost_t weights) const;
+  CostBreakdown get_cost_breakdown(const infeasible_cost_t weights) const;
   objective_cost_t get_objective_cost() const;
   infeasible_cost_t get_infeasibility_cost() const;
   void check_cost_coherence(const infeasible_cost_t& weights);

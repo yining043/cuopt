@@ -77,13 +77,14 @@ struct population {
     // indices[0] always points to solutions[0] - a special place for feasible
     // solution
     indices.emplace_back(0, DBL_MAX);
-    // if (P_->solver_settings_ptr->dump_best_results_) {
-    //   auto curr     = P_->solver_settings_ptr->best_result_file_name_;
-    //   auto filename = curr.substr(0, curr.size() - 4) + "_" + name + ".csv";
-    //   result_file_.open(filename);
-    //   result_file_ <<
-    //   "elapsed_time,best_feasible,best_unfeasible_feasible\n";
-    // }
+    if (P_->solver_settings_ptr->dump_best_results_) {
+      auto curr     = P_->solver_settings_ptr->best_result_file_name_;
+      auto filename = curr.substr(0, curr.size() - 4) + 
+            "_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)) + ".csv";
+      result_file_.open(filename);
+      result_file_ <<
+      "elapsed_time,best_feasible,best_unfeasible_feasible\n";
+    }
 
     threshold = threshold_;
     RUNTIME_TEST(test_invariant());
@@ -137,7 +138,7 @@ struct population {
     return ret;
   }
 
-  void add_solutions_to_island(int elapsed_time, population& popupation_to_add)
+  void add_solutions_to_island(double elapsed_time, population& popupation_to_add)
   {
     for (size_t i = 0; i < indices.size(); ++i) {
       size_t index = indices[i].first;
@@ -159,15 +160,15 @@ struct population {
   /*! \brief { Best quality }*/
   double best_quality() { return indices[1].second; }
 
-  void dump_results([[maybe_unused]] int elapsed_time)
+  void dump_results([[maybe_unused]] double elapsed_time)
   {
-    // if (problem_ptr->solver_settings_ptr->dump_best_results_ &&
-    //     (elapsed_time - last_stamp) >=
-    //     problem_ptr->solver_settings_ptr->dump_interval_) {
-    //   last_stamp = elapsed_time;
-    //   result_file_ << elapsed_time << "," << feasible_quality() << "," <<
-    //   best_quality() << "\n"; result_file_.flush();
-    // }
+    if (problem_ptr->solver_settings_ptr->dump_best_results_ &&
+        (elapsed_time - last_stamp) >=
+        problem_ptr->solver_settings_ptr->dump_interval_) {
+      last_stamp = elapsed_time;
+      result_file_ << elapsed_time << "," << feasible_quality() << "," <<
+      best_quality() << "\n"; result_file_.flush();
+    }
   }
 
   /*! \brief { Best feasible solution. An empty solution may be returned - first
@@ -232,7 +233,7 @@ struct population {
     random_pair.second = solutions[indices[j].first].second;
   }
 
-  void inject_solutions(int elapsed_time,
+  void inject_solutions(double elapsed_time,
                         injection_info_t<allocator, solution, problem>& injection_info)
   {
     if (!injection_info.has_info()) { return; }
@@ -249,7 +250,7 @@ struct population {
   /*! \brief { Add a solution to population. Similar solutions may be ejected
    * from the pool. } \return { -1 = not inserted , others = inserted index}
    */
-  int add_solution(int elapsed_time, solution& sol)
+  int add_solution(double elapsed_time, solution& sol)
   {
     raft::common::nvtx::range fun_scope("add_solution");
     double sol_cost = sol.get_cost(weights);

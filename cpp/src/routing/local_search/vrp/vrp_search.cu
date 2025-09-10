@@ -17,6 +17,7 @@
 
 #include "vrp_execute.cuh"
 #include "vrp_search.cuh"
+#include <iostream>
 
 namespace cuopt {
 namespace routing {
@@ -571,6 +572,16 @@ DI bool get_work_config(typename solution_t<i_t, f_t, REQUEST>::view_t& solution
   return false;
 }
 
+
+template <typename Span>
+__device__ inline void print_span_dev(const Span& s, const char* tag) {
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("%s (size=%lld): ", tag, (long long)s.size());
+    for (int i = 0; i < (int)s.size(); ++i) printf("%d ", (int)s[i]);
+    printf("\n");
+  }
+}
+
 template <typename i_t, typename f_t, request_t REQUEST>
 __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::view_t solution,
                                       typename move_candidates_t<i_t, f_t>::view_t move_candidates,
@@ -578,8 +589,10 @@ __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::vi
 {
   extern __shared__ double shmem[];
   search_data_t<i_t> search_data;
+
   bool early_exit =
     get_work_config<i_t, f_t, REQUEST>(solution, move_candidates, search_data, recycle);
+
   if (early_exit) return;
   i_t r_id_1;
   if (search_data.block_node_id >= solution.get_num_orders()) {
@@ -650,6 +663,7 @@ __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::vi
     search_data.offset,
     selection_delta,
     move_candidates.nodes_to_search.active_nodes_impacted);
+
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -658,6 +672,7 @@ bool find_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
                     bool recycle = false)
 {
   raft::common::nvtx::range fun_scope("find_vrp_moves");
+  // output_sol<i_t, f_t, REQUEST>(sol);
   if (sol.n_routes < 2) { return false; }
 
   if (sol.problem_ptr->is_cvrp()) {
@@ -678,6 +693,33 @@ bool find_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
   }
   cuopt_assert(n_blocks > 0, "n_blocks should be positive");
   cuopt_expects(n_blocks > 0, error_type_t::RuntimeError, "A runtime error occurred!");
+
+
+  // ========================
+  // Print move_candidates.viables.viable_to_pickups for debugging
+    raft::print_device_vector("viable_to_pickups: ",
+                          move_candidates.viables.viable_to_pickups.data() + 992,
+                          10,
+                          std::cout);
+  raft::print_device_vector("viable_to_pickups: ",
+                          move_candidates.viables.viable_to_pickups.data() + 1000,
+                          100,
+                          std::cout);
+  raft::print_device_vector("viable_to_pickups: ",
+                        move_candidates.viables.viable_to_pickups.data() + 2000,
+                        100,
+                        std::cout);
+  // raft::print_device_vector("n_viable_to_pickups: ",
+  //                         move_candidates.viables.n_viable_to_pickups.data(),
+  //                         move_candidates.viables.n_viable_to_pickups.size(),
+  //                         std::cout);
+  // raft::print_device_vector("compatibility_matrix: ",
+  //                         move_candidates.viables.compatibility_matrix.data() + 1000,
+  //                         100,
+  //                         std::cout);
+  // ========================
+
+
   if (!set_shmem_of_kernel(find_vrp_moves_kernel<i_t, f_t, REQUEST>, sh_size)) { return false; }
   move_candidates.vrp_move_candidates.find_kernel_graph.start_capture(sol.sol_handle->get_stream());
   move_candidates.vrp_move_candidates.reset(sol.sol_handle);
@@ -709,14 +751,39 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
                         move_candidates_t<i_t, f_t>& move_candidates)
 {
   raft::common::nvtx::range fun_scope("perform_vrp_search");
+  // printf("perform_vrp_search\n");
+  // sol.print();
   cuopt_func_call(sol.check_cost_coherence(move_candidates.weights));
   if (!find_vrp_moves(sol, move_candidates)) { return false; }
+
+
+  // print all the found move_candidates
+  
+
+  // todo!!
+
+
+  // todo!!
+  f_t cost_before = sol.get_cost(true, move_candidates.weights);
+  // auto cb = sol.get_cost_breakdown(move_candidates.weights);
+  // std::cout << "constraint_cost: " << cb.constraint_cost << ", obj_cost: " << cb.obj_cost << std::endl;
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
+  f_t cost_after = sol.get_cost(true, move_candidates.weights);
+  printf("perform_vrp_search ");
+  printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
   if (move_found) {
     // copy the current nodes to search beforehand, so sliding can search for it again
     auto copy_sampled_nodes = move_candidates.nodes_to_search.h_sampled_nodes;
     // do a single iteration as more iterations doesn't find more moves
-    recycle_unused_moves(sol, move_candidates);
+
+
+    printf("perform_vrp_search_with_recycling ");
+    f_t cost_before = sol.get_cost(true, move_candidates.weights);
+    bool recycle_found = false;
+    recycle_found = recycle_unused_moves(sol, move_candidates);
+    f_t cost_after = sol.get_cost(true, move_candidates.weights);
+    printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, recycle_found);
+
     move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
     move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
   }

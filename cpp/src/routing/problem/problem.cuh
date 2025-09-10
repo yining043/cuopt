@@ -82,7 +82,7 @@ struct viables_t {
                                                           bool exclude_self_in_neighbors,
                                                           i_t batch_num = 0) const
     {
-      i_t n_viable     = n_viable_to_pickups[node] - i_t(exclude_self_in_neighbors);
+      i_t n_viable     =  n_viable_to_pickups[node] - i_t(exclude_self_in_neighbors);
       i_t batch_offset = batch_num * max_n_neighbors;
       // filter the tailing ones
       n_viable         = n_viable - batch_offset;

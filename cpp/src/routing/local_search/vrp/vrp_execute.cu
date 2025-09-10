@@ -69,6 +69,7 @@ __global__ void extract_non_overlapping_moves_kernel(
     random_shuffle(
       shuffled_route_pair_indices.data(), shuffled_route_pair_indices.size(), thread_rng);
     i_t n_moves_found = 0;
+    f_t delta_sum    = 0;
     for (i_t i = 0; i < shuffled_route_pair_indices.size(); ++i) {
       i_t random_idx     = shuffled_route_pair_indices[i];
       i_t route_pair_idx = sh_best_route_pairs[random_idx];
@@ -83,9 +84,99 @@ __global__ void extract_non_overlapping_moves_kernel(
       vrp_candidates.record_move(route_pair_idx, n_moves_found);
       ++n_moves_found;
       cuopt_func_call(*move_candidates.debug_delta += vrp_candidates.cost_delta[route_pair_idx]);
+      delta_sum += vrp_candidates.cost_delta[route_pair_idx];
     }
     vrp_candidates.set_n_changed_routes(n_moves_found);
+    printf("Best cost delta = %.3f\n", delta_sum);
   }
+
+// ================== Beam Search（方法 A：运行时可调） ==================
+// -------------------------------------------------------------
+// Beam Search（运行时可调 beam；无随机，按 sh_best_route_pairs 的原始顺序遍历）
+// 注意：n_routes ≤ 64；MAX_STEPS 与 seq[16] 一致；beam_size ∈ [1, BEAM_MAX]
+// -------------------------------------------------------------
+  // if (threadIdx.x == 0) {
+  //   const int BEAM_MAX  = 20;                          // 按需调大
+  //   const int beam_size = BEAM_MAX;                   // 外部传入（需 1..BEAM_MAX）
+  //   const int STEPS_CAP = (solution.n_routes >> 1);
+  //   const int MAX_STEPS = (STEPS_CAP < 32 ? STEPS_CAP : 32);
+
+  //   using Mask = unsigned long long;
+
+  //   struct State {
+  //     Mask   mask  = 0ULL;
+  //     double score = 0.0;
+  //     int    len   = 0;
+  //     int    seq[16];
+  //   };
+  //   auto better = [](const State& a, const State& b) {
+  //     if (a.len != b.len) return a.len > b.len;
+  //     return a.score < b.score;
+  //   };
+
+  //   State beam[BEAM_MAX];      // 当前保留的前 k 个部分解
+  //   int   cur_beam = 1;        // 初始空解
+  //   State cand[2 * BEAM_MAX];  // 本轮扩展生成的候选
+
+  //   // === 核心改变：不再洗牌，也不再用 shuffled_route_pair_indices ===
+  //   const int n_pairs = static_cast<int>(sh_best_route_pairs.size());
+  //   for (int i = 0; i < n_pairs; ++i) {
+  //     const int route_pair_idx = sh_best_route_pairs[i];           // 直接顺序取第 i 个
+  //     const int r1 = route_pair_idx / solution.n_routes;
+  //     const int r2 = route_pair_idx % solution.n_routes;
+  //     if (r1 == r2 || r1 > r2) continue; // 只取上三角
+
+  //     const Mask bit   = (Mask(1) << r1) | (Mask(1) << r2);
+  //     const double dlt = vrp_candidates.cost_delta[route_pair_idx];
+
+  //     // 扩展：对当前 beam 中的每个状态做“不选/可选则选”两种分支
+  //     int nxt = 0;
+  //     for (int b = 0; b < cur_beam; ++b) {
+  //       cand[nxt++] = beam[b];  // 分支A：不选
+  //       if ((beam[b].mask & bit) == 0 && beam[b].len < MAX_STEPS) {
+  //         State t = beam[b];    // 分支B：选
+  //         t.mask  |= bit;
+  //         t.score += dlt;
+  //         t.seq[t.len] = route_pair_idx;
+  //         ++t.len;
+  //         cand[nxt++] = t;
+  //       }
+  //     }
+
+  //     // 取前 beam_size 个最优状态写回
+  //     const int keep = (nxt < beam_size ? nxt : beam_size);
+  //     for (int k = 0; k < keep; ++k) {
+  //       int best = k;
+  //       for (int j = k + 1; j < nxt; ++j)
+  //         if (better(cand[j], cand[best])) best = j;
+  //       State tmp = cand[k]; cand[k] = cand[best]; cand[best] = tmp;
+  //       beam[k] = cand[k];
+  //     }
+  //     cur_beam = keep;
+
+  //     if (cur_beam > 0 && beam[0].len >= MAX_STEPS) break; // 早停
+  //   }
+
+  //   // 回放最优解
+  //   const State& best = beam[0];
+  //   int n_moves_found = best.len;
+  //   for (int t = 0; t < best.len; ++t) {
+  //     const int route_pair_idx = best.seq[t];
+  //     const int r1 = route_pair_idx / solution.n_routes;
+  //     const int r2 = route_pair_idx % solution.n_routes;
+  //     changed_routes[r1] = 1;
+  //     changed_routes[r2] = 1;
+  //     vrp_candidates.record_move(route_pair_idx, t);
+  //     cuopt_func_call(*move_candidates.debug_delta += vrp_candidates.cost_delta[route_pair_idx]);
+  //   }
+  //   vrp_candidates.set_n_changed_routes(n_moves_found);
+  //   printf("Best cost delta = %.3f, steps_cap = %d\n", best.score, STEPS_CAP);
+  // }
+
+  // ================== 结束：Beam Search（方法 A） ==================
+
+
+
 }
 
 // this function inserts a fragment into a route gap
@@ -444,8 +535,8 @@ bool execute_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
   cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     &numBlocksPerSm, execute_vrp_moves_kernel<i_t, f_t, REQUEST>, TPB, 0);
   // if the number of blocks are larger than the gpu can hold, only execute the max fitting moves
-  n_blocks            = std::min(n_blocks,
-                      sol.sol_handle->get_device_properties().multiProcessorCount * numBlocksPerSm);
+  n_blocks =
+    min(n_blocks, sol.sol_handle->get_device_properties().multiProcessorCount * numBlocksPerSm);
   auto sol_view       = sol.view();
   auto move_cand_view = move_candidates.view();
   // launch
