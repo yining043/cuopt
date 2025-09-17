@@ -110,10 +110,13 @@ template <typename i_t, typename f_t, request_t REQUEST>
 class local_search_t {
  public:
   local_search_t(const solution_handle_t<i_t, f_t>* sol_handle_,
-                 i_t n_orders,
-                 i_t max_routes,
-                 bool depot_included,
-                 const viables_t<i_t, f_t>& viables_);
+               i_t n_orders, i_t max_routes, bool depot_included,
+               viables_t<i_t, f_t>& viables_);
+  local_search_t(const solution_handle_t<i_t, f_t>* sol_handle_,
+               i_t n_orders, i_t max_routes, bool depot_included,
+               const viables_t<i_t, f_t>& viables_const)
+  : local_search_t(sol_handle_, n_orders, max_routes, depot_included,
+                   const_cast<viables_t<i_t, f_t>&>(viables_const)) {}
   // computes candidates of insertion and ejection on given solution
 
   void run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
@@ -148,6 +151,7 @@ class local_search_t {
   {
     time_limit         = time_limit_;
     start              = std::chrono::steady_clock::now();
+    total_offset       = std::chrono::steady_clock::duration(0);
     time_limit_reached = false;
   }
 
@@ -165,11 +169,19 @@ class local_search_t {
     time_limit_reached = true;
   }
 
+  static inline void add_offset(std::chrono::steady_clock::duration offset)
+  { total_offset += offset; }
+
   static inline bool check_time_limit()
   {
     if (get_time_limit_reached()) return true;
+    printf("Total time used: %lld ms, offset: %lld ms\n",
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now() - start)
+             .count(),
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(total_offset).count());
     bool this_thread_finished =
-      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start)
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - total_offset - start)
         .count() > time_limit;
     if (this_thread_finished) { set_time_limit_reached(); }
     return this_thread_finished;
@@ -190,9 +202,9 @@ class local_search_t {
   bool run_cross_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_inter_search(solution_t<i_t, f_t, REQUEST>& sol);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::PDP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::VRP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96);
 
   void reset_cross_vectors(solution_t<i_t, f_t, REQUEST>& solution);
 
@@ -202,6 +214,7 @@ class local_search_t {
 
   static inline f_t time_limit;
   static inline std::chrono::time_point<std::chrono::steady_clock> start;
+  static inline std::chrono::steady_clock::duration total_offset;
   static inline bool time_limit_reached;
   ExactCycleFinder<i_t, f_t, 128> cycle_finder_small;
   ExactCycleFinder<i_t, f_t, 1024> cycle_finder_big;
@@ -216,6 +229,9 @@ class local_search_t {
 
   // graphs
   cuda_graph_t sliding_cuda_graph;
+public:
+  //get total offset
+  static inline std::chrono::steady_clock::duration get_total_offset() { return total_offset; }
 };
 
 }  // namespace detail

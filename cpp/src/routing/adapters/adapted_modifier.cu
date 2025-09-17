@@ -52,7 +52,7 @@ void adapted_modifier_t<i_t, f_t, REQUEST>::perturbate(
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-void adapted_modifier_t<i_t, f_t, REQUEST>::improve(
+std::chrono::steady_clock::duration adapted_modifier_t<i_t, f_t, REQUEST>::improve(
   adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
   costs weight,
   f_t time_limit,
@@ -73,6 +73,7 @@ void adapted_modifier_t<i_t, f_t, REQUEST>::improve(
   adapted_solution.check_device_host_coherence();
   cuopt_func_call(adapted_solution.sol.check_cost_coherence(gpu_weight));
   pool_allocator.resource_pool->release(index);
+  return resource.ls.get_total_offset();
 }
 
 // add unserviced pdp requests to the solution

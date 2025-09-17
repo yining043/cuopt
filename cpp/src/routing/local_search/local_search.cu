@@ -31,6 +31,10 @@
 #include <chrono>
 #include <unordered_set>
 
+#include <vector>
+#include <algorithm>
+#include <random>
+
 namespace cuopt {
 namespace routing {
 namespace detail {
@@ -40,7 +44,7 @@ local_search_t<i_t, f_t, REQUEST>::local_search_t(const solution_handle_t<i_t, f
                                                   i_t n_orders,
                                                   i_t max_routes,
                                                   bool depot_included,
-                                                  const viables_t<i_t, f_t>& viables_)
+                                                  viables_t<i_t, f_t>& viables_)
   : cycle_finder_small(sol_handle_, depot_included, 5, 50000),
     cycle_finder_big(sol_handle_, depot_included, 5, 50000),
     move_candidates(n_orders, max_routes, sol_handle_, viables_),
@@ -147,7 +151,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_cross_search(solution_t<i_t, f_t, RE
 template <typename i_t, typename f_t, request_t REQUEST>
 template <request_t r_t, std::enable_if_t<r_t == request_t::PDP, bool>>
 bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t>& sol,
-                                                        bool full_set)
+                                                        bool full_set,
+                                                        i_t changed_nb_size)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
 
@@ -189,7 +194,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 template <typename i_t, typename f_t, request_t REQUEST>
 template <request_t r_t, std::enable_if_t<r_t == request_t::VRP, bool>>
 bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t>& sol,
-                                                        bool full_set)
+                                                        bool full_set,
+                                                        i_t changed_nb_size)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
 
@@ -219,21 +225,21 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   for (auto const& op : fast_operators) {
     switch (op) {
       case fast_operators_t::SLIDING: {
-        move_found = run_sliding_search(sol) || move_found;
+        // move_found = run_sliding_search(sol) || move_found;
         break;
       }
       case fast_operators_t::VRP: {
-        move_found = perform_vrp_search(sol, move_candidates) || move_found;
+        move_found = perform_vrp_search(sol, move_candidates, changed_nb_size) || move_found;
         break;
       }
       case fast_operators_t::REGRET: {
-        move_found =
-          run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
-          move_found;
+        // move_found =
+        //   run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
+        //   move_found;
         break;
       }
       case fast_operators_t::TWO_OPT: {
-        move_found = run_two_opt_search(sol) || move_found;
+        // move_found = run_two_opt_search(sol) || move_found;
         break;
       }
       case fast_operators_t::CROSS: {
@@ -268,19 +274,150 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   i_t iter = 0;
   sol.sol_handle->sync_stream();
   sol.compute_cost();
-  const i_t iter_limit = max_iterations;
+  i_t iter_limit = max_iterations;
   const bool should_all_nodes_be_served =
     consider_unserviced && !sol.problem_ptr->has_prize_collection();
   sol.global_runtime_checks(should_all_nodes_be_served, false, "run_best_local_search_begin");
   [[maybe_unused]] double cost_before = 0., cost_after = 0.;
+
+  //########
+  // sol.print();
+  using Sol = cuopt::routing::detail::solution_t<i_t, f_t, REQUEST>;
+  using clock = std::chrono::steady_clock;
+  // host 侧构造 1000×1000，每行是随机排列
+  i_t R = 1000, C = 1000;
+  // 维度
+  const size_t N = static_cast<size_t>(R) * C;
+  const size_t BYTES = sizeof(i_t) * N;
+
+  //========= 1111
+  std::vector<i_t> base_node_neighbour(N), work_node_neighbour(N), best_node_neighbour(N);
+  cudaMemcpyAsync(base_node_neighbour.data(),
+                  move_candidates.viables.viable_to_pickups.data(),
+                  BYTES, cudaMemcpyDeviceToHost, sol.sol_handle->get_stream());
+  sol.sol_handle->sync_stream();
+  best_node_neighbour = base_node_neighbour;
+
+  std::vector<NodeInfo<int>> base_node_to_search(N), work_node_to_search(N), best_node_to_search(N);
+  //========= 2222
+
+  // 随机选 K 个元素并“稳定”移动到最前（保持相对顺序）
+  std::mt19937_64 rng(std::random_device{}());
+  auto jitter_row = [&](NodeInfo<int>* row, int C) {
+  // auto jitter_row = [&](i_t* row, int C) {
+    if (C <= 1) return;
+    int K = std::max<int>(1, C / 500);          // 约 0.2% 元素，至少 1 个
+    if (K > C) K = C;
+
+    // 选 K 个唯一下标
+    std::vector<int> idx(C);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::shuffle(idx.begin(), idx.end(), rng);
+    idx.resize(K);
+    std::sort(idx.begin(), idx.end());         // 选中元素按原顺序排列
+
+    // 组装：先放选中的，再放其余的（两段都保持原相对顺序）
+    using Elem = std::remove_reference_t<decltype(row[0])>;  // ← 元素类型
+    std::vector<Elem> tmp;   
+    tmp.reserve(C);
+    for (int p : idx) tmp.push_back(row[p]);   // 选中的到前面
+    for (int i = 0, j = 0; i < C; ++i) {       // 其余的跟上
+      if (j < K && i == idx[j]) { ++j; continue; }
+      tmp.push_back(row[i]);
+    }
+    std::copy(tmp.begin(), tmp.end(), row);
+  };
+
+  // 10 次候选
+  double best_score = 1000000000.0;
+
+  // define function to load to device both tables
+  auto load_to_device_both = [&](const std::vector<i_t>& node_neibour_list, 
+                                 std::vector<NodeInfo<int>> nodes_to_search) {
+    auto stream = sol.sol_handle->get_stream();
+    cudaMemcpyAsync(move_candidates.viables.viable_to_pickups.data(),
+                    node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(move_candidates.viables.viable_from_pickups.data(),
+                    node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice, stream);
+    // restore nodes_to_search
+    move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
+    sol.sol_handle->sync_stream();
+  };
+
+  //########
   while (iter < iter_limit) {
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
     // fast loop, insider this sliding, fast vrp search and fast cross search happens
-    while (true) {
+    while (true) { 
+      // if (local_search_count >= ??) { exit(0); } // for debug !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
-      if (run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2)) { continue; }
+      //########################################################
+      auto pause_begin = clock::now();
+      // 10 次候选
+      best_score = 1000000000.0;
+      base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+      best_node_to_search = base_node_to_search;
+      for (int t = 0; t < 10; ++t) {
+        
+        if (t == 0) {
+          work_node_to_search = base_node_to_search;  // 不扰动
+        } else {
+          work_node_to_search = base_node_to_search;  // 从原始拷贝一份再轻微扰动
+          // for (i_t r = 0; r < R; ++r) {
+          jitter_row(work_node_to_search.data(), work_node_to_search.size());
+          // }
+        }
+        load_to_device_both(base_node_neighbour, work_node_to_search);
+        Sol trail_routes(sol);
+        run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 8);
+        // raft::print_device_vector("best_cost_delta_per_node: ",
+        //                            move_candidates.vrp_move_candidates.best_cost_delta_per_node.data(),
+        //                            1000,
+        //                            std::cout);
+        auto s = trail_routes.get_cost(true, move_candidates.weights);
+        if (s < best_score) {
+          best_score = s;
+          best_node_to_search = work_node_to_search;
+          // base = best; // update base to best
+        }
+      }
+      // printf("best score in 1000 trails: %f\n", best_score);
+
+      // 固定最优
+      load_to_device_both(base_node_neighbour, best_node_to_search);
+      auto pause_end   = clock::now();
+      auto offset = pause_end - pause_begin;
+      local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
+      printf("number of nodes to search: %zu, size of base_nodes_to_search: %zu\n", move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
+      //########################################################
+      // raft::print_device_vector("viable_to_pickups: ",
+      //                   move_candidates.viables.viable_to_pickups.data() + 1000,
+      //                   100,
+      //                   std::cout);
+      // raft::print_device_vector("viable_from_pickups: ",
+      //                       move_candidates.viables.viable_from_pickups.data() + 1000,
+      //                       100,
+      //                       std::cout);
+      //########################################################
+      //########################################################
+      // try trail with sizes [16, 64, 256]
+      // for (i_t size : {4, 8, 16, 32, 64, 128, 256}) {
+      //   Sol trail_routes(sol);
+      //   printf("trail with size %d\n", size);
+      //   run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, size);
+      // }
+      // //real search size
+      // ###########################
+      //########################################################
+      //########################################################
+      f_t cost_before = sol.get_cost(true, move_candidates.weights);
+      bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 8);
+      f_t cost_after = sol.get_cost(true, move_candidates.weights);
+      printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
+
+      if (move_found_here) { continue; }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;
@@ -289,9 +426,11 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       break;
     }
 
+    //########################################################
     sol.global_runtime_checks(
       should_all_nodes_be_served, false, "run_best_local_search_after_fast_search");
-
+    
+    // disable cycle finder for now
     if (!run_cycle_finder || (sol.n_routes > 1023)) { break; }
     // cycle finder is needed even for single route in PDP cases
     if (REQUEST == request_t::VRP && sol.n_routes < 2) { break; }
@@ -361,7 +500,6 @@ void local_search_t<i_t, f_t, REQUEST>::run_random_local_search(solution_t<i_t, 
   RAFT_CHECK_CUDA(sol.sol_handle->get_stream());
   sol.sol_handle->sync_stream();
   populate_random_moves(sol);
-
   bool time_limit_reached =
     (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit());
   // if there is no more insertions found

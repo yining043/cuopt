@@ -35,6 +35,17 @@ class timer_t {
     begin      = steady_clock::now();
   }
 
+  void add_offset(steady_clock::duration offset)
+  {
+    printf("time since begin: %lld ms, offset: %lld ms\n",
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - begin)
+             .count(),
+           (long long)std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
+    print_debug("BEFORE offset");
+    begin += offset;
+    print_debug("AFTER offset");
+  }
+
   void print_debug(std::string msg) const
   {
     printf("%s time_limit: %f remaining_time: %f elapsed_time: %f \n",
@@ -44,7 +55,7 @@ class timer_t {
            elapsed_time());
   }
 
-  bool check_time_limit() const noexcept { return elapsed_time() >= time_limit; }
+  bool check_time_limit() const noexcept {return elapsed_time() >= time_limit; }
 
   bool check_half_time() const noexcept { return elapsed_time() >= time_limit / 2; }
 

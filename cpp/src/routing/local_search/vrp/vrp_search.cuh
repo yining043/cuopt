@@ -64,7 +64,8 @@ struct search_data_t {
 
 template <typename i_t, typename f_t, request_t REQUEST>
 bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
-                        move_candidates_t<i_t, f_t>& move_candidates);
+                        move_candidates_t<i_t, f_t>& move_candidates,
+                        i_t changed_nb_size);
 
 }  // namespace detail
 }  // namespace routing
