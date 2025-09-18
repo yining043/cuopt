@@ -330,7 +330,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   // };
 
   // 10 次候选
-  // double best_score = 1000000000.0;
+  double best_score = 1000000000.0;
 
   // define function to load to device both tables
   auto load_to_device_both = [&](const std::vector<i_t>& node_neibour_list, 
@@ -355,22 +355,28 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       //########################################################
       auto pause_begin = clock::now();
       // 10 次候选
-      // best_score = 1000000000.0;
+      best_score = 1000000000.0;
       base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+      const size_t KK = base_node_to_search.size();
+      if (KK > 1) {
+          std::shuffle(base_node_to_search.begin(),
+                      base_node_to_search.begin() + KK,
+                      rng);
+      }
       best_node_to_search = base_node_to_search;
       // 先用 max 初始化当前的 cost_delta global
       global_cost_delta_per_node = std::vector<double>(N, std::numeric_limits<double>::max());
 
-      for (int t = 0; t < 100; ++t) {
+      for (int t = 0; t < 10; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
         } else {
           work_node_to_search = base_node_to_search;  // 从原始拷贝一份再轻微扰动
-          const size_t K = work_node_to_search.size();
-          if (K > 1) {
+          const size_t KK = work_node_to_search.size();
+          if (KK > 1) {
               std::shuffle(work_node_to_search.begin(),
-                          work_node_to_search.begin() + K,
+                          work_node_to_search.begin() + KK,
                           rng);
           }
 
@@ -387,17 +393,18 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                   sol.sol_handle->get_stream());
         sol.sol_handle->sync_stream();
         // element-wise min to global
-        for (size_t i = 0; i < N; ++i) {
-          if (cur_cost_delta_per_node[i] < global_cost_delta_per_node[i]) {
-            global_cost_delta_per_node[i] = cur_cost_delta_per_node[i];
-          }
-        }
-        // auto s = trail_routes.get_cost(true, move_candidates.weights);
-        // if (s < best_score) {
-        //   best_score = s;
-        //   best_node_to_search = work_node_to_search;
-        //   // base = best; // update base to best
+        // for (size_t i = 0; i < N; ++i) {
+        //   if (cur_cost_delta_per_node[i] < global_cost_delta_per_node[i]) {
+        //     global_cost_delta_per_node[i] = cur_cost_delta_per_node[i];
+        //   }
         // }
+        auto s = trail_routes.get_cost(true, move_candidates.weights);
+        if (s < best_score) {
+          best_score = s;
+          global_cost_delta_per_node = cur_cost_delta_per_node;
+          // best_node_to_search = work_node_to_search;
+          // base = best; // update base to best
+        }
       }
       // printf("best score in 1000 trails: %f\n", best_score);
 
