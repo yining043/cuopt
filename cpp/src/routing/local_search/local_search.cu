@@ -367,6 +367,13 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
           work_node_to_search = base_node_to_search;  // 不扰动
         } else {
           work_node_to_search = base_node_to_search;  // 从原始拷贝一份再轻微扰动
+          const size_t K = work_node_to_search.size();
+          if (K > 1) {
+              std::shuffle(work_node_to_search.begin(),
+                          work_node_to_search.begin() + K,
+                          rng);
+          }
+
           // for (i_t r = 0; r < R; ++r) {
           // jitter_row(work_node_to_search.data(), work_node_to_search.size());
           // }
