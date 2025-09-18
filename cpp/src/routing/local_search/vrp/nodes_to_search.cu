@@ -149,12 +149,22 @@ bool nodes_to_search_t<i_t, f_t>::sample_nodes_to_search(
   cuopt_assert(curr_n_nodes_to_search > 0, "There must be at least one operator!");
   n_sampled_nodes = std::min(n_sampled_nodes, curr_n_nodes_to_search);
   h_sampled_nodes.clear();
-  for (i_t i = 0; i < n_sampled_nodes; ++i) {
-    std::uniform_int_distribution<i_t> rng_dist(0, h_nodes_to_search.size() - 1);
-    i_t node_idx   = rng_dist(rng);
-    auto node_info = h_nodes_to_search[node_idx];
-    h_sampled_nodes.push_back(node_info);
-    h_nodes_to_search.erase(h_nodes_to_search.begin() + node_idx);
+  // for (i_t i = 0; i < n_sampled_nodes; ++i) {
+  //   std::uniform_int_distribution<i_t> rng_dist(0, h_nodes_to_search.size() - 1);
+  //   i_t node_idx   = rng_dist(rng);
+  //   auto node_info = h_nodes_to_search[node_idx];
+  //   h_sampled_nodes.push_back(node_info);
+  //   h_nodes_to_search.erase(h_nodes_to_search.begin() + node_idx);
+  // }
+  i_t take = std::min<i_t>(n_sampled_nodes, static_cast<i_t>(h_nodes_to_search.size()));
+  if (take > 0) {
+    // 追加到采样结果（保持原顺序）
+    h_sampled_nodes.insert(h_sampled_nodes.end(),
+                          h_nodes_to_search.begin(),
+                          h_nodes_to_search.begin() + take);
+    // 从源容器里移除这段
+    h_nodes_to_search.erase(h_nodes_to_search.begin(),
+                            h_nodes_to_search.begin() + take);
   }
   sample_nodes_graph.start_capture(sol.sol_handle->get_stream());
   raft::copy(sampled_nodes_to_search.data(),
