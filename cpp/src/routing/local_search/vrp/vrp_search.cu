@@ -731,7 +731,7 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
     // copy the current nodes to search beforehand, so sliding can search for it again
     auto copy_sampled_nodes = move_candidates.nodes_to_search.h_sampled_nodes;
     // do a single iteration as more iterations doesn't find more moves
-    // recycle_unused_moves(sol, move_candidates);
+    recycle_unused_moves(sol, move_candidates, changed_nb_size);
     move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
     move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
   }

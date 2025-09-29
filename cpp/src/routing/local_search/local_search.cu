@@ -225,7 +225,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   for (auto const& op : fast_operators) {
     switch (op) {
       case fast_operators_t::SLIDING: {
-        // move_found = run_sliding_search(sol) || move_found;
+        move_found = run_sliding_search(sol) || move_found;
         break;
       }
       case fast_operators_t::VRP: {
@@ -233,13 +233,13 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         break;
       }
       case fast_operators_t::REGRET: {
-        // move_found =
-        //   run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
-        //   move_found;
+        move_found =
+          run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
+          move_found;
         break;
       }
       case fast_operators_t::TWO_OPT: {
-        // move_found = run_two_opt_search(sol) || move_found;
+        move_found = run_two_opt_search(sol) || move_found;
         break;
       }
       case fast_operators_t::CROSS: {
@@ -285,22 +285,19 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   using Sol = cuopt::routing::detail::solution_t<i_t, f_t, REQUEST>;
   using clock = std::chrono::steady_clock;
   // host 侧构造 1000×1000，每行是随机排列
-  i_t R = 1000, C = 1000;
   // 维度
-  const size_t N = static_cast<size_t>(R) * C;
-  const size_t BYTES = sizeof(i_t) * N;
-  const size_t BYTES_double = sizeof(double) * N;
-
+  const i_t N1 = sol.problem_ptr->get_num_orders() + 4 * sol.get_n_routes();  // nodes
+  const i_t N2 = sol.problem_ptr->get_num_orders() + sol.get_n_routes();  // nodes
   //========= 1111
-  std::vector<i_t> base_node_neighbour(N), work_node_neighbour(N), best_node_neighbour(N);
-  cudaMemcpy(base_node_neighbour.data(),
-                  move_candidates.viables.viable_to_pickups.data(),
-                  BYTES, cudaMemcpyDeviceToHost);
-  best_node_neighbour = base_node_neighbour;
-  std::vector<NodeInfo<int>> base_node_to_search(N), work_node_to_search(N), best_node_to_search(N);
+  // std::vector<i_t> base_node_neighbour(N), work_node_neighbour(N), best_node_neighbour(N);
+  // cudaMemcpy(base_node_neighbour.data(),
+  //                 move_candidates.viables.viable_to_pickups.data(),
+  //                 BYTES, cudaMemcpyDeviceToHost);
+  // best_node_neighbour = base_node_neighbour;
+  std::vector<NodeInfo<int>> base_node_to_search(N1), work_node_to_search(N1), best_node_to_search(N1);
 
   //========= 2222
-  std::vector<double> cur_cost_delta_per_node(N), global_cost_delta_per_node(N);
+  std::vector<double> cur_cost_delta_per_node(N2), global_cost_delta_per_node(N2);
   //========= 3333             
   // 随机选 K 个元素并“稳定”移动到最前（保持相对顺序）
   std::mt19937_64 rng(std::random_device{}());
@@ -333,12 +330,11 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   double best_score = 1000000000.0;
 
   // define function to load to device both tables
-  auto load_to_device_both = [&](const std::vector<i_t>& node_neibour_list, 
-                                 std::vector<NodeInfo<int>> nodes_to_search) {
-    cudaMemcpy(move_candidates.viables.viable_to_pickups.data(),
-                    node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
-    cudaMemcpy(move_candidates.viables.viable_from_pickups.data(),
-                    node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
+  auto load_to_device_both = [&](std::vector<NodeInfo<int>> nodes_to_search) {
+    // cudaMemcpy(move_candidates.viables.viable_to_pickups.data(),
+    //                 node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
+    // cudaMemcpy(move_candidates.viables.viable_from_pickups.data(),
+    //                 node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
     // restore nodes_to_search
     move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
   };
@@ -365,9 +361,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       }
       best_node_to_search = base_node_to_search;
       // 先用 max 初始化当前的 cost_delta global
-      global_cost_delta_per_node = std::vector<double>(N, std::numeric_limits<double>::max());
+      // global_cost_delta_per_node = std::vector<double>(N2, std::numeric_limits<double>::max());
 
-      for (int t = 0; t < 10; ++t) {
+      for (int t = 0; t < 100; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
@@ -384,14 +380,20 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
           // jitter_row(work_node_to_search.data(), work_node_to_search.size());
           // }
         }
-        load_to_device_both(base_node_neighbour, work_node_to_search);
+        load_to_device_both(work_node_to_search);
         Sol trail_routes(sol);
         run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
-        raft::copy(cur_cost_delta_per_node.data(),
-                  move_candidates.vrp_move_candidates.best_cost_delta_per_node.data(),
-                  move_candidates.vrp_move_candidates.best_cost_delta_per_node.size(),
-                  sol.sol_handle->get_stream());
-        sol.sol_handle->sync_stream();
+        
+        // // 修复：确保cur_cost_delta_per_node有正确的大小
+        // if (cur_cost_delta_per_node.size() < move_candidates.vrp_move_candidates.best_cost_delta_per_node.size()) {
+        //   cur_cost_delta_per_node.resize(move_candidates.vrp_move_candidates.best_cost_delta_per_node.size());
+        // }
+        
+        // raft::copy(cur_cost_delta_per_node.data(),
+        //           move_candidates.vrp_move_candidates.best_cost_delta_per_node.data(),
+        //           move_candidates.vrp_move_candidates.best_cost_delta_per_node.size(),
+        //           sol.sol_handle->get_stream());
+        // sol.sol_handle->sync_stream();
         // element-wise min to global
         // for (size_t i = 0; i < N; ++i) {
         //   if (cur_cost_delta_per_node[i] < global_cost_delta_per_node[i]) {
@@ -401,46 +403,46 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         auto s = trail_routes.get_cost(true, move_candidates.weights);
         if (s < best_score) {
           best_score = s;
-          global_cost_delta_per_node = cur_cost_delta_per_node;
-          // best_node_to_search = work_node_to_search;
+          best_node_to_search = work_node_to_search;  // 保存最佳配置
+          // global_cost_delta_per_node = cur_cost_delta_per_node;
           // base = best; // update base to best
         }
       }
       // printf("best score in 1000 trails: %f\n", best_score);
 
       // 固定最优
-      best_node_to_search = base_node_to_search;
-      int C = static_cast<int>(best_node_to_search.size()); // columns
-      auto& cost = global_cost_delta_per_node;
-      int K = 40; // top K
-      if (K > C) K = C;
+      // best_node_to_search = base_node_to_search;
+      // int C = static_cast<int>(best_node_to_search.size()); // columns
+      // auto& cost = global_cost_delta_per_node;
+      // int K = 40; // top K
+      // if (K > C) K = C;
 
-      std::vector<size_t> ord(C);
-      std::iota(ord.begin(), ord.end(), 0);
-      auto node_cost_by_pos = [&](size_t pos) {
-          auto nid = best_node_to_search[pos].node();
-          return cost[nid];
-      };
-      std::partial_sort(
-          ord.begin(), ord.begin() + K, ord.end(),
-          [&](size_t a, size_t b){ return node_cost_by_pos(a) < node_cost_by_pos(b); }
-      );
+      // std::vector<size_t> ord(C);
+      // std::iota(ord.begin(), ord.end(), 0);
+      // auto node_cost_by_pos = [&](size_t pos) {
+      //     auto nid = best_node_to_search[pos].node();
+      //     return cost[nid];
+      // };
+      // std::partial_sort(
+      //     ord.begin(), ord.begin() + K, ord.end(),
+      //     [&](size_t a, size_t b){ return node_cost_by_pos(a) < node_cost_by_pos(b); }
+      // );
 
-      std::vector<char> pick(C, 0);
-      for (int i = 0; i < K; ++i) pick[ord[i]] = 1;
+      // std::vector<char> pick(C, 0);
+      // for (int i = 0; i < K; ++i) pick[ord[i]] = 1;
 
-      using NodeT = std::remove_reference_t<decltype(best_node_to_search[0])>;
-      std::vector<NodeT> tmp; tmp.reserve(C);
-      for (int i = 0; i < K; ++i) tmp.push_back(std::move(best_node_to_search[ord[i]])); // 先放Top-K（保持相对顺序）
-      for (int i = 0; i < C; ++i) if (!pick[i]) tmp.push_back(std::move(best_node_to_search[i])); // 再放剩余
-      best_node_to_search.swap(tmp);
-      //print best_node_to_search
+      // using NodeT = std::remove_reference_t<decltype(best_node_to_search[0])>;
+      // std::vector<NodeT> tmp; tmp.reserve(C);
+      // for (int i = 0; i < K; ++i) tmp.push_back(std::move(best_node_to_search[ord[i]])); // 先放Top-K（保持相对顺序）
+      // for (int i = 0; i < C; ++i) if (!pick[i]) tmp.push_back(std::move(best_node_to_search[i])); // 再放剩余
+      // best_node_to_search.swap(tmp);
+      // print best_node_to_search
       // for (int i = 0; i < 100; ++i) {
       //   std::cout<<"best_node_to_search["<<i<<"]="<<best_node_to_search[i].node()<<", cost="<<cost[best_node_to_search[i].node()]<<"\n";
       // }
 
       // 用最好的这一份继续后续流程
-      load_to_device_both(base_node_neighbour, best_node_to_search);
+      load_to_device_both(best_node_to_search);
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
       local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
