@@ -364,7 +364,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       // 先用 max 初始化当前的 cost_delta global
       // global_cost_delta_per_node = std::vector<double>(N2, std::numeric_limits<double>::max());
 
-      for (int t = 0; t < 10; ++t) {
+      for (int t = 0; t < 0; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
@@ -383,8 +383,15 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         }
         load_to_device_both(work_node_to_search);
         Sol trail_routes(sol);
-        run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
-        
+        bool move = true;
+        for (int warmup = 0; warmup < 1; ++warmup) {
+          if (move) {
+            move = run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
+          } else {
+            break;
+          }
+        }
+
         // // 修复：确保cur_cost_delta_per_node有正确的大小
         // if (cur_cost_delta_per_node.size() < move_candidates.vrp_move_candidates.best_cost_delta_per_node.size()) {
         //   cur_cost_delta_per_node.resize(move_candidates.vrp_move_candidates.best_cost_delta_per_node.size());

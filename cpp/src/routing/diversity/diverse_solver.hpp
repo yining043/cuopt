@@ -340,6 +340,7 @@ struct solve {
              sol.get_cost(final_weights));
       auto offset = lm.improve(sol, final_weights, std::numeric_limits<double>::max());
       timer.add_offset(offset);
+      improvement_timer.add_offset(offset);
       printf("AFTER: feasible %d cost %f\n", sol.is_feasible(), sol.get_cost(final_weights));
       if (sol.get_cost(final_weights) < original_cost) {
         output_sol(sol);
@@ -481,6 +482,7 @@ struct solve {
         if (success) { 
           auto offset = lm.improve(temp_pair.first, weights, timer.remaining_time()); 
           timer.add_offset(offset);
+          improvement_timer.add_offset(offset);
         }
         working_vector.push_back(temp_pair.first);
       } else {
@@ -503,6 +505,7 @@ struct solve {
         if (success) { 
           auto offset = lm.improve(temp_pair.first, weights, timer.remaining_time()); 
           timer.add_offset(offset);
+          improvement_timer.add_offset(offset);
         }
         working_vector.push_back(temp_pair.first);
       } else {
@@ -592,6 +595,7 @@ struct solve {
             working_population.solutions[idx.first].second, final_weights, timer.remaining_time());
 
           timer.add_offset(offset);
+          improvement_timer.add_offset(offset);
         }
       }
     }
@@ -611,6 +615,7 @@ struct solve {
 
     auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
     timer.add_offset(offset);
+    improvement_timer.add_offset(offset);
     benchmark_print("Cost after improve : %f \n ", temp_pair.first.get_cost(final_weights));
 
     reserve_population.add_solution(timer.elapsed_time(), temp_pair.first);
@@ -644,6 +649,7 @@ struct solve {
             temp_pair.first, target_vehicle_ids_, single_gen_time, final_weights, timer);
           auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
           timer.add_offset(offset);
+          improvement_timer.add_offset(offset);
           reserve_population.add_solution(timer.elapsed_time(), temp_pair.first);
           working_population.add_solution(timer.elapsed_time(), temp_pair.first);
         }
@@ -747,6 +753,7 @@ struct solve {
       g.generate_solution(temp_pair.first, vehicle_ids, single_gen_time, final_weights, timer);
       auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
       timer.add_offset(offset);
+      improvement_timer.add_offset(offset);
       reserve_population.add_solution(timer.elapsed_time(), temp_pair.first);
     }
   }
@@ -896,6 +903,7 @@ struct solve {
 
         auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
         timer.add_offset(offset);
+        improvement_timer.add_offset(offset);
 
         // If LS is making the initial feasible solutions infeasible,
         // it means that the infeasible weights are not sufficient
@@ -1015,6 +1023,7 @@ struct solve {
         temp_pair.first = p.best();
         auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time(), true);
         timer.add_offset(offset);
+        improvement_timer.add_offset(offset);
         p.add_solution(timer.elapsed_time(), temp_pair.first);
       }
 
@@ -1085,6 +1094,7 @@ struct solve {
           if (!feasible_only || offspring.is_feasible()) {
             auto offset = lm.improve(offspring, weights, improvement_timer.remaining_time(), run_cycle_finder);
             timer.add_offset(offset);
+            improvement_timer.add_offset(offset);
             recombine_stats.update_improve_stats(
               offspring.get_cost(weights), cost_first, cost_second);
             working_insertion_index = p.add_solution(timer.elapsed_time(), offspring);
