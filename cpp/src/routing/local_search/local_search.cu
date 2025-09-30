@@ -337,6 +337,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
     //                 node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
     // restore nodes_to_search
     move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
+    move_candidates.nodes_to_search.n_sampled_nodes = nodes_to_search.size();
   };
 
   //########
@@ -363,7 +364,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       // 先用 max 初始化当前的 cost_delta global
       // global_cost_delta_per_node = std::vector<double>(N2, std::numeric_limits<double>::max());
 
-      for (int t = 0; t < 100; ++t) {
+      for (int t = 0; t < 10; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
