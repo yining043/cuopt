@@ -708,8 +708,8 @@ bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
   raft::common::nvtx::range fun_scope("recycle_unused_moves");
   auto& nodes_to_search  = move_candidates.nodes_to_search;
   constexpr bool recycle = true;
-  bool nodes_remained    = nodes_to_search.sample_nodes_for_recycle(sol, move_candidates);
-  if (!nodes_remained) { return false; }
+  // bool nodes_remained    = nodes_to_search.sample_nodes_for_recycle(sol, move_candidates);
+  // if (!nodes_remained) { return false; }
   if (!find_vrp_moves(sol, move_candidates, recycle, changed_nb_size)) { return false; }
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
   // printf("running recycle, move_found: %d\n", move_found);
@@ -728,14 +728,14 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
   // f_t cost_after = sol.get_cost(true, move_candidates.weights);
   // printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
-  if (move_found) {
-    // copy the current nodes to search beforehand, so sliding can search for it again
-    auto copy_sampled_nodes = move_candidates.nodes_to_search.h_sampled_nodes;
-    // do a single iteration as more iterations doesn't find more moves
-    recycle_unused_moves(sol, move_candidates, changed_nb_size);
-    move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
-    move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
-  }
+  // if (move_found) {
+  //   // copy the current nodes to search beforehand, so sliding can search for it again
+  //   auto copy_sampled_nodes = move_candidates.nodes_to_search.h_sampled_nodes;
+  //   // do a single iteration as more iterations doesn't find more moves
+  //   recycle_unused_moves(sol, move_candidates, changed_nb_size);
+  //   move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
+  //   move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
+  // }
   return move_found;
 }
 

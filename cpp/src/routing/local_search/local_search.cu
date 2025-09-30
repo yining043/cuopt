@@ -307,7 +307,8 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   using clock = std::chrono::steady_clock;
   const i_t N1 = sol.problem_ptr->get_num_orders() + 4 * sol.get_n_routes();  // nodes
   const i_t N2 = sol.problem_ptr->get_num_orders() + sol.get_n_routes();  // nodes
-  std::vector<NodeInfo<int>> base_node_to_search(N1), work_node_to_search(N1);//, best_node_to_search(N1);
+  std::vector<NodeInfo<int>> base_node_to_search(N1), work_node_to_search(N1), save_node_to_search(N1), best_node_to_search(N1);
+  std::vector<int> save_h_best_id_per_node(N2), h_best_id_per_node(N2);
   std::mt19937 rng(std::random_device{}());
 
   // define function to load to device both tables
@@ -328,22 +329,23 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       //########################################################
       auto pause_begin = clock::now();
       // 10 次候选
-      // double best_score = 1000000000.0;
+      double best_score = 1000000000.0;
       base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+      best_node_to_search = base_node_to_search;
       const size_t KK = base_node_to_search.size();
       if (KK > 1) {
           std::shuffle(base_node_to_search.begin(),
                       base_node_to_search.begin() + KK,
                       rng);
       }
-      // move_candidates.nodes_to_search.h_recycled_node_pairs.clear();
 
-      std::vector<NodeInfo<int>> intersection;
-      intersection.clear();
-      for (const auto& node : base_node_to_search) {
-        intersection.push_back(node);
-      }
-      for (int t = 0; t < 00; ++t) {
+      // std::vector<NodeInfo<int>> intersection;
+      // intersection.clear();
+      // for (const auto& node : base_node_to_search) {
+      //   intersection.push_back(node);
+      // }
+      bool total_success = false;
+      for (int t = 0; t < 20; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
@@ -358,53 +360,68 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         }
         load_nodes_to_search(work_node_to_search);
         Sol trail_routes(sol);
+        bool move = true;
+        bool success = true;
         if constexpr (REQUEST == request_t::VRP) {
-          if (move_candidates.nodes_to_search.sample_nodes_to_search(trail_routes, rng, false)) {
-            auto move_found = perform_vrp_search(trail_routes, move_candidates, 96);
-            move_candidates.nodes_to_search.restore_found_nodes(trail_routes);
-            // printf("trail %d, move_found: %d, n_sampled_nodes: %d\n", t, move_found, move_candidates.nodes_to_search.n_sampled_nodes);
+          for (int k = 0; k < 20; ++k) {
+            if (move_candidates.nodes_to_search.sample_nodes_to_search(trail_routes, rng, false) && move) {
+              move = perform_vrp_search(trail_routes, move_candidates, 96);
+              move_candidates.nodes_to_search.restore_found_nodes(trail_routes);
+              // printf("trail %d, move_found: %d, n_sampled_nodes: %d\n", t, move_found, move_candidates.nodes_to_search.n_sampled_nodes);
+            
+              //for the first time
+              if (k==0) {
+                save_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+                raft::copy(save_h_best_id_per_node.data(),
+                  move_candidates.vrp_move_candidates.best_id_per_node.data(),
+                  save_h_best_id_per_node.size(),
+                  sol.sol_handle->get_stream()
+                );
+                // Synchronize again to ensure copy is complete
+                sol.sol_handle->sync_stream();
+              }
+            }
+            else if (k==0)
+            {
+              success = false;
+              move = false;
+              save_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+              break;
+            }
+            else
+            {
+              break;
+            }
           }
         } else {
           exit(0);
-          // run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
         }
 
-        // 从本次试探中复制 best_id_per_node 并汇总为 (node_id, best_id) 对 直接存储到 h_recycled_node_pairs
-        {
-          // int count_non_null = 0;
-          raft::copy(move_candidates.nodes_to_search.h_best_id_per_node.data(),
-            move_candidates.vrp_move_candidates.best_id_per_node.data(),
-            move_candidates.nodes_to_search.h_best_id_per_node.size(),
-            sol.sol_handle->get_stream()
-          );
-          auto& host_best_ids = move_candidates.nodes_to_search.h_best_id_per_node;
-          for (i_t nid = 0; nid < (int)host_best_ids.size(); ++nid) {
-            const i_t best = host_best_ids[nid];
-            if (best != -1) {
-              move_candidates.nodes_to_search.h_recycled_node_pairs.push_back(int2{nid, best});
-              // count_non_null++;
-            }
-          }
-          // printf("trail %d, count_non_null: %d\n", t, count_non_null);
+        auto s = trail_routes.get_cost(true, move_candidates.weights);
+        if (s < best_score && success) {
+          best_score = s;
+          best_node_to_search = save_node_to_search;  // 保存最佳配置
+          h_best_id_per_node = save_h_best_id_per_node;
         }
+        total_success = total_success || success;
 
         // 试探后：move_candidates.nodes_to_search.h_nodes_to_search 是剩余的节点列表
-        {
-          const auto& remaining_nodes = move_candidates.nodes_to_search.h_nodes_to_search;
-          std::set<int> remaining_node_ids;
-          for (const auto& node : remaining_nodes) {
-            remaining_node_ids.insert(node.node());
-          }
+        // {
+        //   const auto& remaining_nodes = move_candidates.nodes_to_search.h_nodes_to_search;
+        //   std::set<int> remaining_node_ids;
+        //   for (const auto& node : remaining_nodes) {
+        //     remaining_node_ids.insert(node.node());
+        //   }
           
-          // 更新 intersection 为交集（移除不在剩余节点中的而且host_best_ids[nid]==-1的节点）
-          intersection.erase(
-            std::remove_if(intersection.begin(), intersection.end(),
-              [&remaining_node_ids](const NodeInfo<int>& node) {
-                return remaining_node_ids.find(node.node()) == remaining_node_ids.end();
-              }),
-            intersection.end()
-          );
-        }
+        //   // 更新 intersection 为交集（移除不在剩余节点中的而且host_best_ids[nid]==-1的节点）
+        //   intersection.erase(
+        //     std::remove_if(intersection.begin(), intersection.end(),
+        //       [&remaining_node_ids](const NodeInfo<int>& node) {
+        //         return remaining_node_ids.find(node.node()) == remaining_node_ids.end();
+        //       }),
+        //     intersection.end()
+        //   );
+        // }
 
 
 
@@ -414,8 +431,11 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         //   best_node_to_search = work_node_to_search;  // 保存最佳配置
         // }
       }
-      // 基于汇总的 pair 进行一次 recycle 轻量搜索（仅 VRP 生效）；其他请求类型保留原有流程
+      
       if constexpr (REQUEST == request_t::VRP) {
+        // int count_non_null = 0;
+        // printf("trail %d, count_non_null: %d\n", t, count_non_null);
+
         // 用 aggregated_pairs 替换 move_candidates.vrp_move_candidates.best_id_per_node
         // auto& aggregated_pairs = move_candidates.nodes_to_search.h_recycled_node_pairs;
         // bool nodes_remained = !aggregated_pairs.empty();
@@ -449,10 +469,25 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         exit(0);
       }
       // 使用剩余节点集合进行最后的搜索
-      load_nodes_to_search(intersection);
-      // move_candidates.nodes_to_search.n_sampled_nodes = move_candidates.nodes_to_search.h_recycled_node_pairs.size(); //!!!! not sure if bug!!!!
+      load_nodes_to_search(best_node_to_search);
+      if (total_success){
+        // Ensure all device operations are complete before using host data
+        move_candidates.nodes_to_search.h_recycled_node_pairs.clear();
+        for (i_t nid = 0; nid < (int)h_best_id_per_node.size(); ++nid) {
+          const i_t best = h_best_id_per_node[nid];
+          if (best != -1) {
+            move_candidates.nodes_to_search.h_recycled_node_pairs.push_back(int2{nid, best});
+          }
+        }
+        raft::copy(move_candidates.nodes_to_search.recycled_node_pairs.data(),
+                  move_candidates.nodes_to_search.h_recycled_node_pairs.data(),
+                  move_candidates.nodes_to_search.h_recycled_node_pairs.size(),
+                  sol.sol_handle->get_stream());
+        sol.sol_handle->sync_stream();
+        move_candidates.nodes_to_search.n_sampled_nodes = move_candidates.nodes_to_search.h_recycled_node_pairs.size(); //!!!! not sure if bug!!!!
+      }
       printf("number of nodes to search: %zu, size of base_nodes_to_search: %zu\n", move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
-      
+      printf("number of recycled pairs: %zu\n", move_candidates.nodes_to_search.h_recycled_node_pairs.size());
       //!!!! no delete!!!!
       
       auto pause_end   = clock::now();
@@ -483,15 +518,20 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       bool move_found_here = false;
       if constexpr (REQUEST == request_t::VRP) {
         // 仅 VRP：使用 recycle 的轻量搜索
-        move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
-        // if (move_candidates.nodes_to_search.h_recycled_node_pairs.size() > 0) {
-        //   // move_found_here = recycle_unused_moves(sol, move_candidates, 96);
-        //   // move_candidates.nodes_to_search.restore_found_nodes(sol);
-        // }
+        if (move_candidates.nodes_to_search.h_recycled_node_pairs.size() > 0 && total_success) {
+          for (int attempt = 0; attempt < 2; ++attempt) {
+              move_found_here = recycle_unused_moves(sol, move_candidates, 96);
+          }
+          move_candidates.nodes_to_search.restore_found_nodes(sol);
+        }
+        else {
+          load_nodes_to_search(base_node_to_search);
+          move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
+          printf("not success at : %d\n", iter);
+        }
       } else {
-        exit(0);
         // 非 VRP：沿用原 run_fast_search
-        // move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
+        exit(0);
       }
       f_t cost_after = sol.get_cost(true, move_candidates.weights);
       printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
