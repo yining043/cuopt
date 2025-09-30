@@ -712,6 +712,7 @@ bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
   if (!nodes_remained) { return false; }
   if (!find_vrp_moves(sol, move_candidates, recycle, changed_nb_size)) { return false; }
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
+  // printf("running recycle, move_found: %d\n", move_found);
   return move_found;
 }
 
@@ -740,6 +741,12 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
 
 template bool perform_vrp_search<int, float, request_t::VRP>(
   solution_t<int, float, request_t::VRP>& sol, move_candidates_t<int, float>& move_candidates, int changed_nb_size);
+
+// Ensure linker has a strong symbol for recycle_unused_moves (VRP instantiation)
+template bool recycle_unused_moves<int, float, request_t::VRP>(
+  solution_t<int, float, request_t::VRP>&,
+  move_candidates_t<int, float>&,
+  int);
 
 }  // namespace detail
 }  // namespace routing

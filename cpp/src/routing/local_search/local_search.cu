@@ -22,6 +22,28 @@
 #include "compute_insertions.cuh"
 #include "vrp/nodes_to_search.cuh"
 #include "vrp/vrp_search.cuh"
+#include "vrp/vrp_execute.cuh"
+
+// forward declaration to use recycle-mode search without including implementation TUs
+namespace cuopt {
+namespace routing {
+namespace detail {
+template <typename i_t, typename f_t, request_t REQUEST>
+bool find_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
+                    move_candidates_t<i_t, f_t>& move_candidates,
+                    bool recycle,
+                    i_t changed_nb_size);
+template <typename i_t, typename f_t, request_t REQUEST>
+bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
+                          move_candidates_t<i_t, f_t>& move_candidates,
+                          i_t changed_nb_size);
+template <typename i_t, typename f_t, request_t REQUEST>
+bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
+                          move_candidates_t<i_t, f_t>& move_candidates,
+                          i_t changed_nb_size);
+}  // namespace detail
+}  // namespace routing
+}  // namespace cuopt
 
 #include <routing/utilities/cuopt_utils.cuh>
 #include <utilities/copy_helpers.hpp>
@@ -281,77 +303,32 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   [[maybe_unused]] double cost_before = 0., cost_after = 0.;
 
   //########
-  // sol.print();
   using Sol = cuopt::routing::detail::solution_t<i_t, f_t, REQUEST>;
   using clock = std::chrono::steady_clock;
-  // host 侧构造 1000×1000，每行是随机排列
-  // 维度
   const i_t N1 = sol.problem_ptr->get_num_orders() + 4 * sol.get_n_routes();  // nodes
   const i_t N2 = sol.problem_ptr->get_num_orders() + sol.get_n_routes();  // nodes
-  //========= 1111
-  // std::vector<i_t> base_node_neighbour(N), work_node_neighbour(N), best_node_neighbour(N);
-  // cudaMemcpy(base_node_neighbour.data(),
-  //                 move_candidates.viables.viable_to_pickups.data(),
-  //                 BYTES, cudaMemcpyDeviceToHost);
-  // best_node_neighbour = base_node_neighbour;
-  std::vector<NodeInfo<int>> base_node_to_search(N1), work_node_to_search(N1), best_node_to_search(N1);
-
-  //========= 2222
-  std::vector<double> cur_cost_delta_per_node(N2), global_cost_delta_per_node(N2);
-  //========= 3333             
-  // 随机选 K 个元素并“稳定”移动到最前（保持相对顺序）
-  std::mt19937_64 rng(std::random_device{}());
-  // auto jitter_row = [&](NodeInfo<int>* row, int C) {
-  // // auto jitter_row = [&](i_t* row, int C) {
-  //   if (C <= 1) return;
-  //   int K = std::max<int>(1, C / 500);          // 约 0.2% 元素，至少 1 个
-  //   if (K > C) K = C;
-
-  //   // 选 K 个唯一下标
-  //   std::vector<int> idx(C);
-  //   std::iota(idx.begin(), idx.end(), 0);
-  //   std::shuffle(idx.begin(), idx.end(), rng);
-  //   idx.resize(K);
-  //   std::sort(idx.begin(), idx.end());         // 选中元素按原顺序排列
-
-  //   // 组装：先放选中的，再放其余的（两段都保持原相对顺序）
-  //   using Elem = std::remove_reference_t<decltype(row[0])>;  // ← 元素类型
-  //   std::vector<Elem> tmp;   
-  //   tmp.reserve(C);
-  //   for (int p : idx) tmp.push_back(row[p]);   // 选中的到前面
-  //   for (int i = 0, j = 0; i < C; ++i) {       // 其余的跟上
-  //     if (j < K && i == idx[j]) { ++j; continue; }
-  //     tmp.push_back(row[i]);
-  //   }
-  //   std::copy(tmp.begin(), tmp.end(), row);
-  // };
-
-  // 10 次候选
-  double best_score = 1000000000.0;
+  std::vector<NodeInfo<int>> base_node_to_search(N1), work_node_to_search(N1);//, best_node_to_search(N1);
+  std::mt19937 rng(std::random_device{}());
 
   // define function to load to device both tables
-  auto load_to_device_both = [&](std::vector<NodeInfo<int>> nodes_to_search) {
-    // cudaMemcpy(move_candidates.viables.viable_to_pickups.data(),
-    //                 node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
-    // cudaMemcpy(move_candidates.viables.viable_from_pickups.data(),
-    //                 node_neibour_list.data(), BYTES, cudaMemcpyHostToDevice);
-    // restore nodes_to_search
+  auto load_nodes_to_search = [&](std::vector<NodeInfo<int>> nodes_to_search) {
     move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
+    move_candidates.nodes_to_search.n_sampled_nodes = nodes_to_search.size();
   };
 
   //########
   while (iter < iter_limit) {
+    printf("iter: %d\n", iter);
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
     // fast loop, insider this sliding, fast vrp search and fast cross search happens
     while (true) { 
-      // if (local_search_count >= ??) { exit(0); } // for debug !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-      if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
+       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
       //########################################################
       auto pause_begin = clock::now();
       // 10 次候选
-      best_score = 1000000000.0;
+      // double best_score = 1000000000.0;
       base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
       const size_t KK = base_node_to_search.size();
       if (KK > 1) {
@@ -359,11 +336,14 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                       base_node_to_search.begin() + KK,
                       rng);
       }
-      best_node_to_search = base_node_to_search;
-      // 先用 max 初始化当前的 cost_delta global
-      // global_cost_delta_per_node = std::vector<double>(N2, std::numeric_limits<double>::max());
+      // move_candidates.nodes_to_search.h_recycled_node_pairs.clear();
 
-      for (int t = 0; t < 100; ++t) {
+      std::vector<NodeInfo<int>> intersection;
+      intersection.clear();
+      for (const auto& node : base_node_to_search) {
+        intersection.push_back(node);
+      }
+      for (int t = 0; t < 00; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
@@ -375,78 +355,109 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                           work_node_to_search.begin() + KK,
                           rng);
           }
-
-          // for (i_t r = 0; r < R; ++r) {
-          // jitter_row(work_node_to_search.data(), work_node_to_search.size());
-          // }
         }
-        load_to_device_both(work_node_to_search);
+        load_nodes_to_search(work_node_to_search);
         Sol trail_routes(sol);
-        run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
-        
-        // // 修复：确保cur_cost_delta_per_node有正确的大小
-        // if (cur_cost_delta_per_node.size() < move_candidates.vrp_move_candidates.best_cost_delta_per_node.size()) {
-        //   cur_cost_delta_per_node.resize(move_candidates.vrp_move_candidates.best_cost_delta_per_node.size());
-        // }
-        
-        // raft::copy(cur_cost_delta_per_node.data(),
-        //           move_candidates.vrp_move_candidates.best_cost_delta_per_node.data(),
-        //           move_candidates.vrp_move_candidates.best_cost_delta_per_node.size(),
-        //           sol.sol_handle->get_stream());
-        // sol.sol_handle->sync_stream();
-        // element-wise min to global
-        // for (size_t i = 0; i < N; ++i) {
-        //   if (cur_cost_delta_per_node[i] < global_cost_delta_per_node[i]) {
-        //     global_cost_delta_per_node[i] = cur_cost_delta_per_node[i];
-        //   }
-        // }
-        auto s = trail_routes.get_cost(true, move_candidates.weights);
-        if (s < best_score) {
-          best_score = s;
-          best_node_to_search = work_node_to_search;  // 保存最佳配置
-          // global_cost_delta_per_node = cur_cost_delta_per_node;
-          // base = best; // update base to best
+        if constexpr (REQUEST == request_t::VRP) {
+          if (move_candidates.nodes_to_search.sample_nodes_to_search(trail_routes, rng, false)) {
+            auto move_found = perform_vrp_search(trail_routes, move_candidates, 96);
+            move_candidates.nodes_to_search.restore_found_nodes(trail_routes);
+            // printf("trail %d, move_found: %d, n_sampled_nodes: %d\n", t, move_found, move_candidates.nodes_to_search.n_sampled_nodes);
+          }
+        } else {
+          exit(0);
+          // run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96);
         }
+
+        // 从本次试探中复制 best_id_per_node 并汇总为 (node_id, best_id) 对 直接存储到 h_recycled_node_pairs
+        {
+          // int count_non_null = 0;
+          raft::copy(move_candidates.nodes_to_search.h_best_id_per_node.data(),
+            move_candidates.vrp_move_candidates.best_id_per_node.data(),
+            move_candidates.nodes_to_search.h_best_id_per_node.size(),
+            sol.sol_handle->get_stream()
+          );
+          auto& host_best_ids = move_candidates.nodes_to_search.h_best_id_per_node;
+          for (i_t nid = 0; nid < (int)host_best_ids.size(); ++nid) {
+            const i_t best = host_best_ids[nid];
+            if (best != -1) {
+              move_candidates.nodes_to_search.h_recycled_node_pairs.push_back(int2{nid, best});
+              // count_non_null++;
+            }
+          }
+          // printf("trail %d, count_non_null: %d\n", t, count_non_null);
+        }
+
+        // 试探后：move_candidates.nodes_to_search.h_nodes_to_search 是剩余的节点列表
+        {
+          const auto& remaining_nodes = move_candidates.nodes_to_search.h_nodes_to_search;
+          std::set<int> remaining_node_ids;
+          for (const auto& node : remaining_nodes) {
+            remaining_node_ids.insert(node.node());
+          }
+          
+          // 更新 intersection 为交集（移除不在剩余节点中的而且host_best_ids[nid]==-1的节点）
+          intersection.erase(
+            std::remove_if(intersection.begin(), intersection.end(),
+              [&remaining_node_ids](const NodeInfo<int>& node) {
+                return remaining_node_ids.find(node.node()) == remaining_node_ids.end();
+              }),
+            intersection.end()
+          );
+        }
+
+
+
+        // auto s = trail_routes.get_cost(true, move_candidates.weights);
+        // if (s < best_score) {
+        //   best_score = s;
+        //   best_node_to_search = work_node_to_search;  // 保存最佳配置
+        // }
       }
-      // printf("best score in 1000 trails: %f\n", best_score);
+      // 基于汇总的 pair 进行一次 recycle 轻量搜索（仅 VRP 生效）；其他请求类型保留原有流程
+      if constexpr (REQUEST == request_t::VRP) {
+        // 用 aggregated_pairs 替换 move_candidates.vrp_move_candidates.best_id_per_node
+        // auto& aggregated_pairs = move_candidates.nodes_to_search.h_recycled_node_pairs;
+        // bool nodes_remained = !aggregated_pairs.empty();
+        // printf("fast-search pairs aggregated before:  %zu\n", aggregated_pairs.size());
+        // if (nodes_remained) {
 
-      // 固定最优
-      // best_node_to_search = base_node_to_search;
-      // int C = static_cast<int>(best_node_to_search.size()); // columns
-      // auto& cost = global_cost_delta_per_node;
-      // int K = 40; // top K
-      // if (K > C) K = C;
+        //   // 去重配对
+        //   auto pair_less = [](const int2& a, const int2& b) {
+        //     if (a.x != b.x) { return a.x < b.x; }
+        //     return a.y < b.y;
+        //   };
+        //   std::sort(aggregated_pairs.begin(), aggregated_pairs.end(), pair_less);
+        //   aggregated_pairs.erase(std::unique(aggregated_pairs.begin(),
+        //                                     aggregated_pairs.end(),
+        //                                     [](const int2& a, const int2& b) {
+        //                                       return a.x == b.x && a.y == b.y;
+        //                                     }),
+        //                         aggregated_pairs.end());
+        //   raft::copy(move_candidates.nodes_to_search.recycled_node_pairs.data(),
+        //               aggregated_pairs.data(),
+        //               aggregated_pairs.size(),
+        //               sol.sol_handle->get_stream());
+        // }
+        
+        // printf("fast-search pairs aggregated after: %zu\n", aggregated_pairs.size());
+        
+        // 10次试探后，intersection就是剩余未搜索的节点
+        // printf("remaining nodes after 10 trials: %zu\n", intersection.size());
 
-      // std::vector<size_t> ord(C);
-      // std::iota(ord.begin(), ord.end(), 0);
-      // auto node_cost_by_pos = [&](size_t pos) {
-      //     auto nid = best_node_to_search[pos].node();
-      //     return cost[nid];
-      // };
-      // std::partial_sort(
-      //     ord.begin(), ord.begin() + K, ord.end(),
-      //     [&](size_t a, size_t b){ return node_cost_by_pos(a) < node_cost_by_pos(b); }
-      // );
-
-      // std::vector<char> pick(C, 0);
-      // for (int i = 0; i < K; ++i) pick[ord[i]] = 1;
-
-      // using NodeT = std::remove_reference_t<decltype(best_node_to_search[0])>;
-      // std::vector<NodeT> tmp; tmp.reserve(C);
-      // for (int i = 0; i < K; ++i) tmp.push_back(std::move(best_node_to_search[ord[i]])); // 先放Top-K（保持相对顺序）
-      // for (int i = 0; i < C; ++i) if (!pick[i]) tmp.push_back(std::move(best_node_to_search[i])); // 再放剩余
-      // best_node_to_search.swap(tmp);
-      // print best_node_to_search
-      // for (int i = 0; i < 100; ++i) {
-      //   std::cout<<"best_node_to_search["<<i<<"]="<<best_node_to_search[i].node()<<", cost="<<cost[best_node_to_search[i].node()]<<"\n";
-      // }
-
-      // 用最好的这一份继续后续流程
-      load_to_device_both(best_node_to_search);
+      } else {
+        exit(0);
+      }
+      // 使用剩余节点集合进行最后的搜索
+      load_nodes_to_search(intersection);
+      // move_candidates.nodes_to_search.n_sampled_nodes = move_candidates.nodes_to_search.h_recycled_node_pairs.size(); //!!!! not sure if bug!!!!
+      printf("number of nodes to search: %zu, size of base_nodes_to_search: %zu\n", move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
+      
+      //!!!! no delete!!!!
+      
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
       local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
-      printf("number of nodes to search: %zu, size of base_nodes_to_search: %zu\n", move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
       //########################################################
       // raft::print_device_vector("viable_to_pickups: ",
       //                   move_candidates.viables.viable_to_pickups.data() + 1000,
@@ -469,7 +480,19 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       //########################################################
       //########################################################
       f_t cost_before = sol.get_cost(true, move_candidates.weights);
-      bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
+      bool move_found_here = false;
+      if constexpr (REQUEST == request_t::VRP) {
+        // 仅 VRP：使用 recycle 的轻量搜索
+        move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
+        // if (move_candidates.nodes_to_search.h_recycled_node_pairs.size() > 0) {
+        //   // move_found_here = recycle_unused_moves(sol, move_candidates, 96);
+        //   // move_candidates.nodes_to_search.restore_found_nodes(sol);
+        // }
+      } else {
+        exit(0);
+        // 非 VRP：沿用原 run_fast_search
+        // move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
+      }
       f_t cost_after = sol.get_cost(true, move_candidates.weights);
       printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
 
