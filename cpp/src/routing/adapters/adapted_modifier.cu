@@ -67,13 +67,13 @@ std::chrono::steady_clock::duration adapted_modifier_t<i_t, f_t, REQUEST>::impro
 
   resource.ls.set_active_weights(gpu_weight);
   resource.ls.start_timer(time_limit);
-  resource.ls.run_best_local_search(
+  auto offset = resource.ls.run_best_local_search(
     adapted_solution.sol, consider_unserviced, time_limit_enabled, run_cycle_finder);
   adapted_solution.populate_host_data();
   adapted_solution.check_device_host_coherence();
   cuopt_func_call(adapted_solution.sol.check_cost_coherence(gpu_weight));
   pool_allocator.resource_pool->release(index);
-  return resource.ls.get_total_offset();
+  return offset;
 }
 
 // add unserviced pdp requests to the solution

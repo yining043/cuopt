@@ -276,13 +276,16 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
+std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
                                                               const bool consider_unserviced,
                                                               const bool time_limit_enabled,
                                                               const bool run_cycle_finder)
 {
   // Handle a corner case when there is no single task that is feasible
-  if (sol.n_routes == 0) { return; }
+  if (sol.n_routes == 0) { return std::chrono::steady_clock::duration(0); }
+  
+  // Reset offset at the beginning
+  total_offset = std::chrono::steady_clock::duration(0);
   // for production use working weights
   move_candidates.selection_weights = move_candidates.weights;
   // for benchmarks use low random weights
@@ -563,7 +566,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         exit(0);
       }
       f_t cost_after = sol.get_cost(true, move_candidates.weights);
-      printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
+      if (sol.is_feasible()) {
+        printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
+      }
 
       if (move_found_here) { continue; }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
@@ -624,6 +629,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   }
   // reset it, so that next time all routes will be searched unless otherwise is specified
   sol.set_routes_to_search();
+  
+  // Return the accumulated offset
+  return total_offset;
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>

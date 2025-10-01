@@ -30,12 +30,12 @@ struct adapted_generator_t {
     pool_allocator_t<i_t, f_t, detail::solution_t<i_t, f_t, REQUEST>, detail::problem_t<i_t, f_t>>;
   adapted_generator_t(const problem_t<i_t, f_t>& problem_, allocator& pool_allocator_);
   // make feasible function greedily ejects
-  bool make_feasible(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
+  std::pair<bool, std::chrono::steady_clock::duration> make_feasible(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
                      f_t time_limit,
                      costs const& weight,
                      bool clear_scores);
   // creates an initial solution until the given time budget or n_routes are reached
-  void generate_solution(adapted_sol_t<i_t, f_t, REQUEST>& sol,
+  std::chrono::steady_clock::duration generate_solution(adapted_sol_t<i_t, f_t, REQUEST>& sol,
                          const std::vector<i_t>& desired_vehicle_ids,
                          f_t time_limit,
                          costs const& weight,
