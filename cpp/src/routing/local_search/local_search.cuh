@@ -119,7 +119,7 @@ class local_search_t {
                    const_cast<viables_t<i_t, f_t>&>(viables_const)) {}
   // computes candidates of insertion and ejection on given solution
 
-  void run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
+  std::chrono::steady_clock::duration run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
                              const bool consider_unserviced,
                              const bool time_limit_enabled,
                              const bool run_cycle_finder);

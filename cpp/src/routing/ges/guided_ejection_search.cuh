@@ -83,7 +83,7 @@ class guided_ejection_search_t {
   explicit guided_ejection_search_t(solution_t<i_t, f_t, REQUEST>& dummy_sol,
                                     local_search_t<i_t, f_t, REQUEST>* local_search,
                                     std::ofstream* intermediate_file = nullptr);
-  bool guided_ejection_search_loop(i_t& counter, bool minimize_routes, i_t desired_ep_size = 0);
+  std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_loop(i_t& counter, bool minimize_routes, i_t desired_ep_size = 0);
   bool greedy_insert(bool insert_all = false);
   bool time_stop_condition_reached();
   void start_timer(std::chrono::time_point<std::chrono::steady_clock> start_time,
@@ -91,12 +91,12 @@ class guided_ejection_search_t {
   void set_solution_ptr(solution_t<i_t, f_t, REQUEST>* solution_ptr, bool clear_scores = true);
   // cannot be private because used in tests
   bool run_lexicographic_search(request_info_t<i_t, REQUEST>* __restrict__ request_id);
-  void route_minimizer_loop();
-  bool fixed_route_loop();
-  bool construct_feasible_solution();
+  std::chrono::steady_clock::duration route_minimizer_loop();
+  std::pair<bool, std::chrono::steady_clock::duration> fixed_route_loop();
+  std::pair<bool, std::chrono::steady_clock::duration> construct_feasible_solution();
   // cannot be private due to device lambda
   void init_ejection_pool();
-  bool try_squeeze_feasible(const request_info_t<i_t, REQUEST>* request, bool random_route = true);
+  std::pair<bool, std::chrono::steady_clock::duration> try_squeeze_feasible(const request_info_t<i_t, REQUEST>* request, bool random_route = true);
   void squeeze(const request_info_t<i_t, REQUEST>* request, bool random_route = true);
   void squeeze_all_ep();
   bool repair_empty_routes();
@@ -112,7 +112,7 @@ class guided_ejection_search_t {
                                       request_info_t<i_t, REQUEST>* __restrict__ req);
 
   void squeeze_breaks();
-  bool try_squeeze_breaks_feasible();
+  std::pair<bool, std::chrono::steady_clock::duration> try_squeeze_breaks_feasible();
 
   rmm::device_uvector<i_t> p_scores_;
   rmm::device_scalar<uint32_t> global_min_p_;
@@ -140,7 +140,7 @@ class guided_ejection_search_t {
   void dump_to_file(std::string msg);
   void shuffle_pool();
   void squeeze_remaining_requests();
-  bool squeeze_all_and_save();
+  std::pair<bool, std::chrono::steady_clock::duration> squeeze_all_and_save();
   f_t remaining_time() const;
 
   // Data reuse for get_all_feasible_insertion

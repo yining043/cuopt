@@ -518,7 +518,9 @@ struct solve {
   {
     for (int i = 0; i < number_to_fill; ++i) {
       double gen_time = 2.;
-      g.generate_solution(temp_pair.first, target_vehicle_ids_, gen_time, final_weights, timer);
+      auto offset = g.generate_solution(temp_pair.first, target_vehicle_ids_, gen_time, final_weights, timer);
+      timer.add_offset(offset);
+      improvement_timer.add_offset(offset);
       working_vector.push_back(temp_pair.first);
     }
   }
@@ -607,8 +609,10 @@ struct solve {
     temp_pair.first = reserve_population.get_random_solution_tournament();
     benchmark_print("Cost before make_feasible : %f \n", temp_pair.first.get_cost(final_weights));
 
-    bool feasibilized =
+    auto [feasibilized, make_feasible_offset] =
       g.make_feasible(temp_pair.first, timer.clamp_remaining_time(60), final_weights, false);
+    timer.add_offset(make_feasible_offset);
+    improvement_timer.add_offset(make_feasible_offset);
     benchmark_print("Cost after make_feasible : %f After make_feasible : %d \n ",
                     temp_pair.first.get_cost(final_weights),
                     feasibilized);
@@ -645,8 +649,10 @@ struct solve {
         double single_gen_time = std::min(time_left * 0.05, 20.) * ges_time_fraction;
         // add five or so solutions to reserve
         for (int i = 0; i < 5; ++i) {
-          g.generate_solution(
+          auto gen_offset = g.generate_solution(
             temp_pair.first, target_vehicle_ids_, single_gen_time, final_weights, timer);
+          timer.add_offset(gen_offset);
+          improvement_timer.add_offset(gen_offset);
           auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
           timer.add_offset(offset);
           improvement_timer.add_offset(offset);
@@ -750,7 +756,9 @@ struct solve {
     sols_num               = std::min<int>(
       sols_num, (int)reserve_population.max_solutions - (int)reserve_population.current_size());
     for (int i = 0; i < sols_num; ++i) {
-      g.generate_solution(temp_pair.first, vehicle_ids, single_gen_time, final_weights, timer);
+      auto gen_offset = g.generate_solution(temp_pair.first, vehicle_ids, single_gen_time, final_weights, timer);
+      timer.add_offset(gen_offset);
+      improvement_timer.add_offset(gen_offset);
       auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
       timer.add_offset(offset);
       improvement_timer.add_offset(offset);
@@ -874,8 +882,10 @@ struct solve {
           // We don't know what vehicles will be used until we generate first
           // time
           std::vector<int> desired_vehicle_ids;
-          g.generate_solution(
+          auto gen_offset = g.generate_solution(
             temp_pair.first, desired_vehicle_ids, time_limit, final_weights, timer);
+          timer.add_offset(gen_offset);
+          island_creation_timer.add_offset(gen_offset);
           first_gen           = false;
           target_vehicles_    = temp_pair.first.sol.get_n_routes();
           target_vehicle_ids_ = temp_pair.first.sol.get_used_vehicle_ids();
@@ -892,8 +902,10 @@ struct solve {
           }
         } else {
           auto time_limit = timer.clamp_remaining_time(sol_gen_time);
-          g.generate_solution(
+          auto gen_offset = g.generate_solution(
             temp_pair.first, target_vehicle_ids_, time_limit, final_weights, timer);
+          timer.add_offset(gen_offset);
+          island_creation_timer.add_offset(gen_offset);
           first_gen = false;
         }
         // increase the solution generation time if we didn't find
@@ -904,6 +916,7 @@ struct solve {
         auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
         timer.add_offset(offset);
         improvement_timer.add_offset(offset);
+        island_creation_timer.add_offset(offset);
 
         // If LS is making the initial feasible solutions infeasible,
         // it means that the infeasible weights are not sufficient

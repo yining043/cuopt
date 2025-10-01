@@ -254,13 +254,16 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
+std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
                                                               const bool consider_unserviced,
                                                               const bool time_limit_enabled,
                                                               const bool run_cycle_finder)
 {
   // Handle a corner case when there is no single task that is feasible
-  if (sol.n_routes == 0) { return; }
+  if (sol.n_routes == 0) { return std::chrono::steady_clock::duration(0); }
+  
+  // Reset offset at the beginning
+  total_offset = std::chrono::steady_clock::duration(0);
   // for production use working weights
   move_candidates.selection_weights = move_candidates.weights;
   // for benchmarks use low random weights
@@ -408,7 +411,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
         //     global_cost_delta_per_node[i] = cur_cost_delta_per_node[i];
         //   }
         // }
-        auto s = trail_routes.get_cost(true, move_candidates.weights);
+        auto obj_costs = trail_routes.get_objective_cost();
+        auto obj_weights = trail_routes.problem_ptr->dimensions_info.objective_weights;
+        auto s = objective_cost_t::dot(obj_weights, obj_costs);
         if (s < best_score) {
           best_score = s;
           best_node_to_search = work_node_to_search;  // 保存最佳配置
@@ -479,7 +484,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       f_t cost_before = sol.get_cost(true, move_candidates.weights);
       bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96);
       f_t cost_after = sol.get_cost(true, move_candidates.weights);
-      printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
+      if (sol.is_feasible()) {
+        printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found_here);
+      }
 
       if (move_found_here) { continue; }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
@@ -540,6 +547,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
   }
   // reset it, so that next time all routes will be searched unless otherwise is specified
   sol.set_routes_to_search();
+  
+  // Return the accumulated offset
+  return total_offset;
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
