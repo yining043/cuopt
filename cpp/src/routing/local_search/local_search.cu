@@ -331,7 +331,6 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       iter++;
       //########################################################
       auto pause_begin = clock::now();
-      // 10 次候选
       double best_score = 1000000000.0;
       base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
       best_node_to_search_before = base_node_to_search;
@@ -349,7 +348,12 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       //   intersection.push_back(node);
       // }
       bool total_success = false;
-      for (int t = 0; t < 1; ++t) {
+      
+      // 跨 trial 聚合的 best_id_per_node（从所有 trial 中收集最优 move patterns）
+      std::vector<int> global_best_id(N2, -1);
+      std::vector<double> global_best_cost(N2, std::numeric_limits<double>::max());
+      
+      for (int t = 0; t < 100; ++t) {
         
         if (t == 0) {
           work_node_to_search = base_node_to_search;  // 不扰动
@@ -367,22 +371,45 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
         bool move = true;
         bool success = true;
         if constexpr (REQUEST == request_t::VRP) {
-          for (int k = 0; k < 1; ++k) {
-            if (move_candidates.nodes_to_search.sample_nodes_to_search(trail_routes, rng, false) && move) {
+          // 累积前几次k的best_id_per_node以获得更多节点对
+          std::vector<int> accumulated_best_id(N2, -1);
+          std::vector<double> accumulated_best_cost(N2, std::numeric_limits<double>::max());
+          
+          for (int k = 0; k < 200; ++k) {
+            // k=0时使用full_set以获得更多的best_id_per_node entries
+            bool use_full_set = true;
+            
+            if (move_candidates.nodes_to_search.sample_nodes_to_search(trail_routes, rng, use_full_set) && move) {
               move = perform_vrp_search(trail_routes, move_candidates, 96);
+              
+              // 累积前5次的best_id_per_node
+              if (k < 1000000000 && move) {
+                std::vector<int> curr_id(N2);
+                std::vector<double> curr_cost(N2);
+                
+                raft::copy(curr_id.data(),
+                          move_candidates.vrp_move_candidates.best_id_per_node.data(),
+                          N2, sol.sol_handle->get_stream());
+                raft::copy(curr_cost.data(),
+                          move_candidates.vrp_move_candidates.best_cost_delta_per_node.data(),
+                          N2, sol.sol_handle->get_stream());
+                sol.sol_handle->sync_stream();
+                
+                // 合并：保留cost更小的节点对
+                for (int i = 0; i < N2; ++i) {
+                  if (curr_id[i] != -1 && curr_cost[i] < accumulated_best_cost[i]) {
+                    accumulated_best_id[i] = curr_id[i];
+                    accumulated_best_cost[i] = curr_cost[i];
+                  }
+                }
+              }
+              
               move_candidates.nodes_to_search.restore_found_nodes(trail_routes);
               // printf("trail %d, move_found: %d, n_sampled_nodes: %d\n", t, move_found, move_candidates.nodes_to_search.n_sampled_nodes);
             
               //for the first time
               if (k==0) {
                 save_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
-                raft::copy(save_h_best_id_per_node.data(),
-                  move_candidates.vrp_move_candidates.best_id_per_node.data(),
-                  save_h_best_id_per_node.size(),
-                  sol.sol_handle->get_stream()
-                );
-                // Synchronize again to ensure copy is complete
-                sol.sol_handle->sync_stream();
               }
             }
             else if (k==0)
@@ -397,6 +424,26 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
               break;
             }
           }
+          
+          // 使用累积的best_id而不是只用k=0的
+          save_h_best_id_per_node = accumulated_best_id;
+          
+          // 将当前 trial 的结果聚合到 global_best_id 中
+          for (int i = 0; i < N2; ++i) {
+            if (accumulated_best_id[i] != -1 && accumulated_best_cost[i] < global_best_cost[i]) {
+              global_best_id[i] = accumulated_best_id[i];
+              global_best_cost[i] = accumulated_best_cost[i];
+            }
+          }
+          
+          // Debug: count accumulated pairs
+          int acc_pairs = 0;
+          for (int i = 0; i < N2; ++i) {
+            if (accumulated_best_id[i] != -1) acc_pairs++;
+          }
+          if (success) {
+            printf("Trial %d: accumulated %d pairs from iterations\n", t, acc_pairs);
+          }
         } else {
           exit(0);
         }
@@ -406,7 +453,8 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
           best_score = s;
           best_node_to_search_before = work_node_to_search;  // 保存最佳配置
           best_node_to_search_after = save_node_to_search;  // 保存最佳配置
-          h_best_id_per_node = save_h_best_id_per_node;
+          // 不再只保存最佳 trial 的，而是使用全局聚合的结果
+          // h_best_id_per_node = save_h_best_id_per_node;
         }
         total_success = total_success || success;
 
@@ -436,6 +484,16 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
         //   best_node_to_search = work_node_to_search;  // 保存最佳配置
         // }
       }
+      
+      // 使用全局聚合的 best_id_per_node（从所有 trial 中收集的最优结果）
+      h_best_id_per_node = global_best_id;
+      
+      // Debug: count global aggregated pairs
+      int global_pairs = 0;
+      for (int i = 0; i < N2; ++i) {
+        if (global_best_id[i] != -1) global_pairs++;
+      }
+      printf("=== Global Aggregation: %d pairs collected from all %d trials ===\n", global_pairs, 10);
       
       if constexpr (REQUEST == request_t::VRP) {
         // int count_non_null = 0;
@@ -478,21 +536,64 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (total_success){
         // Ensure all device operations are complete before using host data
         move_candidates.nodes_to_search.h_recycled_node_pairs.clear();
-        for (i_t nid = 0; nid < (int)h_best_id_per_node.size(); ++nid) {
-          const i_t best = h_best_id_per_node[nid];
-          if (best != -1) {
-            move_candidates.nodes_to_search.h_recycled_node_pairs.push_back(int2{nid, best});
+        
+        // 获取 viable_to_pickups 数据到 host
+        i_t n_orders = sol.get_num_orders();
+        i_t n_requests = sol.get_num_requests();
+        std::vector<i_t> h_n_viable_to_pickups(n_orders);
+        std::vector<i_t> h_viable_to_pickups(n_orders * n_requests);
+        
+        raft::copy(h_n_viable_to_pickups.data(), 
+                   move_candidates.viables.n_viable_to_pickups.data(), 
+                   n_orders, 
+                   sol.sol_handle->get_stream());
+        raft::copy(h_viable_to_pickups.data(), 
+                   move_candidates.viables.viable_to_pickups.data(), 
+                   n_orders * n_requests, 
+                   sol.sol_handle->get_stream());
+        sol.sol_handle->sync_stream();
+        
+        // 为所有节点填充 recycled_node_pairs，使用 viable_to_pickups 的第一个作为 node_id_2
+        for (i_t nid = 0; nid < n_orders; ++nid) {
+          i_t n_viable = h_n_viable_to_pickups[nid];
+          i_t node_id_2 = -1;
+          
+          // 优先使用 h_best_id_per_node 中的数据（如果有效）
+          if (nid < (int)h_best_id_per_node.size() && h_best_id_per_node[nid] != -1) {
+            node_id_2 = h_best_id_per_node[nid];
+          }
+          // 否则，使用 viable_to_pickups 的第一个候选
+          else if (n_viable > 0) {
+            // viable_to_pickups 是按行存储，每行有 n_requests 个元素
+            // 跳过第一个（可能是自己），取第二个或第一个
+            i_t offset = nid * n_requests;
+            node_id_2 = h_viable_to_pickups[offset]; // 取第一个 viable pickup
+          }
+          
+          // 只要有有效的 node_id_2，就添加这个配对
+          if (node_id_2 != -1) {
+            move_candidates.nodes_to_search.h_recycled_node_pairs.push_back(int2{nid, node_id_2});
           }
         }
+        
         raft::copy(move_candidates.nodes_to_search.recycled_node_pairs.data(),
                   move_candidates.nodes_to_search.h_recycled_node_pairs.data(),
                   move_candidates.nodes_to_search.h_recycled_node_pairs.size(),
                   sol.sol_handle->get_stream());
         sol.sol_handle->sync_stream();
-        move_candidates.nodes_to_search.n_sampled_nodes = move_candidates.nodes_to_search.h_recycled_node_pairs.size(); //!!!! not sure if bug!!!!
+        move_candidates.nodes_to_search.n_sampled_nodes = move_candidates.nodes_to_search.h_recycled_node_pairs.size();
+        
+        // Debug: final statistics
+        int final_pairs = move_candidates.nodes_to_search.h_recycled_node_pairs.size();
+        printf("=== Looking Ahead Summary ===\n");
+        printf("Final recycled pairs: %d (all nodes covered using viable_to_pickups)\n", final_pairs);
+        printf("Total nodes: %d, pairs with best_id: %d, pairs with viable_pickup: %d\n", 
+               (int)n_orders, 
+               (int)std::count_if(h_best_id_per_node.begin(), h_best_id_per_node.end(), [](int x){ return x != -1; }),
+               final_pairs);
+        printf("nodes_to_search size: %zu, base_nodes: %zu\n", 
+               move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
       }
-      printf("number of nodes to search: %zu, size of base_nodes_to_search: %zu\n", move_candidates.nodes_to_search.h_nodes_to_search.size(), base_node_to_search.size());
-      printf("number of recycled pairs: %zu\n", move_candidates.nodes_to_search.h_recycled_node_pairs.size());
       //!!!! no delete!!!!
       
       auto pause_end   = clock::now();
