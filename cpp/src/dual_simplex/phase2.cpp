@@ -1238,10 +1238,7 @@ i_t initialize_steepest_edge_norms(const lp_problem_t<i_t, f_t>& lp,
       settings.log.printf("Initialized %d of %d steepest edge norms in %.2fs\n", k, m, now);
     }
     if (toc(start_time) > settings.time_limit) { return -1; }
-    if (settings.concurrent_halt != nullptr &&
-        settings.concurrent_halt->load(std::memory_order_acquire) == 1) {
-      return -1;
-    }
+    if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) { return -1; }
   }
   return 0;
 }
@@ -2975,8 +2972,7 @@ dual::status_t dual_phase2(i_t phase,
 
     if (now > settings.time_limit) { return dual::status_t::TIME_LIMIT; }
 
-    if (settings.concurrent_halt != nullptr &&
-        settings.concurrent_halt->load(std::memory_order_acquire) == 1) {
+    if (settings.concurrent_halt != nullptr && *settings.concurrent_halt == 1) {
       return dual::status_t::CONCURRENT_LIMIT;
     }
   }

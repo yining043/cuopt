@@ -25,6 +25,12 @@ project(
   LANGUAGES CXX CUDA
 )
 
+# Debug: Print CUDA compiler version early
+message(STATUS "=============================================================")
+message(STATUS "libcuopt: CMAKE_CUDA_COMPILER_VERSION = ${CMAKE_CUDA_COMPILER_VERSION}")
+message(STATUS "libcuopt: CUDAToolkit_VERSION = ${CUDAToolkit_VERSION}")
+message(STATUS "=============================================================")
+
 # Check if cuopt is already available. If so, it is the user's responsibility to ensure that the
 # CMake package is also available at build time of the Python cuopt package.
 find_package(cuopt "${CUOPT_VERSION}")
@@ -75,13 +81,25 @@ set(rpaths
   "$ORIGIN/../lib64"
   "$ORIGIN/../../rapids_logger/lib64"
   "$ORIGIN/../../librmm/lib64"
+  "$ORIGIN/../../nvidia/cudss/lib"
   "$ORIGIN/../../nvidia/cublas/lib"
   "$ORIGIN/../../nvidia/curand/lib"
   "$ORIGIN/../../nvidia/cusolver/lib"
   "$ORIGIN/../../nvidia/cusparse/lib"
-  # For CUDA 13.x
-  "$ORIGIN/../../nvidia/cu13/lib"
 )
+
+# Add CUDA version-specific paths based on CUDA compiler version
+message(STATUS "libcuopt: CMAKE_CUDA_COMPILER_VERSION = ${CMAKE_CUDA_COMPILER_VERSION}")
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 14.0)
+  message(STATUS "libcuopt: Adding cu13 RPATH")
+  list(APPEND rpaths "$ORIGIN/../../nvidia/cu13/lib")
+elseif(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0 AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.0)
+  message(STATUS "libcuopt: Adding cu12 RPATH")
+  list(APPEND rpaths "$ORIGIN/../../nvidia/cu12/lib")
+else()
+  message(WARNING "libcuopt: Unsupported CUDA version ${CMAKE_CUDA_COMPILER_VERSION}")
+endif()
+message(STATUS "libcuopt: Final RPATH = ${rpaths}")
 
 set_property(TARGET cuopt PROPERTY INSTALL_RPATH ${rpaths} APPEND)
 set_property(TARGET cuopt_cli PROPERTY INSTALL_RPATH ${rpaths} APPEND)

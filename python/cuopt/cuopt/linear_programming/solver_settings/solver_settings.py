@@ -19,10 +19,15 @@ from cuopt.linear_programming.solver.solver_parameters import (
     CUOPT_ABSOLUTE_DUAL_TOLERANCE,
     CUOPT_ABSOLUTE_GAP_TOLERANCE,
     CUOPT_ABSOLUTE_PRIMAL_TOLERANCE,
+    CUOPT_AUGMENTED,
     CUOPT_CROSSOVER,
+    CUOPT_CUDSS_DETERMINISTIC,
     CUOPT_DUAL_INFEASIBLE_TOLERANCE,
     CUOPT_DUAL_POSTSOLVE,
+    CUOPT_DUALIZE,
+    CUOPT_ELIMINATE_DENSE_COLUMNS,
     CUOPT_FIRST_PRIMAL_FEASIBLE,
+    CUOPT_FOLDING,
     CUOPT_INFEASIBILITY_DETECTION,
     CUOPT_ITERATION_LIMIT,
     CUOPT_LOG_FILE,
@@ -36,6 +41,7 @@ from cuopt.linear_programming.solver.solver_parameters import (
     CUOPT_MIP_RELATIVE_TOLERANCE,
     CUOPT_MIP_SCALING,
     CUOPT_NUM_CPU_THREADS,
+    CUOPT_ORDERING,
     CUOPT_PDLP_SOLVER_MODE,
     CUOPT_PER_CONSTRAINT_RESIDUAL,
     CUOPT_PRESOLVE,
@@ -60,6 +66,7 @@ class SolverMethod(IntEnum):
     Concurrent = 0
     PDLP = auto()
     DualSimplex = auto()
+    Barrier = auto()
 
     def __str__(self):
         """Convert the solver method to a string.
@@ -379,6 +386,16 @@ class SolverSettings:
                 CUOPT_MIP_HEURISTICS_ONLY
             ),
             "num_cpu_threads": self.get_parameter(CUOPT_NUM_CPU_THREADS),
+            "augmented": self.get_parameter(CUOPT_AUGMENTED),
+            "folding": self.get_parameter(CUOPT_FOLDING),
+            "dualize": self.get_parameter(CUOPT_DUALIZE),
+            "ordering": self.get_parameter(CUOPT_ORDERING),
+            "eliminate_dense_columns": self.get_parameter(
+                CUOPT_ELIMINATE_DENSE_COLUMNS
+            ),
+            "cudss_deterministic": self.get_parameter(
+                CUOPT_CUDSS_DETERMINISTIC
+            ),
             "crossover": self.get_parameter(CUOPT_CROSSOVER),
             "log_to_console": self.get_parameter(CUOPT_LOG_TO_CONSOLE),
             "first_primal_feasible": self.get_parameter(

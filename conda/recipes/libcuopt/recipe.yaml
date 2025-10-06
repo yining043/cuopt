@@ -69,9 +69,11 @@ cache:
       - librmm =${{ dep_minor_version }}
       - rapids-logger =0.1
       - cuda-nvtx-dev
+      - libcudss-dev >=0.7
       - libcurand-dev
       - libcusparse-dev
       - cuda-cudart-dev
+      - cuda-driver-dev
       - boost
       - tbb-devel
       - zlib
@@ -87,6 +89,8 @@ outputs:
           cmake --install cpp/libmps_parser/build
       dynamic_linking:
         overlinking_behavior: "error"
+        missing_dso_allowlist:
+          - libcuda.so.1
       prefix_detection:
         ignore:
           # See https://github.com/rapidsai/build-planning/issues/160
@@ -111,6 +115,7 @@ outputs:
           - cuda-version
           - gtest
           - libcurand
+          - libcudss
           - libcusparse
           - librmm
           - libzlib
@@ -133,6 +138,8 @@ outputs:
           cmake --install cpp/build
       dynamic_linking:
         overlinking_behavior: "error"
+        missing_dso_allowlist:
+          - libcuda.so.1
       prefix_detection:
         ignore:
           # See https://github.com/rapidsai/build-planning/issues/160
@@ -149,7 +156,9 @@ outputs:
         - rapids-logger =0.1
         - librmm =${{ dep_minor_version }}
         - cuda-cudart-dev
+        - cuda-driver-dev
         - libcublas
+        - libcudss-dev >=0.7
         - libcusparse-dev
       run:
         - ${{ pin_compatible("cuda-version", upper_bound="x", lower_bound="x") }}
@@ -157,12 +166,14 @@ outputs:
         - boost
         - librmm =${{ dep_minor_version }}
         - cuda-nvrtc
+        - libcudss
       ignore_run_exports:
         by_name:
           - cuda-cudart
           - cuda-nvtx
           - cuda-version
           - gtest
+          - libcudss
           - libcurand
           - libcusparse
           - librmm
@@ -187,6 +198,8 @@ outputs:
           cmake --install cpp/build --component testing
       dynamic_linking:
         overlinking_behavior: "error"
+        missing_dso_allowlist:
+          - libcuda.so.1
       string: cuda${{ cuda_major }}_${{ date_string }}_${{ head_rev }}
     requirements:
       build:
@@ -200,6 +213,7 @@ outputs:
         - gtest ${{ gtest_version }}
         - cuda-cudart-dev
         - libcublas
+        - libcudss-dev >=0.7
         - libcusparse-dev
       run:
         - gmock ${{ gtest_version }}
@@ -214,6 +228,7 @@ outputs:
           - gtest
           - libcurand
           - libcusparse
+          - libcudss
           - librmm
           - libboost
           - libboost_iostreams

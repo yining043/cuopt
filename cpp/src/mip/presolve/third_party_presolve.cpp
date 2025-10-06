@@ -22,6 +22,8 @@
 #include <mip/presolve/third_party_presolve.hpp>
 #include <utilities/timer.hpp>
 
+#include <raft/common/nvtx.hpp>
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"  // ignore boost error for pip wheel build
 #include <papilo/core/Presolve.hpp>
@@ -37,6 +39,7 @@ template <typename i_t, typename f_t>
 papilo::Problem<f_t> build_papilo_problem(const optimization_problem_t<i_t, f_t>& op_problem,
                                           problem_category_t category)
 {
+  raft::common::nvtx::range fun_scope("Build papilo problem");
   // Build papilo problem from optimization problem
   papilo::ProblemBuilder<f_t> builder;
 
@@ -194,6 +197,7 @@ template <typename i_t, typename f_t>
 optimization_problem_t<i_t, f_t> build_optimization_problem(
   papilo::Problem<f_t> const& papilo_problem, raft::handle_t const* handle_ptr)
 {
+  raft::common::nvtx::range fun_scope("Build optimization problem");
   optimization_problem_t<i_t, f_t> op_problem(handle_ptr);
 
   auto obj = papilo_problem.getObjective();
