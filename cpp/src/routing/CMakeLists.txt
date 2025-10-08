@@ -61,3 +61,6 @@ set(ROUTING_SRC_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/utilities/cython.cu)
 
 set(CUOPT_SRC_FILES ${CUOPT_SRC_FILES} ${ROUTING_SRC_FILES} PARENT_SCOPE)
+
+# Add subdirectories
+add_subdirectory(local_search/vrp)
