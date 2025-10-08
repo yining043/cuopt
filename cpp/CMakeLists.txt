@@ -60,6 +60,7 @@ option(SKIP_C_PYTHON_ADAPTERS "Skip building C and Python adapter files (cython_
 option(SKIP_ROUTING_BUILD "Skip building routing components" OFF)
 option(WRITE_FATBIN "Enable fatbin writing" ON)
 option(HOST_LINEINFO "Build with debug line information for host code" OFF)
+option(BUILD_PYTHON_BINDINGS "Build Python bindings using pybind11" ON)
 
 message(VERBOSE "cuOpt: Enable nvcc -lineinfo: ${CMAKE_CUDA_LINEINFO}")
 message(VERBOSE "cuOpt: Build cuOpt unit-tests: ${BUILD_TESTS}")
@@ -70,6 +71,7 @@ message(VERBOSE "cuOpt: Skip C/Python adapters: ${SKIP_C_PYTHON_ADAPTERS}")
 message(VERBOSE "cuOpt: Skip routing build: ${SKIP_ROUTING_BUILD}")
 message(VERBOSE "cuOpt: Build with debug line information for host code: ${HOST_LINEINFO}")
 message(VERBOSE "cuOpt: fatbin: ${WRITE_FATBIN}")
+message(VERBOSE "cuOpt: Build Python bindings: ${BUILD_PYTHON_BINDINGS}")
 
 # ##################################################################################################
 # - compiler options ------------------------------------------------------------------------------
