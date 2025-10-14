@@ -151,7 +151,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
   
-  // Trigger callback
   if (sol.problem_ptr->solver_settings_ptr && 
       sol.problem_ptr->solver_settings_ptr->get_routing_callbacks().size() > 0) {
     
@@ -166,7 +165,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     if (get_callback) {
       f_t objective = sol.get_cost(true, move_candidates.weights);
       
-      // Use route_node_map for efficient route extraction (only 2 GPU->CPU copies)
       auto h_route_ids = cuopt::host_copy(sol.route_node_map.route_id_per_node);
       auto h_intra_idx = cuopt::host_copy(sol.route_node_map.intra_route_idx_per_node);
       
@@ -174,7 +172,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       
       std::vector<std::vector<i_t>> routes_2d(sol.n_routes);
       
-      // Fill service nodes using route_node_map, dynamically grow to avoid n_nodes GPU reads
       for (i_t node_id = 0; node_id < (i_t)h_route_ids.size(); ++node_id) {
         i_t route_id = h_route_ids[node_id];
         i_t intra_idx = h_intra_idx[node_id];
@@ -187,7 +184,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         }
       }
       
-      // Add depot at start and end of each route
       for (i_t r = 0; r < sol.n_routes; ++r) {
         if (!routes_2d[r].empty()) {
           routes_2d[r][0] = depot_node_id;
@@ -195,7 +191,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         }
       }
       
-      printf("Callback triggered\n");
       get_callback->get_solution(&routes_2d, objective, sol.n_routes);
     }
   }
@@ -278,7 +273,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         }
       }
       
-      // Add depot at start and end of each route
       for (i_t r = 0; r < sol.n_routes; ++r) {
         if (!routes_2d[r].empty()) {
           routes_2d[r][0] = depot_node_id;
@@ -286,11 +280,10 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         }
       }
       
-      // printf("Callback triggered\n");
       get_callback->get_solution(&routes_2d, objective, sol.n_routes);
     }
   }
-  printf("Callback triggered\n");
+
   std::vector<fast_operators_t> fast_operators{fast_operators_t::SLIDING};
 
   if (!sol.problem_ptr->is_tsp) {
