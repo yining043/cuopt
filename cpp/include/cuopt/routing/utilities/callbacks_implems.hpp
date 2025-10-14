@@ -24,40 +24,59 @@ namespace cuopt {
 namespace routing {
 namespace callbacks {
 
-// Default implementation that bridges C++ to Python callback
-class default_observation_callback_t : public observation_callback_t {
+// Default customize nodes callback implementation (bridges C++ to Python)
+class default_customize_nodes_callback_t : public customize_nodes_callback_t {
 public:
-    void get_observation_and_sample(
-        const std::vector<std::vector<int>>* routes,
-        const std::vector<int>* node_ids_to_search,
-        std::vector<int>* sampled_indices_out,
-        float objective_value,
-        int n_routes
+    void customize_nodes_to_search(
+        const std::vector<std::vector<int>>* routes_2d,
+        const std::vector<int>* candidate_node_ids,
+        float solution_cost,
+        int num_routes,
+        std::vector<int>* sampled_indices_out
     ) override {
-        // Call Python callback method
-        PyObject* res = PyObject_CallMethod(
-            this->pyCallbackClass, 
-            "_cpp_callback_wrapper", 
-            "(KKfi)", 
-            reinterpret_cast<unsigned long long>(routes),
-            reinterpret_cast<unsigned long long>(node_ids_to_search),
-            objective_value,
-            n_routes
+        PyObject* result = PyObject_CallMethod(
+            this->pyCallbackClass,
+            "_cpp_customize_nodes_to_search",
+            "(KKfi)",
+            reinterpret_cast<unsigned long long>(routes_2d),
+            reinterpret_cast<unsigned long long>(candidate_node_ids),
+            solution_cost,
+            num_routes
         );
         
-        // Parse Python list of indices
-        if (res && PyList_Check(res)) {
-            Py_ssize_t size = PyList_Size(res);
+        if (result && PyList_Check(result)) {
+            Py_ssize_t size = PyList_Size(result);
             sampled_indices_out->reserve(size);
             for (Py_ssize_t i = 0; i < size; ++i) {
-                PyObject* item = PyList_GetItem(res, i);
+                PyObject* item = PyList_GetItem(result, i);
                 if (PyLong_Check(item)) {
                     sampled_indices_out->push_back(PyLong_AsLong(item));
                 }
             }
         }
         
-        if (res) Py_DECREF(res);
+        if (result) Py_DECREF(result);
+    }
+    
+    PyObject* pyCallbackClass;
+};
+
+// Default reward callback implementation (bridges C++ to Python)
+class default_reward_callback_t : public reward_callback_t {
+public:
+    void receive_reward(
+        bool improvement_found,
+        float solution_cost
+    ) override {
+        PyObject* result = PyObject_CallMethod(
+            this->pyCallbackClass,
+            "_cpp_receive_reward",
+            "(if)",
+            improvement_found ? 1 : 0,
+            solution_cost
+        );
+        
+        if (result) Py_DECREF(result);
     }
     
     PyObject* pyCallbackClass;

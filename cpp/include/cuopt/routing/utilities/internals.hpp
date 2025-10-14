@@ -31,7 +31,8 @@ public:
 
 // Callback type enumeration
 enum class callback_type_t {
-    OBSERVATION
+    CUSTOMIZE_NODES,
+    REWARD
 };
 
 // Base routing callback
@@ -40,27 +41,44 @@ public:
     virtual callback_type_t get_type() const = 0;
 };
 
-// Observation callback for routing search
-// The callback receives current routing solution and node candidates,
-// and returns indices of nodes to sample for local search
-class observation_callback_t : public base_routing_callback_t {
+// Customize nodes callback - customizes node sampling for local search
+class customize_nodes_callback_t : public base_routing_callback_t {
 public:
-    // Get observation and sample nodes for search
-    // @param routes: Current routing solution (2D array of node IDs)
-    // @param node_ids_to_search: Available node IDs for sampling
-    // @param sampled_indices_out: OUTPUT - Indices into node_ids_to_search (not node IDs!)
-    // @param objective_value: Current objective cost
-    // @param n_routes: Number of routes
-    virtual void get_observation_and_sample(
-        const std::vector<std::vector<int>>* routes,
-        const std::vector<int>* node_ids_to_search,
-        std::vector<int>* sampled_indices_out,
-        float objective_value,
-        int n_routes
+    // Customize which nodes to sample based on current search state
+    // 
+    // @param routes_2d              Current routing solution (2D vector, each inner vector is a route)
+    // @param candidate_node_ids     Available node IDs for potential sampling
+    // @param solution_cost          Current objective cost value
+    // @param num_routes             Number of routes in current solution
+    // @param sampled_indices_out    OUTPUT - Sampled indices into candidate_node_ids array
+    //                               Note: Must return indices (0 to N-1), not actual node IDs
+    virtual void customize_nodes_to_search(
+        const std::vector<std::vector<int>>* routes_2d,
+        const std::vector<int>* candidate_node_ids,
+        float solution_cost,
+        int num_routes,
+        std::vector<int>* sampled_indices_out
     ) = 0;
     
     callback_type_t get_type() const override {
-        return callback_type_t::OBSERVATION;
+        return callback_type_t::CUSTOMIZE_NODES;
+    }
+};
+
+// Reward callback - receives feedback after search iteration
+class reward_callback_t : public base_routing_callback_t {
+public:
+    // Receive reward signal from search iteration
+    // 
+    // @param improvement_found  Whether an improving move was discovered
+    // @param solution_cost      Current solution objective cost
+    virtual void receive_reward(
+        bool improvement_found,
+        float solution_cost
+    ) = 0;
+    
+    callback_type_t get_type() const override {
+        return callback_type_t::REWARD;
     }
 };
 

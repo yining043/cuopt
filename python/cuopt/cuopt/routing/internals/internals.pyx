@@ -30,8 +30,12 @@ cdef extern from "cuopt/routing/utilities/callbacks_implems.hpp" namespace "cuop
     cdef cppclass Callback:
         pass
     
-    cdef cppclass default_observation_callback_t(Callback):
-        void get_observation_and_sample(const vector[vector[int]]* routes, const vector[int]* node_ids_to_search, vector[int]* sampled_out, float objective_value, int n_routes) except +
+    cdef cppclass default_customize_nodes_callback_t(Callback):
+        void customize_nodes_to_search(const vector[vector[int]]* routes_2d, const vector[int]* candidate_node_ids, float solution_cost, int num_routes, vector[int]* sampled_indices_out) except +
+        PyObject* pyCallbackClass
+    
+    cdef cppclass default_reward_callback_t(Callback):
+        void receive_reward(int improvement_found, float solution_cost) except +
         PyObject* pyCallbackClass
 
 
@@ -39,28 +43,28 @@ cdef class PyCallback:
     pass
 
 
-cdef class ObservationCallback(PyCallback):
+cdef class CustomizeNodesCallback(PyCallback):
     """
-    Callback to receive observations and control node sampling during routing search
+    Callback for customizing node sampling in routing search
     
-    The callback receives the current routing solution state and a list of candidate
-    nodes for local search. It should return INDICES (not node IDs) of nodes to sample.
+    Receives current solution state and returns which nodes to sample for local search.
+    This combines observation and action selection into a single cohesive callback.
     
     Examples
     --------
-    >>> from cuopt.routing import ObservationCallback
+    >>> from cuopt.routing import CustomizeNodesCallback
     >>> import random
     >>> 
-    >>> class MyCallback(ObservationCallback):
-    ...     def get_observation_and_sample(self, routes_2d, node_ids_to_search, 
-    ...                                    objective_value, n_routes):
-    ...         print(f"Cost: {objective_value:.2f}, Routes: {n_routes}")
-    ...         # Return INDICES, not node IDs
-    ...         sample_size = min(40, len(node_ids_to_search))
-    ...         return random.sample(range(len(node_ids_to_search)), sample_size)
+    >>> class MyCustomCallback(CustomizeNodesCallback):
+    ...     def customize_nodes_to_search(self, routes_2d, candidate_node_ids, 
+    ...                                   solution_cost, num_routes):
+    ...         # Adaptive sampling based on problem size
+    ...         num_candidates = len(candidate_node_ids)
+    ...         sample_size = min(40, num_candidates)
+    ...         return random.sample(range(num_candidates), sample_size)
     """
     
-    cdef default_observation_callback_t native_callback
+    cdef default_customize_nodes_callback_t native_callback
     
     def __init__(self):
         self.native_callback.pyCallbackClass = <PyObject*><void*>self
@@ -68,59 +72,103 @@ cdef class ObservationCallback(PyCallback):
     def get_native_callback(self):
         return <uintptr_t>&(self.native_callback)
     
-    def _cpp_callback_wrapper(self, unsigned long long routes_ptr, unsigned long long nodes_ptr, 
-                              float objective_value, int n_routes):
-        """Internal wrapper that bridges C++ to Python"""
-        cdef const vector[vector[int]]* routes = <const vector[vector[int]]*>routes_ptr
-        cdef const vector[int]* nodes = <const vector[int]*>nodes_ptr
+    def _cpp_customize_nodes_to_search(self, unsigned long long routes_ptr, unsigned long long nodes_ptr,
+                                       float solution_cost, int num_routes):
+        cdef const vector[vector[int]]* routes_2d = <const vector[vector[int]]*>routes_ptr
+        cdef const vector[int]* candidate_node_ids = <const vector[int]*>nodes_ptr
         
-        py_routes = routes[0]
-        py_nodes = nodes[0]
+        py_routes_2d = routes_2d[0]
+        py_candidate_node_ids = candidate_node_ids[0]
         
-        sampled_indices = self.get_observation_and_sample(py_routes, py_nodes, 
-                                                          objective_value, n_routes)
-        
-        return sampled_indices
+        return self.customize_nodes_to_search(py_routes_2d, py_candidate_node_ids, 
+                                              solution_cost, num_routes)
     
-    def get_observation_and_sample(self, routes_2d, node_ids_to_search, 
-                                   objective_value, n_routes):
+    def customize_nodes_to_search(self, routes_2d, candidate_node_ids, solution_cost, num_routes):
         """
-        Receive observation and return indices of nodes to sample
+        Customize which nodes to sample for local search
         
-        Override this method in your subclass to implement custom sampling logic.
+        Override this method to implement custom node selection logic based on
+        the current solution state.
         
         Parameters
         ----------
         routes_2d : list of list of int
-            Current routing solution, each inner list is a route (node IDs)
-        node_ids_to_search : list of int
-            Candidate node IDs available for sampling
-        objective_value : float
-            Current objective cost value
-        n_routes : int
-            Number of routes in the solution
+            Current routing solution (2D list where each inner list represents a route)
+        candidate_node_ids : list of int
+            Available candidate node IDs that can be sampled for local search
+        solution_cost : float
+            Current solution objective cost
+        num_routes : int
+            Total number of routes in current solution
             
         Returns
         -------
         list of int
-            Indices into node_ids_to_search array (NOT node IDs themselves!)
-            Example: if you want to sample the first and third nodes from
-            node_ids_to_search, return [0, 2]
+            Sampled indices into candidate_node_ids array (NOT actual node IDs).
+            Indices must be in range [0, N-1] where N is len(candidate_node_ids).
+            Example: to sample 1st and 3rd candidates, return [0, 2]
         """
         import random
         
-        n_available = len(node_ids_to_search)
-        if n_available == 0:
+        num_candidates = len(candidate_node_ids)
+        if num_candidates == 0:
             return []
         
-        # Determine sample size
-        if n_available < 40:
-            sample_size = n_available
-        elif n_available < 80:
-            sample_size = n_available // 2
+        if num_candidates < 40:
+            sample_size = num_candidates
+        elif num_candidates < 80:
+            sample_size = num_candidates // 2
         else:
             sample_size = 40
         
-        # Return random indices into node_ids_to_search
-        return random.sample(range(n_available), sample_size)
+        return random.sample(range(num_candidates), sample_size)
+
+
+cdef class RewardCallback(PyCallback):
+    """
+    Reward callback for routing search
+    
+    Receives feedback after each local search iteration. This follows the reinforcement
+    learning paradigm where rewards signal the outcome of taking actions.
+    
+    Examples
+    --------
+    >>> from cuopt.routing import RewardCallback
+    >>> 
+    >>> class MyRewardCallback(RewardCallback):
+    ...     def __init__(self):
+    ...         super().__init__()
+    ...         self.improvement_count = 0
+    ...     
+    ...     def receive_reward(self, improvement_found, solution_cost):
+    ...         if improvement_found:
+    ...             self.improvement_count += 1
+    ...             print(f"✓ Improvement #{self.improvement_count}: cost={solution_cost:.2f}")
+    """
+    
+    cdef default_reward_callback_t native_callback
+    
+    def __init__(self):
+        self.native_callback.pyCallbackClass = <PyObject*><void*>self
+    
+    def get_native_callback(self):
+        return <uintptr_t>&(self.native_callback)
+    
+    def _cpp_receive_reward(self, int improvement_found, float solution_cost):
+        self.receive_reward(bool(improvement_found), solution_cost)
+    
+    def receive_reward(self, improvement_found, solution_cost):
+        """
+        Receive reward signal from search iteration
+        
+        Override this method to implement custom reward processing logic.
+        
+        Parameters
+        ----------
+        improvement_found : bool
+            Whether an improving move was discovered in this iteration
+        solution_cost : float
+            Current solution objective cost
+        """
+        pass
 

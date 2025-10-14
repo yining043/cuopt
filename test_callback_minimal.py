@@ -1,41 +1,76 @@
 """
-Minimal test for routing callback functionality
+Test for routing callback functionality (Customize-Nodes and Reward)
+
+Demonstrates the two callback types:
+- CustomizeNodesCallback: Customizes node sampling for local search
+- RewardCallback: Receives iteration feedback
 """
 import numpy as np
 import cudf
 from cuopt import routing
-from cuopt.routing import ObservationCallback
+from cuopt.routing import CustomizeNodesCallback, RewardCallback
 import matplotlib.pyplot as plt
 import random
 
 
-class TestCallback(ObservationCallback):
+class TestCustomizeNodesCallback(CustomizeNodesCallback):
+    """Example callback - customizes node sampling with observation tracking"""
+    
     def __init__(self):
         super().__init__()
         self.call_count = 0
-        self.solutions = []
+        self.observations = []
     
-    def get_observation_and_sample(self, routes_2d, node_ids_to_search, objective_value, n_routes):
+    def customize_nodes_to_search(self, routes_2d, candidate_node_ids, solution_cost, num_routes):
+        """Customize sampling and record state"""
         self.call_count += 1
-        self.solutions.append({
+        
+        # Record observation
+        num_candidates = len(candidate_node_ids)
+        self.observations.append({
             'iteration': self.call_count,
-            'cost': objective_value,
-            'n_routes': n_routes,
+            'cost': solution_cost,
+            'num_routes': num_routes,
             'routes': routes_2d,
+            'num_candidates': num_candidates
         })
         
-        n_available = len(node_ids_to_search)
-        if n_available < 40:
-            sample_size = n_available
-        elif n_available < 80:
-            sample_size = n_available // 2
+        # Adaptive sampling strategy
+        if num_candidates < 40:
+            sample_size = num_candidates
+        elif num_candidates < 80:
+            sample_size = num_candidates // 2
         else:
             sample_size = 40
         
-        sampled_indices = random.sample(range(n_available), sample_size) if sample_size > 0 else []
-        print(f"  Iteration {self.call_count}: sampled {sample_size} nodes from {n_available}, cost={objective_value:.2f}")
+        sampled_indices = random.sample(range(num_candidates), sample_size) if sample_size > 0 else []
+        print(f"  [Customize {self.call_count}] Sampled {sample_size}/{num_candidates} nodes (cost={solution_cost:.2f})")
         
         return sampled_indices
+
+
+class TestRewardCallback(RewardCallback):
+    """Example reward callback - tracks improvement signals"""
+    
+    def __init__(self):
+        super().__init__()
+        self.reward_count = 0
+        self.improvements = []
+        self.cost_history = []
+    
+    def receive_reward(self, improvement_found, solution_cost):
+        """Process reward signal"""
+        self.reward_count += 1
+        self.cost_history.append(solution_cost)
+        
+        if improvement_found:
+            self.improvements.append({
+                'iteration': self.reward_count,
+                'cost': solution_cost
+            })
+            print(f"  [Reward {self.reward_count}] ✓ Improvement! cost={solution_cost:.2f}")
+        else:
+            print(f"  [Reward {self.reward_count}] ✗ No improvement, cost={solution_cost:.2f}")
 
 
 def generate_random_vrp(n_locations, n_vehicles, seed=42):
@@ -149,35 +184,52 @@ def test_callback():
     data_model.add_capacity_dimension("demand", problem_data['demand'], 
                                       problem_data['vehicle_capacity'])
     
-    # Setup callback
-    callback = TestCallback()
+    # Setup callbacks
+    customize_callback = TestCustomizeNodesCallback()
+    reward_callback = TestRewardCallback()
+    
     solver_settings = routing.SolverSettings()
     solver_settings.set_time_limit(10)
-    solver_settings.set_routing_callback(callback)
+    solver_settings.set_routing_callback(customize_callback)
+    solver_settings.set_routing_callback(reward_callback)
     
     # Solve
     print("\nSolving...")
     solution = routing.Solve(data_model, solver_settings)
     
-    # Results
+    # Results summary
     print("\n" + "=" * 60)
+    print("RESULTS SUMMARY")
+    print("=" * 60)
     print(f"Solution status: {solution.get_status()}")
-    print(f"Callback invocations: {callback.call_count}")
+    print(f"Customize nodes calls: {customize_callback.call_count}")
+    print(f"Reward calls: {reward_callback.reward_count}")
+    print(f"Total improvements: {len(reward_callback.improvements)}")
     print("=" * 60)
     
-    # Analysis
-    if callback.solutions:
-        plot_cost_curve(callback.solutions)
+    # Detailed analysis
+    if customize_callback.observations:
+        plot_cost_curve(customize_callback.observations)
         
-        best_callback_sol = min(callback.solutions, key=lambda x: x['cost'])
+        best_obs = min(customize_callback.observations, key=lambda x: x['cost'])
         final_routes = parse_solution_to_routes(solution.get_route())
         final_cost = solution.get_total_objective()
         
-        print(f"\nBest callback cost: {best_callback_sol['cost']:.2f} (iteration {best_callback_sol['iteration']})")
-        print(f"Final solution cost: {final_cost:.2f}")
-        print(f"Difference: {abs(final_cost - best_callback_sol['cost']):.2f}")
+        print(f"\nCustomize Nodes Callback:")
+        print(f"  Best observed cost: {best_obs['cost']:.2f} (iteration {best_obs['iteration']})")
         
-        compare_solutions(best_callback_sol, final_routes, final_cost, problem_data['coordinates'])
+        print(f"\nReward Callback:")
+        print(f"  Total reward signals: {reward_callback.reward_count}")
+        print(f"  Positive rewards (improvements): {len(reward_callback.improvements)}")
+        if reward_callback.improvements:
+            best_improvement = min(imp['cost'] for imp in reward_callback.improvements)
+            print(f"  Best improvement cost: {best_improvement:.2f}")
+        
+        print(f"\nFinal Solution:")
+        print(f"  Cost: {final_cost:.2f}")
+        print(f"  Gap from best observed: {abs(final_cost - best_obs['cost']):.2f}")
+        
+        compare_solutions(best_obs, final_routes, final_cost, problem_data['coordinates'])
 
 
 if __name__ == "__main__":

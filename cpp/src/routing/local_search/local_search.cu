@@ -195,21 +195,22 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   raft::common::nvtx::range fun_scope("run_fast_search");
 
   auto& nodes_to_search = move_candidates.nodes_to_search;
-  callbacks::observation_callback_t* obs_callback = nullptr;
+  callbacks::customize_nodes_callback_t* obs_callback = nullptr;
   if (full_set) {
     sol.set_routes_to_search();
     extract_nodes_to_search(sol, move_candidates);
   }
   else {
-    // Get observation callback 
+    // Get customize nodes callback
     for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
-      if (callback->get_type() == callbacks::callback_type_t::OBSERVATION) {
-        obs_callback = static_cast<callbacks::observation_callback_t*>(callback);
+      if (callback->get_type() == callbacks::callback_type_t::CUSTOMIZE_NODES) {
+        obs_callback = static_cast<callbacks::customize_nodes_callback_t*>(callback);
         break;
       }
     }
   }
-  if (!full_set && obs_callback) {
+  bool needs_customization = nodes_to_search.h_nodes_to_search.size() > 40;
+  if (!full_set && needs_customization && obs_callback) {
     // Prepare current solution for observation
     size_t n_nodes = sol.route_node_map.route_id_per_node.size();
     std::vector<i_t> h_route_ids(n_nodes);
@@ -260,26 +261,26 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       }
     }
     
-    // Get sampled indices from Python callback
-    std::vector<i_t> sampled_indices;
-    obs_callback->get_observation_and_sample(
-        &routes_2d, 
+    // Customize nodes to search: Get sampled indices from callback
+    std::vector<i_t> sampled_node_indices;
+    obs_callback->customize_nodes_to_search(
+        &routes_2d,
         &node_ids_to_search,
-        &sampled_indices, // Note: Python returns indices into node_ids_to_search, NOT node IDs
-        objective, 
-        sol.n_routes
+        objective,
+        sol.n_routes,
+        &sampled_node_indices
     );
-    if (sampled_indices.empty()) { return false; }
+    if (sampled_node_indices.empty()) { return false; }
     
-    // Copy selected nodes using indices (O(m))
+    // Apply action: Copy selected nodes using sampled indices
     nodes_to_search.h_sampled_nodes.clear();
-    nodes_to_search.h_sampled_nodes.reserve(sampled_indices.size());
-    for (i_t idx : sampled_indices) {
+    nodes_to_search.h_sampled_nodes.reserve(sampled_node_indices.size());
+    for (i_t idx : sampled_node_indices) {
       nodes_to_search.h_sampled_nodes.push_back(h_nodes[idx]);
     }
 
-    // Copy sampled nodes to GPU
-    nodes_to_search.n_sampled_nodes = sampled_indices.size();
+    // Transfer sampled nodes to GPU
+    nodes_to_search.n_sampled_nodes = sampled_node_indices.size();
     nodes_to_search.sample_nodes_graph.start_capture(sol.sol_handle->get_stream());
     raft::copy(nodes_to_search.sampled_nodes_to_search.data(),
                 nodes_to_search.h_sampled_nodes.data(),
@@ -291,8 +292,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 
     // Remove sampled nodes using swap-and-pop (O(m log m))
     // Sort indices in descending order to avoid invalidation
-    std::sort(sampled_indices.begin(), sampled_indices.end(), std::greater<i_t>());
-    for (i_t idx : sampled_indices) {
+    std::sort(sampled_node_indices.begin(), sampled_node_indices.end(), std::greater<i_t>());
+    for (i_t idx : sampled_node_indices) {
       // Swap with last element and pop (preserves other indices)
       if (idx < (i_t)h_nodes.size() - 1) {
         h_nodes[idx] = std::move(h_nodes.back());
@@ -340,6 +341,18 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         break;
       }
       case fast_operators_t::CROSS: {
+        break;
+      }
+    }
+  }
+
+  // Reward: Send feedback to reward callback after search iteration
+  if (!full_set && obs_callback && needs_customizationcc) {
+    for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
+      if (callback->get_type() == callbacks::callback_type_t::REWARD) {
+        auto reward_callback = static_cast<callbacks::reward_callback_t*>(callback);
+        f_t solution_cost = sol.get_cost(true, move_candidates.weights);
+        reward_callback->receive_reward(move_found, solution_cost);
         break;
       }
     }
