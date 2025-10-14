@@ -18,9 +18,11 @@
 #pragma once
 
 #include <cuopt/routing/routing_structures.hpp>
+#include <cuopt/routing/utilities/internals.hpp>
 #include <fstream>
 #include <limits>
 #include <ostream>
+#include <vector>
 
 namespace cuopt {
 namespace routing {
@@ -96,12 +98,29 @@ class solver_settings_t {
    */
   std::tuple<i_t, bool, std::string> get_dump_best_results() const noexcept;
 
+  /**
+   * @brief Set a callback for routing solver
+   * 
+   * @param[in] callback Pointer to callback object
+   */
+  void set_routing_callback(callbacks::base_routing_callback_t* callback);
+  
+  /**
+   * @brief Get all registered routing callbacks
+   * 
+   * @return Vector of callback pointers
+   */
+  const std::vector<callbacks::base_routing_callback_t*> get_routing_callbacks() const;
+
   bool enable_verbose_mode_{false};
   bool log_errors_{false};
   f_t time_limit_{std::numeric_limits<f_t>::max()};
   i_t dump_interval_{std::numeric_limits<i_t>::max()};
   bool dump_best_results_{false};
   std::string best_result_file_name_;
+
+private:
+  std::vector<callbacks::base_routing_callback_t*> routing_callbacks_;
 };
 
 }  // namespace routing

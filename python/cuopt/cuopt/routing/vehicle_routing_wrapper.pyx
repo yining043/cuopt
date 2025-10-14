@@ -30,6 +30,9 @@ from cuopt.routing.vehicle_routing cimport (
     solver_settings_t,
 )
 
+cdef extern from "cuopt/routing/utilities/internals.hpp" namespace "cuopt::routing::callbacks":
+    cdef cppclass base_routing_callback_t
+
 from datetime import date, datetime
 
 from dateutil.relativedelta import relativedelta
@@ -744,6 +747,20 @@ cdef class SolverSettings:
 
     def get_best_results_interval(self):
         return self.interval
+    
+    def set_routing_callback(self, callback):
+        """
+        Set a callback to receive solutions during routing search
+        
+        Parameters
+        ----------
+        callback : GetSolutionCallback
+            Callback object that inherits from GetSolutionCallback
+        """
+        cdef uintptr_t callback_ptr = callback.get_native_callback()
+        self.c_solver_settings.get().set_routing_callback(
+            <base_routing_callback_t*>callback_ptr
+        )
 
 cdef char* c_get_string(string in_str):
     cdef char* c_string = <char *> malloc((in_str.length()+1) * sizeof(char))

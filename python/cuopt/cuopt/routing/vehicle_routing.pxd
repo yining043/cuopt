@@ -26,6 +26,9 @@ from pylibraft.common.handle cimport *
 
 from cuopt.routing.structure.routing_utilities cimport *
 
+cdef extern from "cuopt/routing/utilities/internals.hpp" namespace "cuopt::routing::callbacks":
+    cdef cppclass base_routing_callback_t
+
 
 cdef extern from "cuopt/routing/solve.hpp" namespace "cuopt::routing":
 
@@ -137,6 +140,7 @@ cdef extern from "cuopt/routing/solve.hpp" namespace "cuopt::routing":
         void set_verbose_mode(bool verbose) except+
         void set_error_logging_mode(bool logging) except+
         void dump_best_results(const string &file_path, i_t interval) except+
+        void set_routing_callback(base_routing_callback_t* callback) except+
 
         f_t get_time_limit() except+
 
