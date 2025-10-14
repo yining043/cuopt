@@ -754,8 +754,8 @@ cdef class SolverSettings:
         
         Parameters
         ----------
-        callback : GetSolutionCallback
-            Callback object that inherits from GetSolutionCallback
+        callback : ObservationCallback
+            Callback object that inherits from ObservationCallback
         """
         cdef uintptr_t callback_ptr = callback.get_native_callback()
         self.c_solver_settings.get().set_routing_callback(

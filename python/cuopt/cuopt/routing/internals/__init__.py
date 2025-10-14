@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cuopt.routing.internals.internals import GetSolutionCallback
+from cuopt.routing.internals.internals import ObservationCallback
 
-__all__ = ["GetSolutionCallback"]
+__all__ = ["ObservationCallback"]
 

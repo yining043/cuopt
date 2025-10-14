@@ -4,32 +4,51 @@ Minimal test for routing callback functionality
 import numpy as np
 import cudf
 from cuopt import routing
-from cuopt.routing import GetSolutionCallback
+from cuopt.routing import ObservationCallback
 import matplotlib.pyplot as plt
+import random
 
-
-class TestCallback(GetSolutionCallback):
+class TestCallback(ObservationCallback):
     def __init__(self):
         super().__init__()
         self.call_count = 0
         self.solutions = []
     
-    def get_solution(self, routes_2d, objective_value, n_routes):
+    def get_observation_and_sample(self, routes_2d, node_ids_to_search, objective_value, n_routes):
+        """
+        Custom callback that logs solutions and returns indices for sampling
+        
+        NOTE: Must return INDICES into node_ids_to_search, not node IDs!
+        """
         self.call_count += 1
         
+        # Store observation for analysis
         self.solutions.append({
             'iteration': self.call_count,
             'cost': objective_value,
             'n_routes': n_routes,
-            'routes': routes_2d
+            'routes': routes_2d,
+            'nodes_to_search': list(node_ids_to_search)
         })
         
-        print(f"[Callback #{self.call_count}] cost={objective_value:.2f}, routes={n_routes}")
+        # Determine sample size
+        n_available = len(node_ids_to_search)
+        if n_available < 40:
+            sample_size = n_available
+        elif n_available < 80:
+            sample_size = n_available // 2
+        else:
+            sample_size = 40
+        
+        # Return random INDICES (not node IDs!)
+        sampled_indices = random.sample(range(n_available), sample_size) if sample_size > 0 else []
+        
+        return sampled_indices
 
 
 def generate_random_vrp(n_locations, n_vehicles, seed=42):
     """Generate a random VRP problem"""
-    np.random.seed(seed)
+    # np.random.seed(seed)
     
     coords = np.random.rand(n_locations, 2) * 100
     
