@@ -55,6 +55,9 @@ version_cache.json
 # Local Server Error Log
 error_log.txt
 
+# output/
+output/
+
 # docs
 docs/cuopt/source/cuopt-c/lp-milp/cuopt-cli-help.txt
 docs/cuopt/source/cuopt-server/client-api/sh-cli-help.txt

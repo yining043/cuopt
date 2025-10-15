@@ -28,6 +28,7 @@ class CuOptCollector:
         
         # Policy network
         self.use_policy = use_policy
+        self.policy = policy
         if use_policy and policy is None:
             self.policy = NodeCandidateSelectionPolicy(
                 node_feature_dim=3,
@@ -36,9 +37,6 @@ class CuOptCollector:
                 num_graph_layers=2,
                 num_sab_layers=2
             )
-            self.policy.eval()
-        else:
-            self.policy = policy
     
     def reset(self):
         """Generate new problem and prepare solver"""
@@ -105,38 +103,32 @@ class _CustomizeCallback(CustomizeNodesCallback):
             'num_candidates': len(candidate_node_ids),
         }
         self.collector.trajectory['states'].append(state)
+        # Use adaptive sampling (n<40→all, n<80→half, n≥80→40)
+        n = len(candidate_node_ids)
+        assert n > 0, "No candidates"
+        if n < 40:
+            sample_size = n
+        else:
+            sample_size = 40
         
         # Generate action
         if self.collector.use_policy:
             # Use policy network
-            selected_indices, logp = self.collector.policy.sample(
+            selected_indices, _logp = self.collector.policy.sample(
                 state, 
                 self.collector.problem_data,
+                sample_size,
                 deterministic = False
             )
             action = selected_indices
-            # print(f"logp: {logp.item() if torch.is_tensor(logp) else logp}")
-            self.collector.trajectory['logps'].append(logp.item() if torch.is_tensor(logp) else logp)
+            logp = _logp.item() if torch.is_tensor(_logp) else _logp
         else:
-            # Use adaptive sampling (n<40→all, n<80→half, n≥80→40)
-            n = len(candidate_node_ids)
-            if n == 0:
-                action = []
-            elif n < 40:
-                sample_size = n
-            elif n < 80:
-                sample_size = n // 2
-            else:
-                sample_size = 40
-            
-            if n > 0 and sample_size > 0:
-                action = self.collector.rng.choice(n, sample_size, replace=False).tolist()
-            else:
-                action = []
-            self.collector.trajectory['logps'].append(0.0)
-        
+            action = self.collector.rng.choice(n, sample_size, replace=False).tolist()
+            logp = 0.0
+
+        self.collector.trajectory['logps'].append(logp)
         self.collector.trajectory['actions'].append(action)
-        print(f" {len(action)}/{len(candidate_node_ids)} action selected")
+        # print(f" {len(action)}/{len(candidate_node_ids)} action selected")
         return action
 
 
@@ -172,6 +164,7 @@ if __name__ == "__main__":
         if result['num_steps'] > 0:
             states = result['trajectory']['states']
             rewards = result['trajectory']['rewards']
+            actions = result['trajectory']['actions']
             logps = result['trajectory']['logps']
             print(f"--------------------------------")
             print(f"Episode {i+1}")
@@ -182,6 +175,11 @@ if __name__ == "__main__":
             print(f"Avg candidates: {np.mean([s['num_candidates'] for s in states]):.1f}")
             if use_policy:
                 print(f"Avg logp: {np.mean(logps):.4f}")
+            # now print the number of state, reward, logp
+            print(f"Number of states: {len(states)}")
+            print(f"Number of rewards: {len(rewards)}")
+            print(f"Number of actions: {len(actions)}")
+            if use_policy: print(f"Number of logps: {len(logps)}")
             print(f"--------------------------------\n")
         else:
             print("No steps recorded (callback not triggered)")

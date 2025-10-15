@@ -7,7 +7,7 @@ Two-stage architecture:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Bernoulli
 import numpy as np
 
 
@@ -75,7 +75,7 @@ class PMA(nn.Module):
 
 class GraphAttentionLayer(nn.Module):
     """Single Graph Attention Layer"""
-    def __init__(self, in_features, out_features, num_heads=4, dropout=0.1):
+    def __init__(self, in_features, out_features, num_heads=4, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
         self.out_features = out_features
@@ -130,7 +130,7 @@ class GraphAttentionLayer(nn.Module):
 
 class GraphEncoder(nn.Module):
     """Graph Attention Network for encoding all nodes"""
-    def __init__(self, node_feature_dim, d_model, num_heads=4, num_layers=2, dropout=0.1):
+    def __init__(self, node_feature_dim, d_model, num_heads=4, num_layers=2, dropout=0.0):
         super().__init__()
         self.input_proj = nn.Linear(node_feature_dim, d_model)
         
@@ -163,7 +163,7 @@ class GraphEncoder(nn.Module):
 
 class SetTransformerSegmentation(nn.Module):
     """Set Transformer for candidate segmentation"""
-    def __init__(self, d_model, num_heads=4, num_sab_layers=2, dropout=0.1):
+    def __init__(self, d_model, num_heads=4, num_sab_layers=2, dropout=0.0):
         super().__init__()
         
         # SAB layers for candidate interaction
@@ -182,14 +182,13 @@ class SetTransformerSegmentation(nn.Module):
         self.seg_head = nn.Sequential(
             nn.Linear(head_input_dim, d_model),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 2)  # [not_select, select]
+            nn.Linear(d_model, 1)  # Single logit for binary decision
         )
     
     def forward(self, candidate_embeddings):
         """
         candidate_embeddings: [batch, M, d_model] or [M, d_model]
-        Returns: [batch, M, 2] or [M, 2] - logits for each candidate
+        Returns: [batch, M, 1] or [M, 1] - single logit for each candidate
         """
         # Handle single batch
         if candidate_embeddings.dim() == 2:
@@ -232,7 +231,7 @@ class NodeCandidateSelectionPolicy(nn.Module):
                  num_heads=4,
                  num_graph_layers=2,
                  num_sab_layers=2,
-                 dropout=0.1):
+                 dropout=0.0):
         super().__init__()
         
         self.node_feature_dim = node_feature_dim
@@ -268,29 +267,66 @@ class NodeCandidateSelectionPolicy(nn.Module):
         edge_index = self._extract_edges(state['routes_2d'], node_features.size(0))
         
         # Stage 1: Encode all nodes
-        node_embeddings = self.graph_encoder(node_features, edge_index)
+        node_embeddings = self.graph_encoder(node_features, edge_index)  # [N, d_model]
         
-        # Stage 2: Extract candidate embeddings
+        # Expand embeddings to include virtual depot nodes
+        n_real_nodes = node_features.size(0)
+        n_routes = len(state['routes_2d'])
+        n_virtual_depots = n_routes * 4  # CuOpt creates 4 virtual depots per route
+        
+        # Create virtual depot embeddings with route-specific information
+        depot_embedding = node_embeddings[0]  # [d_model]
+        virtual_embeddings = []
+        
+        for route_id in range(n_routes):
+            # Create 4 virtual depots for this route
+            for i in range(4):
+                # Add route-specific positional encoding
+                route_encoding = torch.zeros(self.d_model, device=depot_embedding.device)
+                # Use sinusoidal encoding for route_id
+                position = route_id * 4 + i
+                div_term = torch.exp(torch.arange(0, self.d_model, 2, device=depot_embedding.device) * 
+                                    -(np.log(10000.0) / self.d_model))
+                route_encoding[0::2] = torch.sin(position * div_term)
+                if self.d_model > 1:
+                    route_encoding[1::2] = torch.cos(position * div_term[:len(route_encoding[1::2])])
+                
+                # Virtual depot = depot embedding + route encoding (small scale)
+                virtual_emb = depot_embedding + 0.1 * route_encoding
+                virtual_embeddings.append(virtual_emb)
+        
+        # Concatenate: [real nodes, virtual depots]
+        if virtual_embeddings:
+            virtual_embeddings = torch.stack(virtual_embeddings)  # [n_virtual, d_model]
+            node_embeddings_extended = torch.cat([node_embeddings, virtual_embeddings], dim=0)
+        else:
+            node_embeddings_extended = node_embeddings
+        
+        # Stage 2: Extract candidate embeddings (directly index, no mapping needed)
         candidate_ids = state['candidate_node_ids']
         assert len(candidate_ids) != 0, "No candidates"
         
-        # extra stage: processing candidate ids
-        candidate_ids = torch.tensor(candidate_ids)
-        candidate_ids_mapped = torch.where(
-            candidate_ids >= node_features.size(0),
-            torch.zeros_like(candidate_ids),  # 映射到 depot (节点0)
-            candidate_ids  # 保持原值
-        )
-        candidate_embeddings = node_embeddings[candidate_ids_mapped]
+        candidate_ids_tensor = torch.tensor(candidate_ids, dtype=torch.long)
+        # Clamp to valid range
+        max_id = node_embeddings_extended.size(0) - 1
+        candidate_ids_clamped = torch.clamp(candidate_ids_tensor, 0, max_id)
+        candidate_embeddings = node_embeddings_extended[candidate_ids_clamped]
         
         # Stage 2: Set Transformer segmentation
         logits = self.set_segmentation(candidate_embeddings)
         
         return logits
     
-    def sample(self, state, problem_data, deterministic=False):
+    def sample(self, state, problem_data, sample_size=40, deterministic=False):
         """
         Sample action and compute log probability
+        Select top min(M, sample_size) candidates based on probabilities
+        
+        Args:
+            state: current state dict
+            problem_data: problem data dict
+            sample_size: number of nodes to select (default 40)
+            deterministic: whether to use deterministic selection
         
         Returns:
             selected_indices: list of selected candidate indices (in range [0, M-1])
@@ -309,19 +345,25 @@ class NodeCandidateSelectionPolicy(nn.Module):
                 self.train()
             return [], torch.tensor(0.0)
         
-        # Create categorical distribution
-        dist = Categorical(logits=logits)
+        # Squeeze to get [M] shape and convert to probabilities
+        logits = logits.squeeze(-1)  # [M, 1] -> [M]
+        probs = torch.sigmoid(logits)
         
-        if deterministic:
-            actions = logits.argmax(dim=-1)
-        else:
-            actions = dist.sample()
+        # Determine k = min(M, sample_size)
+        M = probs.size(0)
+        k = min(M, sample_size)
         
-        # Compute log probability
-        logp = dist.log_prob(actions).sum()
+        # Select top-k candidates based on probabilities
+        top_k_probs, top_k_indices = torch.topk(probs, k=k)
+        selected_indices = top_k_indices.tolist()
         
-        # Extract selected indices (where action == 1)
-        selected_indices = (actions == 1).nonzero(as_tuple=True)[0].tolist()
+        # Compute log probability for the selection
+        # Create action mask: selected nodes = 1, others = 0
+        actions = torch.zeros(M, dtype=torch.long, device=probs.device)
+        actions[top_k_indices] = 1
+        
+        dist = Bernoulli(probs=probs)
+        logp = dist.log_prob(actions.float()).mean()
         
         # Restore training mode
         if was_training and deterministic:
@@ -348,11 +390,160 @@ class NodeCandidateSelectionPolicy(nn.Module):
         if logits.size(0) == 0:
             return torch.tensor(0.0), torch.tensor(0.0)
         
-        dist = Categorical(logits=logits)
-        logp = dist.log_prob(actions).sum()
-        entropy = dist.entropy().sum()
+        # Squeeze to get [M] shape and convert to probabilities
+        logits = logits.squeeze(-1)  # [M, 1] -> [M]
+        probs = torch.sigmoid(logits)
+        
+        # Create Bernoulli distribution
+        dist = Bernoulli(probs=probs)
+        
+        # Use mean instead of sum to normalize by number of candidates
+        # This ensures logp and entropy are comparable across different problem sizes
+        logp = dist.log_prob(actions.float()).mean()
+        entropy = dist.entropy().mean()
         
         return logp, entropy
+    
+    def precompute_cache(self, state, problem_data):
+        """
+        Precompute data that doesn't depend on network parameters
+        This caches data processing to avoid repeated computation
+        
+        Args:
+            state: state dict
+            problem_data: problem data dict
+        
+        Returns:
+            cache: dict with preprocessed data
+        """
+        # Extract node features (numpy operations)
+        node_features = self._extract_node_features(problem_data)
+        
+        # Extract edges from routes
+        edge_index = self._extract_edges(state['routes_2d'], node_features.size(0))
+        
+        # Get candidate IDs
+        candidate_ids = state['candidate_node_ids']
+        candidate_ids_tensor = torch.tensor(candidate_ids, dtype=torch.long)
+        
+        # Metadata
+        n_routes = len(state['routes_2d'])
+        n_real_nodes = node_features.size(0)
+        
+        return {
+            'node_features': node_features,
+            'edge_index': edge_index,
+            'candidate_ids': candidate_ids_tensor,
+            'n_routes': n_routes,
+            'n_real_nodes': n_real_nodes
+        }
+    
+    def forward_gnn_only(self, cache):
+        """
+        Forward only GNN part using cached data
+        Returns candidate embeddings that can be batched
+        
+        Args:
+            cache: dict from precompute_cache()
+        
+        Returns:
+            candidate_embeddings: [M, d_model] tensor
+        """
+        # GNN encoding (uses current parameters, allows gradients)
+        node_embeddings = self.graph_encoder(cache['node_features'], cache['edge_index'])
+        
+        # Add virtual depot embeddings
+        depot_embedding = node_embeddings[0]
+        virtual_embeddings = []
+        
+        for route_id in range(cache['n_routes']):
+            for i in range(4):
+                route_encoding = torch.zeros(self.d_model, device=depot_embedding.device)
+                position = route_id * 4 + i
+                div_term = torch.exp(torch.arange(0, self.d_model, 2, device=depot_embedding.device) * 
+                                    -(np.log(10000.0) / self.d_model))
+                route_encoding[0::2] = torch.sin(position * div_term)
+                if self.d_model > 1:
+                    route_encoding[1::2] = torch.cos(position * div_term[:len(route_encoding[1::2])])
+                virtual_emb = depot_embedding + 0.1 * route_encoding
+                virtual_embeddings.append(virtual_emb)
+        
+        # Concatenate real and virtual nodes
+        if virtual_embeddings:
+            virtual_embeddings = torch.stack(virtual_embeddings)
+            node_embeddings_extended = torch.cat([node_embeddings, virtual_embeddings], dim=0)
+        else:
+            node_embeddings_extended = node_embeddings
+        
+        # Extract candidate embeddings using cached IDs
+        max_id = node_embeddings_extended.size(0) - 1
+        candidate_ids_clamped = torch.clamp(cache['candidate_ids'], 0, max_id)
+        candidate_embeddings = node_embeddings_extended[candidate_ids_clamped]
+        
+        return candidate_embeddings
+    
+    def evaluate_batch(self, caches, actions_list):
+        """
+        Batch evaluate using cached data
+        GNN part is done per-sample (different graph structures)
+        Set Transformer is batched (major speedup)
+        
+        Args:
+            caches: list of cache dicts from precompute_cache()
+            actions_list: list of action tensors
+        
+        Returns:
+            logps: [batch_size] tensor of log probabilities
+            entropies: [batch_size] tensor of entropies
+        """
+        batch_size = len(caches)
+        
+        # Step 1: GNN forward for each sample (loop - different graph structures)
+        all_candidate_embeddings = []
+        all_num_candidates = []
+        
+        for cache in caches:
+            candidate_emb = self.forward_gnn_only(cache)  # [M_i, d_model]
+            all_candidate_embeddings.append(candidate_emb)
+            all_num_candidates.append(candidate_emb.size(0))
+        
+        # Step 2: Batch Set Transformer (major speedup!)
+        max_M = max(all_num_candidates)
+        batch_candidates = torch.zeros(batch_size, max_M, self.d_model, 
+                                      device=all_candidate_embeddings[0].device)
+        batch_masks = torch.zeros(batch_size, max_M, dtype=torch.bool,
+                                  device=all_candidate_embeddings[0].device)
+        
+        for i, (emb, M) in enumerate(zip(all_candidate_embeddings, all_num_candidates)):
+            batch_candidates[i, :M] = emb
+            batch_masks[i, :M] = True
+        
+        # Forward Set Transformer once for entire batch
+        batch_logits = self.set_segmentation(batch_candidates)  # [B, max_M, 1]
+        batch_logits = batch_logits.squeeze(-1)  # [B, max_M]
+        
+        # Step 3: Compute logp and entropy for each sample
+        batch_logps = []
+        batch_entropies = []
+        
+        for i, (M, actions) in enumerate(zip(all_num_candidates, actions_list)):
+            # Extract valid logits (not padding)
+            logits = batch_logits[i, :M]
+            probs = torch.sigmoid(logits)
+            
+            # Compute log probability and entropy
+            dist = Bernoulli(probs=probs)
+            logp = dist.log_prob(actions.float()).mean()
+            entropy = dist.entropy().mean()
+            
+            batch_logps.append(logp)
+            batch_entropies.append(entropy)
+        
+        # Stack into tensors
+        logps = torch.stack(batch_logps)
+        entropies = torch.stack(batch_entropies)
+        
+        return logps, entropies
     
     def _extract_node_features(self, problem_data):
         """

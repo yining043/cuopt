@@ -209,7 +209,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       }
     }
   }
-  bool needs_customization = nodes_to_search.h_nodes_to_search.size() > 40;
+  bool needs_customization = nodes_to_search.h_nodes_to_search.size() > 0;
   if (!full_set && needs_customization && obs_callback) {
     // Prepare current solution for observation
     size_t n_nodes = sol.route_node_map.route_id_per_node.size();
