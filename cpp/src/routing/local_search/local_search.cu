@@ -347,7 +347,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   }
 
   // Reward: Send feedback to reward callback after search iteration
-  if (!full_set && obs_callback && needs_customizationcc) {
+  if (!full_set && obs_callback && needs_customization) {
     for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
       if (callback->get_type() == callbacks::callback_type_t::REWARD) {
         auto reward_callback = static_cast<callbacks::reward_callback_t*>(callback);
@@ -397,7 +397,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
       bool move_found = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2);
-      printf("move_found: %d\n", move_found);
+      // printf("move_found: %d\n", move_found);
       if (move_found) { continue; }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
