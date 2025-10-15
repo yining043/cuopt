@@ -60,12 +60,6 @@ class CuOptCollector:
     def run_solver(self, dm, settings):
         """Run solver and return collected trajectory"""
         self.solution = routing.Solve(dm, settings)
-        return {
-            'trajectory': self.trajectory,
-            'solution': self.solution,
-            'problem': self.problem_data,
-            'num_steps': len(self.trajectory['states'])
-        }
     
     def _generate_problem(self):
         """Generate random VRP (same as test_callback_minimal)"""
@@ -152,23 +146,23 @@ if __name__ == "__main__":
     
     if use_policy:
         print("Using Policy Network")
-        collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=2.0, seed=42, use_policy=True)
+        collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=10.0, seed=42, use_policy=True)
     else:
         print("Using Random Sampling")
-        collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=2.0, seed=42, use_policy=False)
+        collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=10.0, seed=42, use_policy=False)
 
     for i in range(3):
         dm, settings = collector.reset()
-        result = collector.run_solver(dm, settings)
+        collector.run_solver(dm, settings)  
         
-        if result['num_steps'] > 0:
-            states = result['trajectory']['states']
-            rewards = result['trajectory']['rewards']
-            actions = result['trajectory']['actions']
-            logps = result['trajectory']['logps']
+        if len(collector.trajectory['states']) > 0:
+            states = collector.trajectory['states']
+            rewards = collector.trajectory['rewards']
+            actions = collector.trajectory['actions']
+            logps = collector.trajectory['logps']
             print(f"--------------------------------")
             print(f"Episode {i+1}")
-            print(f"Steps: {result['num_steps']}")
+            print(f"Steps: {len(states)}")
             print(f"Cost: {states[0]['solution_cost']:.2f} → {states[-1]['solution_cost']:.2f} "
                 f"(Δ={states[0]['solution_cost'] - states[-1]['solution_cost']:.2f})")
             print(f"Total reward: {sum(rewards):.2f}")
