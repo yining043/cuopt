@@ -215,7 +215,7 @@ def test_callback():
     print("=" * 60)
     
     # Setup problem
-    n_locations, n_vehicles = 100, 10
+    n_locations, n_vehicles = 1000, 100
     problem_data = generate_random_vrp(n_locations, n_vehicles)
     
     data_model = routing.DataModel(n_locations, n_vehicles)
@@ -228,7 +228,7 @@ def test_callback():
     reward_callback = TestRewardCallback()
     
     solver_settings = routing.SolverSettings()
-    solver_settings.set_time_limit(10)
+    solver_settings.set_time_limit(5)
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
     

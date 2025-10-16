@@ -1,0 +1,111 @@
+============================================================
+PPO Training (Parallel)
+============================================================
+Epochs: 200, Episodes/epoch: 5
+PPO: 5 update epochs, clip=0.1
+Learning rate: 0.0001, Reward scale: 0.1, Grad clip: 0.1
+Problem size: 50 locations, 5 vehicles
+Workers: training=1, testing=1
+Output directory: output/20251016_043718
+
+Initializing policy...
+Using device: cuda (total GPUs: 1)
+Testing before training...
+  Cost: 900.11±67.94, Return: 21.65
+
+============================================================
+Training from epoch 0 to 200...
+============================================================
+
+--- Epoch 1/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=877.46±70.29, select=91.9%
+  Training samples: 718 (from 5 episodes, avg 143.6 steps/episode)
+  Data sizes - States: 718, Actions: 718, Logps: 718, Rewards: 718
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -3.2823 → -4.3736
+  Ratio: 0.613±0.024 → 0.790±0.006
+  Clipped: 85.7% → 79.3%
+  Entropy: 1.598 → 1.716
+  Gradient norm: 7.3259, Max param change: 0.001016
+
+  Cost: 939.86±68.95, Return: 68.27
+Epoch 1: test_cost=939.86, loss=-3.2823
+
+--- Epoch 2/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=869.65±29.55, select=92.0%
+  Training samples: 791 (from 5 episodes, avg 158.2 steps/episode)
+  Data sizes - States: 791, Actions: 791, Logps: 791, Rewards: 791
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -6.7344 → -6.6477
+  Ratio: 0.919±0.003 → 0.989±0.002
+  Clipped: 40.4% → 26.3%
+  Entropy: 1.706 → 1.699
+  Gradient norm: 1.9254, Max param change: 0.001095
+
+  Cost: 915.03±66.94, Return: 25.24
+Epoch 2: test_cost=915.03, loss=-6.7344
+
+--- Epoch 3/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=889.63±72.89, select=91.9%
+  Training samples: 750 (from 5 episodes, avg 150.0 steps/episode)
+  Data sizes - States: 750, Actions: 750, Logps: 750, Rewards: 750
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -6.9398 → -7.2021
+  Ratio: 0.991±0.005 → 1.053±0.003
+  Clipped: 20.4% → 19.4%
+  Entropy: 1.717 → 1.707
+  Gradient norm: 1.4008, Max param change: 0.001220
+
+  Cost: 835.64±31.92, Return: 26.37
+Epoch 3: test_cost=835.64, loss=-6.9398
+  * New best cost: 835.64 (improved 64.47 / 7.16%)
+  Saved best model to: output/20251016_043718/best_policy.pt
+
+--- Epoch 4/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=975.87±180.09, select=90.8%
+  Training samples: 833 (from 5 episodes, avg 166.6 steps/episode)
+  Data sizes - States: 833, Actions: 833, Logps: 833, Rewards: 833
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -12.4110 → -12.6916
+  Ratio: 1.057±0.005 → 1.114±0.005
+  Clipped: 23.1% → 39.8%
+  Entropy: 1.743 → 1.718
+  Gradient norm: 1.7122, Max param change: 0.001358
+
+  Cost: 910.37±53.89, Return: 21.35
+Epoch 4: test_cost=910.37, loss=-12.4110
+
+--- Epoch 5/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=917.54±87.35, select=91.3%
+  Training samples: 739 (from 5 episodes, avg 147.8 steps/episode)
+  Data sizes - States: 739, Actions: 739, Logps: 739, Rewards: 739
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -6.1534 → -6.2023
+  Ratio: 1.107±0.009 → 1.148±0.006
+  Clipped: 36.2% → 42.9%
+  Entropy: 1.761 → 1.756
+  Gradient norm: 0.3544, Max param change: 0.001489
+
+  Cost: 823.66±15.87, Return: 0.20
+Epoch 5: test_cost=823.66, loss=-6.1534
+  * New best cost: 823.66 (improved 76.45 / 8.49%)
+  Saved best model to: output/20251016_043718/best_policy.pt
+
+--- Epoch 6/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=965.03±107.39, select=89.1%
+  Training samples: 756 (from 5 episodes, avg 151.2 steps/episode)
+  Data sizes - States: 756, Actions: 756, Logps: 756, Rewards: 756
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+expected sequence of length 70 at dim 1 (got 66)

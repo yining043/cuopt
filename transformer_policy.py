@@ -302,9 +302,10 @@ class TransformerCandidatePolicy(nn.Module):
         # Autoregressive decoder
         self.decoder = AutoregressiveDecoder(d_model, num_heads, max_candidates)
         
-        # Learnable dummy depot embeddings (4 per route, max 20 routes = 80 total)
-        # We'll dynamically slice based on actual num_routes
-        max_dummy_depots = 80  # Assume max 20 routes
+        # Learnable dummy depot embeddings (4 per route)
+        # Max routes typically <= n_vehicles, but cuopt may add more dynamically
+        # Use conservative estimate: 4 * max_vehicles * 2 (allow doubling)
+        max_dummy_depots = 400  # Support up to 100 routes (very conservative)
         self.dummy_depot_embeddings = nn.Parameter(torch.randn(max_dummy_depots, d_model))
         
         # Move model to device
@@ -440,6 +441,8 @@ class TransformerCandidatePolicy(nn.Module):
         
         if total_nodes > N:
             # Use learnable dummy depot embeddings (deterministic)
+            # Clamp to avoid index error if num_dummy_depots exceeds our parameter size
+            num_dummy_depots = min(num_dummy_depots, self.dummy_depot_embeddings.size(0))
             dummy_embeddings = self.dummy_depot_embeddings[:num_dummy_depots]  # [num_dummy_depots, d_model]
             
             # Concatenate real nodes + dummy depots
@@ -449,35 +452,46 @@ class TransformerCandidatePolicy(nn.Module):
     
     def encode_batch(self, states, problem_data_list):
         """
-        Batch encode all states - vectorized
+        Batch encode all states - vectorized with dynamic padding
         
         Args:
             states: list of B state dicts
             problem_data_list: list of B problem data dicts
         
         Returns:
-            node_embeddings_batch: [B, total_nodes, d_model]
+            node_embeddings_batch: [B, max_total_nodes, d_model]
+            total_nodes_per_sample: [B] - actual total_nodes for each sample
         """
         B = len(states)
+        device = self.device
         
         # Vectorized feature extraction
         node_features_batch = self.extract_node_features_batch(problem_data_list)  # [B, N, 3]
+        N = node_features_batch.size(1)
         
         # Batch embed and encode
         node_embeddings_batch = self.feature_embed(node_features_batch)  # [B, N, d_model]
         node_embeddings_batch = self.encoder(node_embeddings_batch, attn_bias=None)  # [B, N, d_model]
         
-        # Vectorized dummy depot creation (learnable, deterministic)
-        num_routes = states[0]['num_routes']
-        num_dummy_depots = num_routes * 4
+        # Find max_total_nodes in this batch (n_routes may vary)
+        total_nodes_per_sample = [len(s['candidate_mask']) for s in states]
+        max_total_nodes = max(total_nodes_per_sample)
+        max_dummy_depots = max_total_nodes - N
         
-        # Use learnable dummy depot embeddings (expand to batch)
-        dummy_embeddings = self.dummy_depot_embeddings[:num_dummy_depots].unsqueeze(0)  # [1, num_dummy, d_model]
-        dummy_embeddings = dummy_embeddings.expand(B, -1, -1)  # [B, num_dummy, d_model]
+        # Pad dummy depot embeddings to max
+        dummy_embeddings_padded = torch.zeros(B, max_dummy_depots, self.d_model, device=device)
         
-        node_embeddings_batch = torch.cat([node_embeddings_batch, dummy_embeddings], dim=1)  # [B, total_nodes, d_model]
+        for i, state in enumerate(states):
+            num_dummy = len(state['candidate_mask']) - N
+            if num_dummy > 0:
+                # Clamp to avoid index error
+                num_dummy_safe = min(num_dummy, self.dummy_depot_embeddings.size(0))
+                dummy_embeddings_padded[i, :num_dummy_safe, :] = self.dummy_depot_embeddings[:num_dummy_safe]
         
-        return node_embeddings_batch
+        # Concatenate
+        node_embeddings_batch = torch.cat([node_embeddings_batch, dummy_embeddings_padded], dim=1)  # [B, max_total_nodes, d_model]
+        
+        return node_embeddings_batch, total_nodes_per_sample
     
     def prepare_candidates(self, node_embeddings, candidate_mask):
         """
@@ -516,13 +530,14 @@ class TransformerCandidatePolicy(nn.Module):
         
         return candidate_embeddings, valid_mask, candidate_node_ids
     
-    def prepare_candidates_batch(self, node_embeddings_batch, candidate_masks):
+    def prepare_candidates_batch(self, node_embeddings_batch, candidate_masks, total_nodes_per_sample):
         """
-        Batch prepare candidates - uses torch.nonzero per sample
+        Batch prepare candidates - uses torch.nonzero per sample with dynamic padding
         
         Args:
-            node_embeddings_batch: [B, total_nodes, d_model]
-            candidate_masks: list of B masks [total_nodes]
+            node_embeddings_batch: [B, max_total_nodes, d_model]
+            candidate_masks: list of B masks [variable total_nodes]
+            total_nodes_per_sample: list of B integers - actual total_nodes for each sample
         
         Returns:
             candidate_embeddings_batch: [B, 40, d_model]
@@ -530,10 +545,21 @@ class TransformerCandidatePolicy(nn.Module):
             candidate_node_ids_list: list of B lists
         """
         B = node_embeddings_batch.size(0)
+        max_total_nodes = node_embeddings_batch.size(1)
         device = self.device
         
+        # Pad candidate_masks to max_total_nodes
+        candidate_masks_padded = []
+        for i, mask in enumerate(candidate_masks):
+            actual_len = len(mask)
+            if actual_len < max_total_nodes:
+                padded = mask + [0] * (max_total_nodes - actual_len)
+            else:
+                padded = mask
+            candidate_masks_padded.append(padded)
+        
         # Convert masks to tensor
-        candidate_masks_tensor = torch.tensor(candidate_masks, dtype=torch.bool, device=device)  # [B, total_nodes]
+        candidate_masks_tensor = torch.tensor(candidate_masks_padded, dtype=torch.bool, device=device)  # [B, max_total_nodes]
         
         batch_cand_emb_list = []
         batch_valid_list = []
@@ -565,10 +591,10 @@ class TransformerCandidatePolicy(nn.Module):
     
     def extract_and_pad_selected_indices(self, selection_masks, candidate_node_ids_list):
         """
-        Extract and pad selected indices - uses torch.nonzero per sample
+        Extract and pad selected indices - uses torch.nonzero per sample with variable length handling
         
         Args:
-            selection_masks: list of B masks [total_nodes]
+            selection_masks: list of B masks [variable total_nodes]
             candidate_node_ids_list: list of B lists of candidate node_ids
         
         Returns:
@@ -578,8 +604,18 @@ class TransformerCandidatePolicy(nn.Module):
         B = len(selection_masks)
         device = self.device
         
+        # Pad selection_masks to max length
+        max_len = max(len(mask) for mask in selection_masks)
+        selection_masks_padded = []
+        for mask in selection_masks:
+            if len(mask) < max_len:
+                padded = mask + [0] * (max_len - len(mask))
+            else:
+                padded = mask
+            selection_masks_padded.append(padded)
+        
         # Convert to tensors
-        selection_masks_tensor = torch.tensor(selection_masks, dtype=torch.bool, device=device)  # [B, total_nodes]
+        selection_masks_tensor = torch.tensor(selection_masks_padded, dtype=torch.bool, device=device)  # [B, max_len]
         
         batch_selected_indices = []
         batch_k_values = []
@@ -681,12 +717,12 @@ class TransformerCandidatePolicy(nn.Module):
         B = len(states)
         device = self.device
         
-        # 1. Batch encode all states (fully vectorized)
-        node_embeddings_batch = self.encode_batch(states, problem_data_list)  # [B, total_nodes, d_model]
+        # 1. Batch encode all states (fully vectorized with dynamic padding)
+        node_embeddings_batch, total_nodes_per_sample = self.encode_batch(states, problem_data_list)  # [B, max_total_nodes, d_model]
         
         # 2. Batch prepare candidates (fully vectorized)
         candidate_embeddings_batch, valid_masks_batch, candidate_node_ids_list = \
-            self.prepare_candidates_batch(node_embeddings_batch, [s['candidate_mask'] for s in states])
+            self.prepare_candidates_batch(node_embeddings_batch, [s['candidate_mask'] for s in states], total_nodes_per_sample)
         # [B, 40, d_model], [B, 40], list[B]
         
         # 3. Extract and pad selected indices (fully vectorized)

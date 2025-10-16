@@ -149,15 +149,31 @@ class _CustomizeCallback(CustomizeNodesCallback):
 
 
 class _RewardCallback(RewardCallback):
-    """Records reward as cost improvement"""
+    """Records reward as cost improvement with historical best tracking"""
     
     def __init__(self, collector):
         super().__init__()
         self.collector = collector
+        self.best_cost = None  # Track historical best cost
     
     def receive_reward(self, improvement_found, solution_cost):
+        # Initialize best cost
+        if self.best_cost is None:
+            self.best_cost = solution_cost
+        
+        # Immediate reward: step-to-step improvement
         prev_cost = self.collector.trajectory['states'][-1]['solution_cost']
-        reward = float(prev_cost - solution_cost)
+        immediate_reward = (prev_cost - solution_cost) * 0.1
+        
+        # Historical bonus: reward for breaking historical best
+        if solution_cost < self.best_cost:
+            historical_bonus = (self.best_cost - solution_cost) * 1.0
+            self.best_cost = solution_cost  # Update best
+        else:
+            historical_bonus = 0.0
+        
+        # Combined reward
+        reward = immediate_reward + historical_bonus
         self.collector.trajectory['rewards'].append(reward)
 
 

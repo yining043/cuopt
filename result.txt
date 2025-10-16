@@ -105,3 +105,462 @@ Epoch 5: test_cost=907.12, loss=-13.6926
 
 --- Epoch 6/200 ---
 Collecting data (1 workers)...
+  Collected 5 episodes: cost=935.35±71.43, select=91.1%
+  Training samples: 550 (from 5 episodes, avg 110.0 steps/episode)
+  Data sizes - States: 550, Actions: 550, Logps: 550, Rewards: 550
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -16.4498 → -14.9630
+  Ratio: 1.115±0.011 → 1.135±0.009
+  Clipped: 36.4% → 34.9%
+  Entropy: 1.734 → 1.708
+  Gradient norm: 0.5160, Max param change: 0.001607
+
+  Cost: 947.03±93.80, Return: 20.21
+Epoch 6: test_cost=947.03, loss=-16.4498
+
+--- Epoch 7/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=927.77±69.80, select=91.3%
+  Training samples: 520 (from 5 episodes, avg 104.0 steps/episode)
+  Data sizes - States: 520, Actions: 520, Logps: 520, Rewards: 520
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -11.6779 → -8.6934
+  Ratio: 1.087±0.032 → 1.109±0.030
+  Clipped: 30.1% → 36.5%
+  Entropy: 1.502 → 1.677
+  Gradient norm: 0.4760, Max param change: 0.001602
+
+  Cost: 884.79±18.80, Return: 21.44
+Epoch 7: test_cost=884.79, loss=-11.6779
+
+--- Epoch 8/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=866.65±60.58, select=92.0%
+  Training samples: 561 (from 5 episodes, avg 112.2 steps/episode)
+  Data sizes - States: 561, Actions: 561, Logps: 561, Rewards: 561
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -14.5480 → -15.3953
+  Ratio: 1.096±0.019 → 1.114±0.015
+  Clipped: 27.0% → 28.6%
+  Entropy: 1.576 → 1.632
+  Gradient norm: 0.5847, Max param change: 0.001704
+
+  Cost: 1042.55±9.72, Return: 24.92
+Epoch 8: test_cost=1042.55, loss=-14.5480
+
+--- Epoch 9/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=974.75±349.22, select=90.8%
+  Training samples: 583 (from 5 episodes, avg 116.6 steps/episode)
+  Data sizes - States: 583, Actions: 583, Logps: 583, Rewards: 583
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -14.7900 → -15.6095
+  Ratio: 1.154±0.011 → 1.189±0.019
+  Clipped: 34.2% → 33.9%
+  Entropy: 1.663 → 1.679
+  Gradient norm: 0.6139, Max param change: 0.001877
+
+  Cost: 846.78±37.44, Return: 22.19
+Epoch 9: test_cost=846.78, loss=-14.7900
+
+--- Epoch 10/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=1005.43±214.91, select=89.9%
+  Training samples: 532 (from 5 episodes, avg 106.4 steps/episode)
+  Data sizes - States: 532, Actions: 532, Logps: 532, Rewards: 532
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -24.5336 → -27.8442
+  Ratio: 1.121±0.032 → 1.187±0.030
+  Clipped: 24.2% → 41.1%
+  Entropy: 1.724 → 1.698
+  Gradient norm: 0.5936, Max param change: 0.001990
+
+  Cost: 1153.65±440.83, Return: 21.24
+Epoch 10: test_cost=1153.65, loss=-24.5336
+
+--- Epoch 11/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=883.72±51.47, select=92.1%
+  Training samples: 576 (from 5 episodes, avg 115.2 steps/episode)
+  Data sizes - States: 576, Actions: 576, Logps: 576, Rewards: 576
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -10.6641 → -10.7559
+  Ratio: 1.098±0.023 → 1.111±0.017
+  Clipped: 26.1% → 27.7%
+  Entropy: 1.635 → 1.566
+  Gradient norm: 0.1592, Max param change: 0.002068
+
+  Cost: 1012.10±21.69, Return: 17.83
+Epoch 11: test_cost=1012.10, loss=-10.6641
+
+--- Epoch 12/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=877.21±83.69, select=91.9%
+  Training samples: 546 (from 5 episodes, avg 109.2 steps/episode)
+  Data sizes - States: 546, Actions: 546, Logps: 546, Rewards: 546
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -9.4149 → -11.1504
+  Ratio: 1.133±0.001 → 1.150±0.007
+  Clipped: 32.4% → 27.4%
+  Entropy: 1.545 → 1.657
+  Gradient norm: 0.1477, Max param change: 0.002199
+
+  Cost: 919.58±83.26, Return: 22.75
+Epoch 12: test_cost=919.58, loss=-9.4149
+
+--- Epoch 13/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=929.17±148.19, select=91.8%
+  Training samples: 579 (from 5 episodes, avg 115.8 steps/episode)
+  Data sizes - States: 579, Actions: 579, Logps: 579, Rewards: 579
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -11.3929 → -11.4412
+  Ratio: 1.158±0.055 → 1.120±0.005
+  Clipped: 30.7% → 30.2%
+  Entropy: 1.545 → 1.559
+  Gradient norm: 0.1687, Max param change: 0.002284
+
+  Cost: 921.38±42.73, Return: 21.28
+Epoch 13: test_cost=921.38, loss=-11.3929
+
+--- Epoch 14/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=903.79±80.76, select=92.7%
+  Training samples: 596 (from 5 episodes, avg 119.2 steps/episode)
+  Data sizes - States: 596, Actions: 596, Logps: 596, Rewards: 596
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -10.5755 → -10.7873
+  Ratio: 1.084±0.024 → 1.113±0.008
+  Clipped: 20.5% → 24.8%
+  Entropy: 1.540 → 1.544
+  Gradient norm: 0.1816, Max param change: 0.002283
+
+  Cost: 869.73±23.33, Return: 0.46
+Epoch 14: test_cost=869.73, loss=-10.5755
+
+--- Epoch 15/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=820.05±18.15, select=92.5%
+  Training samples: 697 (from 5 episodes, avg 139.4 steps/episode)
+  Data sizes - States: 697, Actions: 697, Logps: 697, Rewards: 697
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.3514 → -0.3524
+  Ratio: 1.090±0.011 → 1.090±0.005
+  Clipped: 19.8% → 21.0%
+  Entropy: 1.457 → 1.475
+  Gradient norm: 0.0040, Max param change: 0.001539
+
+  Cost: 1020.60±78.87, Return: 0.52
+Epoch 15: test_cost=1020.60, loss=-0.3514
+
+--- Epoch 16/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=1028.89±337.77, select=89.6%
+  Training samples: 549 (from 5 episodes, avg 109.8 steps/episode)
+  Data sizes - States: 549, Actions: 549, Logps: 549, Rewards: 549
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2774 → -0.2867
+  Ratio: 1.082±0.025 → 1.124±0.021
+  Clipped: 14.9% → 21.2%
+  Entropy: 1.552 → 1.545
+  Gradient norm: 0.0054, Max param change: 0.001154
+
+  Cost: 897.08±14.70, Return: 0.53
+Epoch 16: test_cost=897.08, loss=-0.2774
+
+--- Epoch 17/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=895.59±88.36, select=92.1%
+  Training samples: 507 (from 5 episodes, avg 101.4 steps/episode)
+  Data sizes - States: 507, Actions: 507, Logps: 507, Rewards: 507
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2714 → -0.2714
+  Ratio: 1.095±0.000 → 1.095±0.000
+  Clipped: 19.5% → 19.5%
+  Entropy: 1.530 → 1.529
+  Gradient norm: 0.0035, Max param change: 0.000816
+
+  Cost: 859.40±62.52, Return: 0.55
+Epoch 17: test_cost=859.40, loss=-0.2714
+
+--- Epoch 18/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=862.97±57.99, select=90.6%
+  Training samples: 505 (from 5 episodes, avg 101.0 steps/episode)
+  Data sizes - States: 505, Actions: 505, Logps: 505, Rewards: 505
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2766 → -0.2766
+  Ratio: 1.087±0.000 → 1.087±0.000
+  Clipped: 19.8% → 19.8%
+  Entropy: 1.542 → 1.542
+  Gradient norm: 0.0035, Max param change: 0.000904
+
+  Cost: 925.32±40.90, Return: 0.55
+Epoch 18: test_cost=925.32, loss=-0.2766
+
+--- Epoch 19/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=916.21±84.77, select=92.0%
+  Training samples: 584 (from 5 episodes, avg 116.8 steps/episode)
+  Data sizes - States: 584, Actions: 584, Logps: 584, Rewards: 584
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2976 → -0.3040
+  Ratio: 1.060±0.028 → 1.092±0.014
+  Clipped: 15.8% → 18.8%
+  Entropy: 1.596 → 1.486
+  Gradient norm: 0.0060, Max param change: 0.001284
+
+  Cost: 949.04±117.69, Return: 0.53
+Epoch 19: test_cost=949.04, loss=-0.2976
+
+--- Epoch 20/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=1015.13±121.62, select=92.4%
+  Training samples: 537 (from 5 episodes, avg 107.4 steps/episode)
+  Data sizes - States: 537, Actions: 537, Logps: 537, Rewards: 537
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2936 → -0.2677
+  Ratio: 1.083±0.012 → 1.065±0.008
+  Clipped: 22.8% → 15.2%
+  Entropy: 1.504 → 1.509
+  Gradient norm: 0.0039, Max param change: 0.001709
+
+  Cost: 865.38±39.55, Return: 0.52
+Epoch 20: test_cost=865.38, loss=-0.2936
+
+--- Epoch 21/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=927.10±36.64, select=92.4%
+  Training samples: 595 (from 5 episodes, avg 119.0 steps/episode)
+  Data sizes - States: 595, Actions: 595, Logps: 595, Rewards: 595
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.3014 → -0.2946
+  Ratio: 1.081±0.010 → 1.095±0.029
+  Clipped: 19.6% → 20.6%
+  Entropy: 1.457 → 1.538
+  Gradient norm: 0.0037, Max param change: 0.002739
+
+  Cost: 915.57±124.58, Return: 0.50
+Epoch 21: test_cost=915.57, loss=-0.3014
+
+--- Epoch 22/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=881.50±65.31, select=91.3%
+  Training samples: 581 (from 5 episodes, avg 116.2 steps/episode)
+  Data sizes - States: 581, Actions: 581, Logps: 581, Rewards: 581
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.3378 → -0.3157
+  Ratio: 1.073±0.009 → 1.073±0.008
+  Clipped: 17.4% → 16.8%
+  Entropy: 1.523 → 1.521
+  Gradient norm: 0.0046, Max param change: 0.002983
+
+  Cost: 861.46±124.67, Return: 0.56
+Epoch 22: test_cost=861.46, loss=-0.3378
+
+--- Epoch 23/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=910.20±73.18, select=90.8%
+  Training samples: 475 (from 5 episodes, avg 95.0 steps/episode)
+  Data sizes - States: 475, Actions: 475, Logps: 475, Rewards: 475
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2444 → -0.2444
+  Ratio: 1.087±0.000 → 1.088±0.000
+  Clipped: 21.1% → 21.1%
+  Entropy: 1.581 → 1.581
+  Gradient norm: 0.0052, Max param change: 0.001414
+
+  Cost: 928.95±74.50, Return: 0.52
+Epoch 23: test_cost=928.95, loss=-0.2444
+
+--- Epoch 24/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=870.81±82.25, select=92.3%
+  Training samples: 510 (from 5 episodes, avg 102.0 steps/episode)
+  Data sizes - States: 510, Actions: 510, Logps: 510, Rewards: 510
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2770 → -0.2770
+  Ratio: 1.058±0.000 → 1.058±0.000
+  Clipped: 15.9% → 15.9%
+  Entropy: 1.555 → 1.555
+  Gradient norm: 0.0031, Max param change: 0.001019
+
+  Cost: 891.69±127.51, Return: 0.54
+Epoch 24: test_cost=891.69, loss=-0.2770
+
+--- Epoch 25/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=899.46±64.57, select=91.5%
+  Training samples: 544 (from 5 episodes, avg 108.8 steps/episode)
+  Data sizes - States: 544, Actions: 544, Logps: 544, Rewards: 544
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -0.2688 → -0.3013
+  Ratio: 1.041±0.020 → 1.068±0.010
+  Clipped: 11.2% → 17.1%
+  Entropy: 1.552 → 1.577
+  Gradient norm: 0.0029, Max param change: 0.002318
+
+  Cost: 995.20±25.76, Return: 6.34
+Epoch 25: test_cost=995.20, loss=-0.2688
+
+--- Epoch 26/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=856.35±49.21, select=92.2%
+  Training samples: 556 (from 5 episodes, avg 111.2 steps/episode)
+  Data sizes - States: 556, Actions: 556, Logps: 556, Rewards: 556
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.2642 → -1.2462
+  Ratio: 1.054±0.004 → 1.038±0.017
+  Clipped: 12.3% → 11.3%
+  Entropy: 1.526 → 1.593
+  Gradient norm: 0.0252, Max param change: 0.002796
+
+  Cost: 922.66±131.58, Return: 5.64
+Epoch 26: test_cost=922.66, loss=-1.2642
+
+--- Epoch 27/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=975.90±231.17, select=89.8%
+  Training samples: 545 (from 5 episodes, avg 109.0 steps/episode)
+  Data sizes - States: 545, Actions: 545, Logps: 545, Rewards: 545
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -2.8231 → -3.0077
+  Ratio: 1.078±0.016 → 1.139±0.051
+  Clipped: 14.6% → 19.1%
+  Entropy: 1.636 → 1.458
+  Gradient norm: 0.0530, Max param change: 0.002456
+
+  Cost: 901.24±107.48, Return: 6.35
+Epoch 27: test_cost=901.24, loss=-2.8231
+
+--- Epoch 28/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=879.35±89.97, select=91.1%
+  Training samples: 552 (from 5 episodes, avg 110.4 steps/episode)
+  Data sizes - States: 552, Actions: 552, Logps: 552, Rewards: 552
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.3453 → -1.4388
+  Ratio: 1.063±0.000 → 1.079±0.018
+  Clipped: 15.9% → 18.2%
+  Entropy: 1.535 → 1.494
+  Gradient norm: 0.0174, Max param change: 0.002551
+
+  Cost: 967.40±121.29, Return: 6.08
+Epoch 28: test_cost=967.40, loss=-1.3453
+
+--- Epoch 29/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=883.55±70.30, select=91.5%
+  Training samples: 656 (from 5 episodes, avg 131.2 steps/episode)
+  Data sizes - States: 656, Actions: 656, Logps: 656, Rewards: 656
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.4500 → -1.4400
+  Ratio: 1.065±0.008 → 1.061±0.001
+  Clipped: 12.8% → 14.9%
+  Entropy: 1.474 → 1.477
+  Gradient norm: 0.0156, Max param change: 0.001998
+
+  Cost: 982.44±59.48, Return: 5.41
+Epoch 29: test_cost=982.44, loss=-1.4500
+
+--- Epoch 30/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=890.58±83.06, select=91.8%
+  Training samples: 613 (from 5 episodes, avg 122.6 steps/episode)
+  Data sizes - States: 613, Actions: 613, Logps: 613, Rewards: 613
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.8976 → -1.8810
+  Ratio: 1.050±0.010 → 1.067±0.013
+  Clipped: 11.4% → 13.5%
+  Entropy: 1.548 → 1.523
+  Gradient norm: 0.0255, Max param change: 0.002569
+
+  Cost: 962.80±207.59, Return: 13.97
+Epoch 30: test_cost=962.80, loss=-1.8976
+
+--- Epoch 31/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=937.09±115.35, select=91.6%
+  Training samples: 620 (from 5 episodes, avg 124.0 steps/episode)
+  Data sizes - States: 620, Actions: 620, Logps: 620, Rewards: 620
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.2035 → -1.1689
+  Ratio: 1.055±0.001 → 1.050±0.011
+  Clipped: 10.6% → 10.2%
+  Entropy: 1.510 → 1.479
+  Gradient norm: 0.0155, Max param change: 0.001780
+
+  Cost: 1185.59±304.13, Return: 15.75
+Epoch 31: test_cost=1185.59, loss=-1.2035
+
+--- Epoch 32/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=935.31±95.63, select=91.9%
+  Training samples: 490 (from 5 episodes, avg 98.0 steps/episode)
+  Data sizes - States: 490, Actions: 490, Logps: 490, Rewards: 490
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.1510 → -1.1515
+  Ratio: 1.046±0.000 → 1.047±0.000
+  Clipped: 12.2% → 12.2%
+  Entropy: 1.530 → 1.530
+  Gradient norm: 0.0173, Max param change: 0.001164
+
+  Cost: 941.17±91.98, Return: 6.02
+Epoch 32: test_cost=941.17, loss=-1.1510
+
+--- Epoch 33/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=820.91±17.42, select=91.5%
+  Training samples: 514 (from 5 episodes, avg 102.8 steps/episode)
+  Data sizes - States: 514, Actions: 514, Logps: 514, Rewards: 514
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.1326 → -2.4384
+  Ratio: 1.022±0.020 → 1.021±0.021
+  Clipped: 6.5% → 6.5%
+  Entropy: 1.226 → 1.649
+  Gradient norm: 0.0152, Max param change: 0.002485
+
+  Cost: 901.84±90.54, Return: 5.28
+Epoch 33: test_cost=901.84, loss=-1.1326
+
+--- Epoch 34/200 ---
+Collecting data (1 workers)...
+  Collected 5 episodes: cost=910.39±159.96, select=91.0%
+  Training samples: 495 (from 5 episodes, avg 99.0 steps/episode)
+  Data sizes - States: 495, Actions: 495, Logps: 495, Rewards: 495
+PPO updates (5 epochs, batch_size=512)...
+  Preparing training data...
+  PPO loss: -1.3232 → -1.3234
+  Ratio: 1.049±0.000 → 1.049±0.000
+  Clipped: 11.3% → 11.5%
+  Entropy: 1.554 → 1.553
+  Gradient norm: 0.0150, Max param change: 0.001241
+
