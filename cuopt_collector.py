@@ -7,18 +7,20 @@ import cudf
 import torch
 from cuopt import routing
 from cuopt.routing import CustomizeNodesCallback, RewardCallback
-from set_transformer_policy import NodeCandidateSelectionPolicy
+from transformer_policy import TransformerCandidatePolicy
 
 
 class CuOptCollector:
     """Synchronous trajectory collector for CuOpt"""
     
     def __init__(self, n_locations=100, n_vehicles=10, 
-                 time_limit=10.0, seed=42, policy=None, use_policy=False):
+                 time_limit=10.0, seed=42, policy=None, use_policy=False, 
+                 temperature=1.0, policy_device=None):
         self.n_locations = n_locations
         self.n_vehicles = n_vehicles
         self.time_limit = time_limit
         self.rng = np.random.default_rng(seed)
+        self.temperature = temperature  # Sampling temperature
         
         self.trajectory = {'states': [], 'actions': [], 'rewards': [], 'logps': []}
         self.problem_data = None
@@ -30,12 +32,25 @@ class CuOptCollector:
         self.use_policy = use_policy
         self.policy = policy
         if use_policy and policy is None:
-            self.policy = NodeCandidateSelectionPolicy(
-                node_feature_dim=3,
+            # Auto-detect device
+            if policy_device is None:
+                if torch.cuda.is_available():
+                    # If multiple GPUs visible, use GPU 1 for policy (GPU 0 for CuOpt)
+                    if torch.cuda.device_count() > 1:
+                        policy_device = 'cuda:1'
+                    else:
+                        policy_device = 'cuda'  # Single GPU, share with CuOpt
+                else:
+                    policy_device = 'cpu'
+            
+            print(f"Policy device: {policy_device} (total GPUs: {torch.cuda.device_count()})")
+            
+            self.policy = TransformerCandidatePolicy(
                 d_model=128,
-                num_heads=4,
-                num_graph_layers=2,
-                num_sab_layers=2
+                num_heads=8,
+                num_encoder_layers=3,
+                max_candidates=40,
+                device=policy_device
             )
     
     def reset(self):
@@ -86,44 +101,51 @@ class _CustomizeCallback(CustomizeNodesCallback):
         super().__init__()
         self.collector = collector
     
-    def customize_nodes_to_search(self, routes_2d, candidate_node_ids, 
+    def customize_nodes_to_search(self, solution_flat, candidate_mask, 
                                   solution_cost, num_routes):
-        # Record state
+        # Compute number of candidates
+        num_candidates = sum(candidate_mask)
+        assert num_candidates > 0, "No candidates"
+        
+        # Record state (without candidate_node_ids - redundant with candidate_mask)
         state = {
-            'routes_2d': routes_2d,
-            'candidate_node_ids': candidate_node_ids,
+            'solution_flat': solution_flat,
+            'candidate_mask': candidate_mask,
             'solution_cost': solution_cost,
             'num_routes': num_routes,
-            'num_candidates': len(candidate_node_ids),
+            'num_candidates': num_candidates,
         }
         self.collector.trajectory['states'].append(state)
-        # Use adaptive sampling (n<40→all, n<80→half, n≥80→40)
-        n = len(candidate_node_ids)
-        assert n > 0, "No candidates"
-        if n < 40:
-            sample_size = n
+        
+        # Use adaptive sampling
+        if num_candidates < 40:
+            sample_size = num_candidates
         else:
             sample_size = 40
         
-        # Generate action
+        # Generate action (returns selection_mask)
         if self.collector.use_policy:
-            # Use policy network
-            selected_indices, _logp = self.collector.policy.sample(
+            # Use policy network (respects policy.training state)
+            # Always sample, never greedy
+            selection_mask, _logp = self.collector.policy.sample(
                 state, 
                 self.collector.problem_data,
                 sample_size,
-                deterministic = False
+                temperature=self.collector.temperature
             )
-            action = selected_indices
             logp = _logp.item() if torch.is_tensor(_logp) else _logp
         else:
-            action = self.collector.rng.choice(n, sample_size, replace=False).tolist()
+            # Random sampling: extract candidates locally
+            candidate_nodes = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
+            selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
+            sampled = self.collector.rng.choice(candidate_nodes, sample_size, replace=False)
+            selection_mask[sampled] = 1
+            selection_mask = selection_mask.tolist()
             logp = 0.0
 
         self.collector.trajectory['logps'].append(logp)
-        self.collector.trajectory['actions'].append(action)
-        # print(f" {len(action)}/{len(candidate_node_ids)} action selected")
-        return action
+        self.collector.trajectory['actions'].append(selection_mask)
+        return selection_mask  # Return selection mask (fixed length)
 
 
 class _RewardCallback(RewardCallback):
@@ -147,6 +169,8 @@ if __name__ == "__main__":
     if use_policy:
         print("Using Policy Network")
         collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=10.0, seed=42, use_policy=True)
+        # Set policy to eval mode for inference
+        collector.policy.eval()
     else:
         print("Using Random Sampling")
         collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=10.0, seed=42, use_policy=False)

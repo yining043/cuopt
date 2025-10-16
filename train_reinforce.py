@@ -10,7 +10,7 @@ from multiprocessing import Pool
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from cuopt_collector import CuOptCollector
-from set_transformer_policy import NodeCandidateSelectionPolicy
+from transformer_policy import TransformerCandidatePolicy
 
 
 def plot_training_progress(test_costs, entropies, selection_rates, best_cost, save_path='training_progress.png'):
@@ -52,23 +52,33 @@ def plot_training_progress(test_costs, entropies, selection_rates, best_cost, sa
     plt.close()
 
 
-def load_trained_policy(checkpoint_path):
+def load_trained_policy(checkpoint_path, policy_device=None):
     """
     Load a trained policy from checkpoint
     
     Example:
         policy = load_trained_policy('checkpoints/best_policy.pt')
         # Use policy for inference
-        selected, logp = policy.sample(state, problem_data, deterministic=True)
+        selection_mask, logp = policy.sample(state, problem_data, deterministic=True)
     """
     checkpoint = torch.load(checkpoint_path, weights_only=False)
     
-    policy = NodeCandidateSelectionPolicy(
-        node_feature_dim=3,
+    # Auto-detect device
+    if policy_device is None:
+        if torch.cuda.is_available():
+            if torch.cuda.device_count() > 1:
+                policy_device = 'cuda:1'
+            else:
+                policy_device = 'cuda'
+        else:
+            policy_device = 'cpu'
+    
+    policy = TransformerCandidatePolicy(
         d_model=128,
-        num_heads=4,
-        num_graph_layers=2,
-        num_sab_layers=2
+        num_heads=8,
+        num_encoder_layers=3,
+        max_candidates=40,
+        device=policy_device
     )
     policy.load_state_dict(checkpoint['policy_state_dict'])
     policy.eval()
@@ -82,19 +92,24 @@ def load_trained_policy(checkpoint_path):
 
 def _collect_episode_worker(args):
     """Worker function for multiprocessing"""
-    policy_state_dict, use_policy, n_locations, n_vehicles, seed = args
+    policy_state_dict, use_policy, n_locations, n_vehicles, seed, temperature, training_mode, policy_device = args
     
     # Create policy in subprocess if needed
     if use_policy and policy_state_dict is not None:
-        policy = NodeCandidateSelectionPolicy(
-            node_feature_dim=3,
+        # Use same device as parent
+        policy = TransformerCandidatePolicy(
             d_model=128,
-            num_heads=4,
-            num_graph_layers=2,
-            num_sab_layers=2
+            num_heads=8,
+            num_encoder_layers=3,
+            max_candidates=40,
+            device=policy_device
         )
         policy.load_state_dict(policy_state_dict)
-        policy.eval()
+        # Set same mode as parent process
+        if training_mode:
+            policy.train()
+        else:
+            policy.eval()
     else:
         policy = None
     
@@ -104,11 +119,13 @@ def _collect_episode_worker(args):
         use_policy=use_policy,
         n_locations=n_locations,
         n_vehicles=n_vehicles,
-        seed=seed
+        seed=seed,
+        temperature=temperature,
+        policy_device=policy_device
     )
 
 
-def collect_episode(policy=None, use_policy=True, n_locations=50, n_vehicles=5, seed=None):
+def collect_episode(policy=None, use_policy=True, n_locations=50, n_vehicles=5, seed=None, temperature=1.0, policy_device=None):
     """Collect a single episode trajectory"""
     collector = CuOptCollector(
         n_locations=n_locations,
@@ -116,24 +133,34 @@ def collect_episode(policy=None, use_policy=True, n_locations=50, n_vehicles=5, 
         time_limit=5.0,
         seed=seed if seed is not None else np.random.randint(0, 10000),
         policy=policy,
-        use_policy=use_policy
+        use_policy=use_policy,
+        temperature=temperature,
+        policy_device=policy_device
     )
     
     dm, settings = collector.reset()
-    result = collector.run_solver(dm, settings)
+    collector.run_solver(dm, settings)
     
-    return result
+    # Return trajectory and problem data
+    return {
+        'trajectory': collector.trajectory,
+        'problem': collector.problem_data
+    }
 
 
-def collect_episodes_parallel(policy, use_policy, n_episodes, n_locations, n_vehicles, n_workers=4):
+def collect_episodes_parallel(policy, use_policy, n_episodes, n_locations, n_vehicles, n_workers=4, temperature=1.0):
     """Collect multiple episodes in parallel using multiprocessing"""
     # Get policy state dict for serialization
     policy_state_dict = policy.state_dict() if policy is not None else None
     
+    # Get current training mode and device
+    training_mode = policy.training if policy is not None else False
+    policy_device = str(policy.device) if policy is not None else 'cpu'
+    
     # Prepare arguments for each worker
     seeds = [np.random.randint(0, 100000) for _ in range(n_episodes)]
     args_list = [
-        (policy_state_dict, use_policy, n_locations, n_vehicles, seed)
+        (policy_state_dict, use_policy, n_locations, n_vehicles, seed, temperature, training_mode, policy_device)
         for seed in seeds
     ]
     
@@ -163,7 +190,7 @@ def compute_returns(rewards, gamma=0.99, reward_scale=0.01):
 
 
 
-def test_policy(policy, n_episodes=3, n_locations=50, n_vehicles=5, n_workers=3, reward_scale=0.01):
+def test_policy(policy, n_episodes=3, n_locations=50, n_vehicles=5, n_workers=3, reward_scale=0.01, temperature=1.0):
     """Test policy performance (parallel)"""
     policy.eval()
     
@@ -174,7 +201,8 @@ def test_policy(policy, n_episodes=3, n_locations=50, n_vehicles=5, n_workers=3,
         n_episodes=n_episodes,
         n_locations=n_locations,
         n_vehicles=n_vehicles,
-        n_workers=n_workers
+        n_workers=n_workers,
+        temperature=temperature  # Lower temperature during evaluation
     )
     
     costs = []
@@ -198,18 +226,20 @@ def test_policy(policy, n_episodes=3, n_locations=50, n_vehicles=5, n_workers=3,
 
 
 def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=5, n_workers=5, 
-                    reward_scale=0.01, grad_clip=1.0, ppo_epochs=4, clip_epsilon=0.2, batch_size=512):
+                    reward_scale=0.01, grad_clip=1.0, ppo_epochs=4, clip_epsilon=0.2, batch_size=512, temperature=1.0):
     """Train policy for one epoch using PPO (parallel collection)"""
     
     # Collect data
     print(f"Collecting data ({n_workers} workers)...")
+    policy.train()  # Set to training mode for data collection
     results = collect_episodes_parallel(
         policy=policy,
         use_policy=True,
         n_episodes=n_episodes,
         n_locations=n_locations,
         n_vehicles=n_vehicles,
-        n_workers=n_workers
+        n_workers=n_workers,
+        temperature=temperature  # Higher temperature during training for exploration
     )
     
     # Process collected data
@@ -239,9 +269,10 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
         
         # Compute selection rate
         for state, action in zip(traj['states'], traj['actions']):
-            n_candidates = len(state['candidate_node_ids'])
-            n_selected = len(action)
-            selection_rates.append(n_selected / n_candidates * 100)
+            n_candidates = sum(state['candidate_mask'])
+            n_selected = sum(action)  # action is now selection_mask
+            if n_candidates > 0:
+                selection_rates.append(n_selected / n_candidates * 100)
     
     # Print statistics
     avg_cost = np.mean(costs)
@@ -252,6 +283,11 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
     # Concatenate returns and old logps
     returns = torch.cat(all_returns)
     old_logps = torch.cat(all_old_logps)
+    
+    # Move to same device as policy
+    device = policy.device
+    returns = returns.to(device)
+    old_logps = old_logps.to(device)
     
     # Debug: Print data statistics
     n_samples = len(old_logps)
@@ -274,30 +310,20 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
     # Save initial parameters for comparison
     initial_params = {name: param.clone().detach() for name, param in policy.named_parameters()}
     
-    # Precompute caches (data processing that doesn't depend on network parameters)
-    print("  Precomputing caches...")
-    all_caches = []
-    for traj_data in all_trajectories:
-        states = traj_data['states']
-        problem = traj_data['problem']
-        
-        traj_caches = []
-        for state in states:
-            cache = policy.precompute_cache(state, problem)
-            traj_caches.append(cache)
-        all_caches.append(traj_caches)
-    
-    # Build flat data structure for efficient batching
+    # Build flat data structure for batching
+    print("  Preparing training data...")
     flat_data = []
     idx = 0
-    cache_idx = 0
     for traj_idx, traj_data in enumerate(all_trajectories):
+        states = traj_data['states']
         actions = traj_data['actions']
+        problem = traj_data['problem']
         
-        for step_idx, action in enumerate(actions):
+        for step_idx, (state, action) in enumerate(zip(states, actions)):
             flat_data.append({
-                'cache': all_caches[traj_idx][step_idx],
-                'action': action,
+                'state': state,
+                'problem': problem,
+                'action': action,  # selection_mask [total_nodes]
                 'advantage': advantages[idx],
                 'old_logp': old_logps[idx]
             })
@@ -323,26 +349,24 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
             batch_indices = indices[start_idx:end_idx]
             
             # Collect batch data
-            batch_caches = []
-            batch_actions = []
+            batch_states = []
+            batch_problems = []
+            batch_selection_masks = []
             batch_advantages = []
             batch_old_logps = []
             
             for idx in batch_indices:
                 sample = flat_data[idx]
-                
-                # Convert action to tensor
-                action_tensor = torch.zeros(len(sample['cache']['candidate_ids']), dtype=torch.long)
-                for action_idx in sample['action']:
-                    action_tensor[action_idx] = 1
-                
-                batch_caches.append(sample['cache'])
-                batch_actions.append(action_tensor)
+                batch_states.append(sample['state'])
+                batch_problems.append(sample['problem'])
+                batch_selection_masks.append(sample['action'])  # Already selection_mask
                 batch_advantages.append(sample['advantage'])
                 batch_old_logps.append(sample['old_logp'])
             
-            # Batch evaluate (major speedup!)
-            batch_new_logps, batch_entropies = policy.evaluate_batch(batch_caches, batch_actions)
+            # Batch evaluate using new API
+            batch_new_logps, batch_entropies = policy.evaluate(
+                batch_states, batch_problems, batch_selection_masks
+            )
             
             # Stack advantages and old_logps
             batch_advantages = torch.stack(batch_advantages)
@@ -425,6 +449,8 @@ def main():
     parser.add_argument('--test_only', action='store_true', help='Only test the loaded model, no training')
     parser.add_argument('--test_episodes', type=int, default=3, help='Number of episodes for test-only mode')
     parser.add_argument('--output_base', type=str, default='output', help='Base directory for outputs')
+    parser.add_argument('--train_temperature', type=float, default=1.0, help='Sampling temperature during training')
+    parser.add_argument('--test_temperature', type=float, default=1.0, help='Sampling temperature during testing')
     args = parser.parse_args()
     
     # Create or reuse output directory
@@ -455,12 +481,25 @@ def main():
     
     # Initialize policy
     print("Initializing policy...")
-    policy = NodeCandidateSelectionPolicy(
-        node_feature_dim=3,
+    
+    # Auto-detect device
+    if torch.cuda.is_available():
+        # If multiple GPUs visible, use GPU 1 for policy (GPU 0 for CuOpt workers)
+        if torch.cuda.device_count() > 1:
+            device = 'cuda:1'
+        else:
+            device = 'cuda'
+    else:
+        device = 'cpu'
+    
+    print(f"Using device: {device} (total GPUs: {torch.cuda.device_count()})")
+    
+    policy = TransformerCandidatePolicy(
         d_model=128,
-        num_heads=4,
-        num_graph_layers=2,
-        num_sab_layers=2
+        num_heads=8,
+        num_encoder_layers=3,
+        max_candidates=40,
+        device=device
     )
     optimizer = optim.Adam(policy.parameters(), lr=args.lr)
     
@@ -491,7 +530,8 @@ def main():
                 n_locations=args.n_locations,
                 n_vehicles=args.n_vehicles,
                 n_workers=args.test_workers,
-                reward_scale=args.reward_scale
+                reward_scale=args.reward_scale,
+                temperature=args.test_temperature
             )
             
             print("\n" + "=" * 60)
@@ -511,7 +551,8 @@ def main():
             n_locations=args.n_locations,
             n_vehicles=args.n_vehicles,
             n_workers=args.test_workers,
-            reward_scale=args.reward_scale
+            reward_scale=args.reward_scale,
+            temperature=args.test_temperature
         )
         print()
         best_cost = before_cost
@@ -545,7 +586,8 @@ def main():
             reward_scale=args.reward_scale,
             grad_clip=args.grad_clip,
             ppo_epochs=args.ppo_epochs,
-            clip_epsilon=args.clip_epsilon
+            clip_epsilon=args.clip_epsilon,
+            temperature=args.train_temperature
         )
         losses.append(loss)
         entropies.append(entropy)
@@ -558,7 +600,8 @@ def main():
             n_locations=args.n_locations,
             n_vehicles=args.n_vehicles,
             n_workers=args.test_workers,
-            reward_scale=args.reward_scale
+            reward_scale=args.reward_scale,
+            temperature=args.test_temperature
         )
         print(f"Epoch {epoch+1}: test_cost={test_cost:.2f}, loss={loss:.4f}")
         test_costs.append(test_cost)
@@ -604,7 +647,8 @@ def main():
         n_locations=args.n_locations,
         n_vehicles=args.n_vehicles,
         n_workers=args.test_workers,
-        reward_scale=args.reward_scale
+        reward_scale=args.reward_scale,
+        temperature=args.test_temperature
     )
     print()
     

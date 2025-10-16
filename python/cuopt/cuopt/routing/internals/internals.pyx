@@ -31,7 +31,7 @@ cdef extern from "cuopt/routing/utilities/callbacks_implems.hpp" namespace "cuop
         pass
     
     cdef cppclass default_customize_nodes_callback_t(Callback):
-        void customize_nodes_to_search(const vector[vector[int]]* routes_2d, const vector[int]* candidate_node_ids, float solution_cost, int num_routes, vector[int]* sampled_indices_out) except +
+        void customize_nodes_to_search(const vector[int]* solution_flat, const vector[int]* candidate_mask, float solution_cost, int num_routes, vector[int]* selection_mask_out) except +
         PyObject* pyCallbackClass
     
     cdef cppclass default_reward_callback_t(Callback):
@@ -56,12 +56,15 @@ cdef class CustomizeNodesCallback(PyCallback):
     >>> import random
     >>> 
     >>> class MyCustomCallback(CustomizeNodesCallback):
-    ...     def customize_nodes_to_search(self, routes_2d, candidate_node_ids, 
+    ...     def customize_nodes_to_search(self, solution_flat, candidate_mask, 
     ...                                   solution_cost, num_routes):
-    ...         # Adaptive sampling based on problem size
-    ...         num_candidates = len(candidate_node_ids)
-    ...         sample_size = min(40, num_candidates)
-    ...         return random.sample(range(num_candidates), sample_size)
+    ...         # Extract candidates and sample
+    ...         candidates = [i for i in range(len(candidate_mask)) if candidate_mask[i]]
+    ...         sampled = random.sample(candidates, min(40, len(candidates)))
+    ...         # Return selection mask
+    ...         selection = [0] * len(candidate_mask)
+    ...         for node_id in sampled: selection[node_id] = 1
+    ...         return selection
     """
     
     cdef default_customize_nodes_callback_t native_callback
@@ -72,18 +75,18 @@ cdef class CustomizeNodesCallback(PyCallback):
     def get_native_callback(self):
         return <uintptr_t>&(self.native_callback)
     
-    def _cpp_customize_nodes_to_search(self, unsigned long long routes_ptr, unsigned long long nodes_ptr,
+    def _cpp_customize_nodes_to_search(self, unsigned long long solution_ptr, unsigned long long mask_ptr, 
                                        float solution_cost, int num_routes):
-        cdef const vector[vector[int]]* routes_2d = <const vector[vector[int]]*>routes_ptr
-        cdef const vector[int]* candidate_node_ids = <const vector[int]*>nodes_ptr
+        cdef const vector[int]* solution_flat = <const vector[int]*>solution_ptr
+        cdef const vector[int]* candidate_mask = <const vector[int]*>mask_ptr
         
-        py_routes_2d = routes_2d[0]
-        py_candidate_node_ids = candidate_node_ids[0]
+        py_solution_flat = solution_flat[0]
+        py_candidate_mask = candidate_mask[0]
         
-        return self.customize_nodes_to_search(py_routes_2d, py_candidate_node_ids, 
+        return self.customize_nodes_to_search(py_solution_flat, py_candidate_mask, 
                                               solution_cost, num_routes)
     
-    def customize_nodes_to_search(self, routes_2d, candidate_node_ids, solution_cost, num_routes):
+    def customize_nodes_to_search(self, solution_flat, candidate_mask, solution_cost, num_routes):
         """
         Customize which nodes to sample for local search
         
@@ -92,10 +95,12 @@ cdef class CustomizeNodesCallback(PyCallback):
         
         Parameters
         ----------
-        routes_2d : list of list of int
-            Current routing solution (2D list where each inner list represents a route)
-        candidate_node_ids : list of int
-            Available candidate node IDs that can be sampled for local search
+        solution_flat : list of int
+            Current solution as flat array organized by route:
+            [route0_dummy0, route0_dummy1, ..., route0_node1, route0_node2, ..., route1_dummy0, ...]
+        candidate_mask : list of int
+            Binary mask indexed by node_id: candidate_mask[node_id]=1 means node_id is a candidate
+            Length = num_orders + num_routes * 4
         solution_cost : float
             Current solution objective cost
         num_routes : int
@@ -104,15 +109,18 @@ cdef class CustomizeNodesCallback(PyCallback):
         Returns
         -------
         list of int
-            Sampled indices into candidate_node_ids array (NOT actual node IDs).
-            Indices must be in range [0, N-1] where N is len(candidate_node_ids).
-            Example: to sample 1st and 3rd candidates, return [0, 2]
+            Selection mask indexed by node_id (same length as candidate_mask).
+            selection_mask[node_id]=1 means select node_id, 0 means not select.
+            Example: [0, 0, 0, 0, 0, 1, 0, ..., 1, 0] with len=num_orders+num_routes*4
         """
         import random
         
+        # Extract candidate node_ids from mask
+        candidate_node_ids = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
         num_candidates = len(candidate_node_ids)
+        
         if num_candidates == 0:
-            return []
+            return [0] * len(candidate_mask)
         
         if num_candidates < 40:
             sample_size = num_candidates
@@ -121,7 +129,15 @@ cdef class CustomizeNodesCallback(PyCallback):
         else:
             sample_size = 40
         
-        return random.sample(range(num_candidates), sample_size)
+        # Sample node IDs
+        sampled_node_ids = random.sample(candidate_node_ids, sample_size)
+        
+        # Convert to selection mask
+        selection_mask = [0] * len(candidate_mask)
+        for node_id in sampled_node_ids:
+            selection_mask[node_id] = 1
+        
+        return selection_mask
 
 
 cdef class RewardCallback(PyCallback):

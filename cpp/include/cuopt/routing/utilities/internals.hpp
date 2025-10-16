@@ -46,18 +46,18 @@ class customize_nodes_callback_t : public base_routing_callback_t {
 public:
     // Customize which nodes to sample based on current search state
     // 
-    // @param routes_2d              Current routing solution (2D vector, each inner vector is a route)
-    // @param candidate_node_ids     Available node IDs for potential sampling
+    // @param solution_flat          Current solution (flat array by route: [route0_dummies, route0_nodes, route1_dummies, ...])
+    // @param candidate_mask         Mask indexed by node_id (candidate_mask[node_id]=1 means node_id is candidate)
     // @param solution_cost          Current objective cost value
     // @param num_routes             Number of routes in current solution
-    // @param sampled_indices_out    OUTPUT - Sampled indices into candidate_node_ids array
-    //                               Note: Must return indices (0 to N-1), not actual node IDs
+    // @param selection_mask_out     OUTPUT - Selection mask indexed by node_id (selection_mask[node_id]=1 means select node_id)
+    //                               Same length as candidate_mask
     virtual void customize_nodes_to_search(
-        const std::vector<std::vector<int>>* routes_2d,
-        const std::vector<int>* candidate_node_ids,
+        const std::vector<int>* solution_flat,
+        const std::vector<int>* candidate_mask,
         float solution_cost,
         int num_routes,
-        std::vector<int>* sampled_indices_out
+        std::vector<int>* selection_mask_out
     ) = 0;
     
     callback_type_t get_type() const override {

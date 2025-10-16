@@ -28,29 +28,29 @@ namespace callbacks {
 class default_customize_nodes_callback_t : public customize_nodes_callback_t {
 public:
     void customize_nodes_to_search(
-        const std::vector<std::vector<int>>* routes_2d,
-        const std::vector<int>* candidate_node_ids,
+        const std::vector<int>* solution_flat,
+        const std::vector<int>* candidate_mask,
         float solution_cost,
         int num_routes,
-        std::vector<int>* sampled_indices_out
+        std::vector<int>* selection_mask_out
     ) override {
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_customize_nodes_to_search",
             "(KKfi)",
-            reinterpret_cast<unsigned long long>(routes_2d),
-            reinterpret_cast<unsigned long long>(candidate_node_ids),
+            reinterpret_cast<unsigned long long>(solution_flat),
+            reinterpret_cast<unsigned long long>(candidate_mask),
             solution_cost,
             num_routes
         );
         
         if (result && PyList_Check(result)) {
             Py_ssize_t size = PyList_Size(result);
-            sampled_indices_out->reserve(size);
+            selection_mask_out->reserve(size);
             for (Py_ssize_t i = 0; i < size; ++i) {
                 PyObject* item = PyList_GetItem(result, i);
                 if (PyLong_Check(item)) {
-                    sampled_indices_out->push_back(PyLong_AsLong(item));
+                    selection_mask_out->push_back(PyLong_AsLong(item));
                 }
             }
         }

@@ -21,17 +21,20 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
         self.call_count = 0
         self.observations = []
     
-    def customize_nodes_to_search(self, routes_2d, candidate_node_ids, solution_cost, num_routes):
+    def customize_nodes_to_search(self, solution_flat, candidate_mask, solution_cost, num_routes):
         """Customize sampling and record state"""
         self.call_count += 1
         
-        # Record observation
-        num_candidates = len(candidate_node_ids)
+        # Compute number of candidates
+        num_candidates = sum(candidate_mask)
+        
+        # Record observation (without candidate_node_ids - redundant)
         self.observations.append({
             'iteration': self.call_count,
             'cost': solution_cost,
             'num_routes': num_routes,
-            'routes': routes_2d,
+            'solution_flat': solution_flat,
+            'candidate_mask': candidate_mask,
             'num_candidates': num_candidates
         })
         
@@ -43,10 +46,17 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
         else:
             sample_size = 40
         
-        sampled_indices = random.sample(range(num_candidates), sample_size) if sample_size > 0 else []
-        print(f"  [Customize {self.call_count}] Sampled {sample_size}/{num_candidates} nodes (cost={solution_cost:.2f})")
+        # Extract candidates locally and create selection mask
+        candidate_nodes = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
+        selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
+        sampled = random.sample(candidate_nodes, min(sample_size, len(candidate_nodes)))
+        selection_mask[sampled] = 1
+        selection_mask = selection_mask.tolist()
         
-        return sampled_indices
+        print(f"  [Customize {self.call_count}] Sampled {sample_size}/{num_candidates} nodes (cost={solution_cost:.2f})")
+        print(f"    Solution flat length: {len(solution_flat)}, Candidate mask length: {len(candidate_mask)}, Active candidates: {sum(candidate_mask)}")
+        
+        return selection_mask  # Return selection mask (fixed length)
 
 
 class TestRewardCallback(RewardCallback):
@@ -112,6 +122,35 @@ def plot_route(ax, coords, route, color, depot_idx=0):
         route_coords = coords[route]
         ax.plot(route_coords[:, 0], route_coords[:, 1], 
                 color=color, linewidth=2, alpha=0.7, zorder=2)
+
+
+def solution_flat_to_routes_2d(solution_flat, num_routes, num_orders):
+    """Convert solution_flat to 2D routes for visualization"""
+    routes_2d = []
+    depot_node_id = 0  # Assuming depot_included = true
+    
+    idx = 0
+    for route_id in range(num_routes):
+        route = [depot_node_id]
+        
+        # Skip 4 dummy depot nodes
+        idx += 4
+        
+        # Collect real nodes until next route's dummy or end
+        while idx < len(solution_flat):
+            node_id = solution_flat[idx]
+            # Stop if we hit next dummy depot
+            if node_id >= num_orders:
+                break
+            route.append(node_id)
+            idx += 1
+        
+        # Add return depot
+        if len(route) > 1:
+            route.append(depot_node_id)
+            routes_2d.append(route)
+    
+    return routes_2d
 
 
 def plot_solution(routes_data, coords, title, ax, colors):
@@ -193,6 +232,8 @@ def test_callback():
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
     
+    # Note: callback uses policy.eval() mode by default, with sampling (not greedy)
+    
     # Solve
     print("\nSolving...")
     solution = routing.Solve(data_model, solver_settings)
@@ -212,6 +253,14 @@ def test_callback():
         plot_cost_curve(customize_callback.observations)
         
         best_obs = min(customize_callback.observations, key=lambda x: x['cost'])
+        
+        # Convert solution_flat to routes_2d for visualization
+        best_routes_2d = solution_flat_to_routes_2d(
+            best_obs['solution_flat'],
+            best_obs['num_routes'],
+            n_locations
+        )
+        
         final_routes = parse_solution_to_routes(solution.get_route())
         final_cost = solution.get_total_objective()
         
@@ -229,7 +278,13 @@ def test_callback():
         print(f"  Cost: {final_cost:.2f}")
         print(f"  Gap from best observed: {abs(final_cost - best_obs['cost']):.2f}")
         
-        compare_solutions(best_obs, final_routes, final_cost, problem_data['coordinates'])
+        # Use converted routes_2d for visualization
+        compare_solutions(
+            {'routes': best_routes_2d, 'cost': best_obs['cost'], 'iteration': best_obs['iteration']},
+            final_routes, 
+            final_cost, 
+            problem_data['coordinates']
+        )
 
 
 if __name__ == "__main__":

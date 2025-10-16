@@ -27,6 +27,7 @@
 #include <utilities/copy_helpers.hpp>
 
 #include <thrust/fill.h>
+#include <unordered_set>
 
 #include <chrono>
 #include <unordered_map>
@@ -223,64 +224,82 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
               sol.route_node_map.intra_route_idx_per_node.data(), 
               n_nodes, 
               sol.sol_handle->get_stream());
-    f_t objective = sol.get_cost(true, move_candidates.weights);
-    // Prepare nodes to search
+
+    // Prepare nodes to search and candidate_mask
     auto& h_nodes = nodes_to_search.h_nodes_to_search;
     if (h_nodes.empty()) { return false; }
-    std::vector<i_t> node_ids_to_search;
-    node_ids_to_search.reserve(h_nodes.size());
-    for (const auto& node_info : h_nodes) {
-      node_ids_to_search.push_back(node_info.node());
+    i_t num_orders = sol.get_num_orders();
+    i_t total_nodes = num_orders + sol.n_routes * 4;
+    std::vector<i_t> candidate_mask(total_nodes, 0);
+    std::unordered_map<i_t, size_t> node_id_to_h_idx;  // Map node_id to h_nodes index
+    node_id_to_h_idx.reserve(h_nodes.size());
+    for (size_t i = 0; i < h_nodes.size(); ++i) {
+      i_t node_id = h_nodes[i].node();
+      candidate_mask[node_id] = 1;
+      node_id_to_h_idx[node_id] = i;  // Store index in h_nodes
     }
-    // Build 2D routes representation
+
+    // Build solution_flat
+    f_t objective = sol.get_cost(true, move_candidates.weights);
+    std::vector<i_t> solution_flat;
+    solution_flat.reserve(total_nodes);
     sol.sol_handle->sync_stream();
-    i_t depot_node_id = sol.problem_ptr->order_info.depot_included_ ? 0 : sol.get_num_orders();
-    std::vector<std::vector<i_t>> routes_2d(sol.n_routes);
-    // Compute route sizes (single pass)
-    std::vector<i_t> route_node_counts(sol.n_routes, 0);
-    for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
-      i_t route_id = h_route_ids[node_id];
-      if (route_id != -1) {
-        route_node_counts[route_id]++;
-      }
-    }
-    // Pre-allocate all routes with depots
+    std::vector<std::vector<i_t>> routes_temp(sol.n_routes);
+    std::vector<i_t> max_used_idx(sol.n_routes, 0);
     for (i_t r = 0; r < sol.n_routes; ++r) {
-      if (route_node_counts[r] > 0) {
-        routes_2d[r].resize(route_node_counts[r] + 2);
-        routes_2d[r].front() = depot_node_id;
-        routes_2d[r].back() = depot_node_id;
-      }
+      routes_temp[r].resize(num_orders + 1, -1);  // +1 for potential intra_idx == num_orders
     }
-    // Fill nodes (no resize, direct indexing)
     for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
       i_t route_id = h_route_ids[node_id];
       i_t intra_idx = h_intra_idx[node_id];
       if (route_id != -1) {
-        routes_2d[route_id][intra_idx] = node_id;
+        routes_temp[route_id][intra_idx] = node_id;
+        max_used_idx[route_id] = std::max(max_used_idx[route_id], intra_idx);
       }
     }
-    
-    // Customize nodes to search: Get sampled indices from callback
-    std::vector<i_t> sampled_node_indices;
-    obs_callback->customize_nodes_to_search(
-        &routes_2d,
-        &node_ids_to_search,
-        objective,
-        sol.n_routes,
-        &sampled_node_indices
-    );
-    if (sampled_node_indices.empty()) { return false; }
-    
-    // Apply action: Copy selected nodes using sampled indices
-    nodes_to_search.h_sampled_nodes.clear();
-    nodes_to_search.h_sampled_nodes.reserve(sampled_node_indices.size());
-    for (i_t idx : sampled_node_indices) {
-      nodes_to_search.h_sampled_nodes.push_back(h_nodes[idx]);
+    for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
+      // Add 4 dummy depot nodes
+      for (i_t batch = 0; batch < 4; ++batch) {
+        i_t dummy_id = num_orders + route_id * 4 + batch;
+        solution_flat.push_back(dummy_id);
+      }
+      // Add real nodes (only iterate to actual max, skip position 0 depot)
+      for (i_t i = 1; i <= max_used_idx[route_id]; ++i) {
+        i_t node_id = routes_temp[route_id][i];
+        if (node_id != -1) {
+          solution_flat.push_back(node_id);
+        }
+      }
     }
 
+    // Callback: Get selection_mask from callback
+    std::vector<i_t> selection_mask;
+    obs_callback->customize_nodes_to_search(
+        &solution_flat,
+        &candidate_mask,
+        objective,
+        sol.n_routes,
+        &selection_mask
+    );
+    if (selection_mask.empty() || selection_mask.size() != (size_t)total_nodes) { return false; }
+    
+    // Extract selected nodes from mask and build sampled lists (single pass)
+    std::vector<i_t> sampled_indices;
+    nodes_to_search.h_sampled_nodes.clear();
+    for (i_t node_id = 0; node_id < total_nodes; ++node_id) {
+      if (selection_mask[node_id] == 1) {
+        auto it = node_id_to_h_idx.find(node_id);
+        if (it != node_id_to_h_idx.end()) {
+          size_t h_idx = it->second;
+          sampled_indices.push_back(h_idx);
+          nodes_to_search.h_sampled_nodes.push_back(h_nodes[h_idx]);
+        }
+      }
+    }
+    if (sampled_indices.empty()) { return false; }
+
     // Transfer sampled nodes to GPU
-    nodes_to_search.n_sampled_nodes = sampled_node_indices.size();
+    nodes_to_search.n_sampled_nodes = sampled_indices.size();
     nodes_to_search.sample_nodes_graph.start_capture(sol.sol_handle->get_stream());
     raft::copy(nodes_to_search.sampled_nodes_to_search.data(),
                 nodes_to_search.h_sampled_nodes.data(),
@@ -290,11 +309,9 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     nodes_to_search.sample_nodes_graph.end_capture(sol.sol_handle->get_stream());
     nodes_to_search.sample_nodes_graph.launch_graph(sol.sol_handle->get_stream());
 
-    // Remove sampled nodes using swap-and-pop (O(m log m))
-    // Sort indices in descending order to avoid invalidation
-    std::sort(sampled_node_indices.begin(), sampled_node_indices.end(), std::greater<i_t>());
-    for (i_t idx : sampled_node_indices) {
-      // Swap with last element and pop (preserves other indices)
+    // Remove sampled nodes using swap-and-pop (O(k log k))
+    std::sort(sampled_indices.begin(), sampled_indices.end(), std::greater<i_t>());
+    for (i_t idx : sampled_indices) {
       if (idx < (i_t)h_nodes.size() - 1) {
         h_nodes[idx] = std::move(h_nodes.back());
       }
