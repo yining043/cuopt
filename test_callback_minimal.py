@@ -21,7 +21,7 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
         self.call_count = 0
         self.observations = []
     
-    def customize_nodes_to_search(self, solution_flat, candidate_mask, solution_cost, num_routes):
+    def customize_nodes_to_search(self, solution_flat, num_routes, solution_cost, candidate_mask):
         """Customize sampling and record state"""
         self.call_count += 1
         
@@ -56,6 +56,11 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
         print(f"  [Customize {self.call_count}] Sampled {sample_size}/{num_candidates} nodes (cost={solution_cost:.2f})")
         print(f"    Solution flat length: {len(solution_flat)}, Candidate mask length: {len(candidate_mask)}, Active candidates: {sum(candidate_mask)}")
         
+        route_2d = solution_flat_to_routes_2d(solution_flat, num_routes, 20)
+        for route in route_2d:
+            print(f"  route: {route}")
+        print(f"  solution_flat: {solution_flat}")
+
         return selection_mask  # Return selection mask (fixed length)
 
 
@@ -215,7 +220,7 @@ def test_callback():
     print("=" * 60)
     
     # Setup problem
-    n_locations, n_vehicles = 1000, 100
+    n_locations, n_vehicles = 20, 3
     problem_data = generate_random_vrp(n_locations, n_vehicles)
     
     data_model = routing.DataModel(n_locations, n_vehicles)
@@ -228,7 +233,7 @@ def test_callback():
     reward_callback = TestRewardCallback()
     
     solver_settings = routing.SolverSettings()
-    solver_settings.set_time_limit(5)
+    solver_settings.set_time_limit(10)
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
     

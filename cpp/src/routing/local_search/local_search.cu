@@ -210,10 +210,12 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       }
     }
   }
-  bool needs_customization = nodes_to_search.h_nodes_to_search.size() > 0;
+  auto& h_nodes = nodes_to_search.h_nodes_to_search;
+  bool needs_customization = h_nodes.size() > 0;
   if (!full_set && needs_customization && obs_callback) {
     // Prepare current solution for observation
-    size_t n_nodes = sol.route_node_map.route_id_per_node.size();
+    size_t n_nodes = sol.get_num_orders();
+    i_t total_nodes = n_nodes + sol.n_routes * 4;
     std::vector<i_t> h_route_ids(n_nodes);
     std::vector<i_t> h_intra_idx(n_nodes);
     raft::copy(h_route_ids.data(), 
@@ -226,10 +228,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
               sol.sol_handle->get_stream());
 
     // Prepare nodes to search and candidate_mask
-    auto& h_nodes = nodes_to_search.h_nodes_to_search;
-    if (h_nodes.empty()) { return false; }
-    i_t num_orders = sol.get_num_orders();
-    i_t total_nodes = num_orders + sol.n_routes * 4;
     std::vector<i_t> candidate_mask(total_nodes, 0);
     std::unordered_map<i_t, size_t> node_id_to_h_idx;  // Map node_id to h_nodes index
     node_id_to_h_idx.reserve(h_nodes.size());
@@ -243,28 +241,29 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     f_t objective = sol.get_cost(true, move_candidates.weights);
     std::vector<i_t> solution_flat;
     solution_flat.reserve(total_nodes);
-    sol.sol_handle->sync_stream();
     std::vector<std::vector<i_t>> routes_temp(sol.n_routes);
-    std::vector<i_t> max_used_idx(sol.n_routes, 0);
+    std::vector<i_t> max_route_length(sol.n_routes, 0);
     for (i_t r = 0; r < sol.n_routes; ++r) {
-      routes_temp[r].resize(num_orders + 1, -1);  // +1 for potential intra_idx == num_orders
+      routes_temp[r].resize(n_nodes, -1);
     }
+    // start building solution_flat
+    sol.sol_handle->sync_stream();
     for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
       i_t route_id = h_route_ids[node_id];
       i_t intra_idx = h_intra_idx[node_id];
       if (route_id != -1) {
         routes_temp[route_id][intra_idx] = node_id;
-        max_used_idx[route_id] = std::max(max_used_idx[route_id], intra_idx);
+        max_route_length[route_id] = std::max(max_route_length[route_id], intra_idx);
       }
     }
     for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
       // Add 4 dummy depot nodes
       for (i_t batch = 0; batch < 4; ++batch) {
-        i_t dummy_id = num_orders + route_id * 4 + batch;
+        i_t dummy_id = n_nodes + route_id * 4 + batch;
         solution_flat.push_back(dummy_id);
       }
       // Add real nodes (only iterate to actual max, skip position 0 depot)
-      for (i_t i = 1; i <= max_used_idx[route_id]; ++i) {
+      for (i_t i = 1; i <= max_route_length[route_id]; ++i) {
         i_t node_id = routes_temp[route_id][i];
         if (node_id != -1) {
           solution_flat.push_back(node_id);
@@ -276,24 +275,21 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     std::vector<i_t> selection_mask;
     obs_callback->customize_nodes_to_search(
         &solution_flat,
-        &candidate_mask,
-        objective,
         sol.n_routes,
+        objective,
+        &candidate_mask,
         &selection_mask
     );
-    if (selection_mask.empty() || selection_mask.size() != (size_t)total_nodes) { return false; }
-    
+    if (selection_mask.size() != (size_t)total_nodes) { exit(1); }
     // Extract selected nodes from mask and build sampled lists (single pass)
     std::vector<i_t> sampled_indices;
     nodes_to_search.h_sampled_nodes.clear();
     for (i_t node_id = 0; node_id < total_nodes; ++node_id) {
       if (selection_mask[node_id] == 1) {
         auto it = node_id_to_h_idx.find(node_id);
-        if (it != node_id_to_h_idx.end()) {
-          size_t h_idx = it->second;
-          sampled_indices.push_back(h_idx);
-          nodes_to_search.h_sampled_nodes.push_back(h_nodes[h_idx]);
-        }
+        size_t h_idx = it->second;
+        sampled_indices.push_back(h_idx);
+        nodes_to_search.h_sampled_nodes.push_back(h_nodes[h_idx]);
       }
     }
     if (sampled_indices.empty()) { return false; }

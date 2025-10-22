@@ -75,18 +75,18 @@ cdef class CustomizeNodesCallback(PyCallback):
     def get_native_callback(self):
         return <uintptr_t>&(self.native_callback)
     
-    def _cpp_customize_nodes_to_search(self, unsigned long long solution_ptr, unsigned long long mask_ptr, 
-                                       float solution_cost, int num_routes):
+    def _cpp_customize_nodes_to_search(self, unsigned long long solution_ptr, int num_routes,
+                                       float solution_cost, unsigned long long mask_ptr):
         cdef const vector[int]* solution_flat = <const vector[int]*>solution_ptr
         cdef const vector[int]* candidate_mask = <const vector[int]*>mask_ptr
         
         py_solution_flat = solution_flat[0]
         py_candidate_mask = candidate_mask[0]
         
-        return self.customize_nodes_to_search(py_solution_flat, py_candidate_mask, 
-                                              solution_cost, num_routes)
+        return self.customize_nodes_to_search(py_solution_flat, num_routes,
+                                              solution_cost, py_candidate_mask)
     
-    def customize_nodes_to_search(self, solution_flat, candidate_mask, solution_cost, num_routes):
+    def customize_nodes_to_search(self, solution_flat, num_routes, solution_cost, candidate_mask):
         """
         Customize which nodes to sample for local search
         
@@ -98,13 +98,13 @@ cdef class CustomizeNodesCallback(PyCallback):
         solution_flat : list of int
             Current solution as flat array organized by route:
             [route0_dummy0, route0_dummy1, ..., route0_node1, route0_node2, ..., route1_dummy0, ...]
+        num_routes : int
+            Total number of routes in current solution
+        solution_cost : float
+            Current solution objective cost
         candidate_mask : list of int
             Binary mask indexed by node_id: candidate_mask[node_id]=1 means node_id is a candidate
             Length = num_orders + num_routes * 4
-        solution_cost : float
-            Current solution objective cost
-        num_routes : int
-            Total number of routes in current solution
             
         Returns
         -------

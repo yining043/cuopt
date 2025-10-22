@@ -101,8 +101,8 @@ class _CustomizeCallback(CustomizeNodesCallback):
         super().__init__()
         self.collector = collector
     
-    def customize_nodes_to_search(self, solution_flat, candidate_mask, 
-                                  solution_cost, num_routes):
+    def customize_nodes_to_search(self, solution_flat, num_routes, 
+                                  solution_cost, candidate_mask):
         # Compute number of candidates
         num_candidates = sum(candidate_mask)
         assert num_candidates > 0, "No candidates"

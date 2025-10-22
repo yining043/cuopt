@@ -29,19 +29,19 @@ class default_customize_nodes_callback_t : public customize_nodes_callback_t {
 public:
     void customize_nodes_to_search(
         const std::vector<int>* solution_flat,
-        const std::vector<int>* candidate_mask,
-        float solution_cost,
         int num_routes,
+        float solution_cost,
+        const std::vector<int>* candidate_mask,
         std::vector<int>* selection_mask_out
     ) override {
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_customize_nodes_to_search",
-            "(KKfi)",
+            "(KifK)",
             reinterpret_cast<unsigned long long>(solution_flat),
-            reinterpret_cast<unsigned long long>(candidate_mask),
+            num_routes,
             solution_cost,
-            num_routes
+            reinterpret_cast<unsigned long long>(candidate_mask)
         );
         
         if (result && PyList_Check(result)) {
