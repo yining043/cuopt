@@ -22,6 +22,7 @@ build
 dist
 html
 *.egg-info
+result*
 
 # Ignore _skbuild directory
 _skbuild/

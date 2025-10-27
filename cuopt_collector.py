@@ -5,6 +5,7 @@ Synchronously collects (state, action, reward) trajectories using fixed sampling
 import numpy as np
 import cudf
 import torch
+import time
 from cuopt import routing
 from cuopt.routing import CustomizeNodesCallback, RewardCallback
 from transformer_policy import TransformerCandidatePolicy
@@ -27,6 +28,10 @@ class CuOptCollector:
         self.solution = None
         self.customize_cb = None
         self.reward_cb = None
+        
+        # Performance tracking
+        self.policy_sample_time = 0.0
+        self.policy_call_count = 0
         
         # Policy network
         self.use_policy = use_policy
@@ -57,6 +62,10 @@ class CuOptCollector:
         """Generate new problem and prepare solver"""
         self.problem_data = self._generate_problem()
         self.trajectory = {'states': [], 'actions': [], 'rewards': [], 'logps': []}
+        
+        # Reset performance tracking
+        self.policy_sample_time = 0.0
+        self.policy_call_count = 0
         
         dm = routing.DataModel(self.problem_data['n_locations'], 
                                self.problem_data['n_vehicles'])
@@ -105,9 +114,8 @@ class _CustomizeCallback(CustomizeNodesCallback):
                                   solution_cost, candidate_mask):
         # Compute number of candidates
         num_candidates = sum(candidate_mask)
-        assert num_candidates > 0, "No candidates"
         
-        # Record state (without candidate_node_ids - redundant with candidate_mask)
+        # Record state
         state = {
             'solution_flat': solution_flat,
             'candidate_mask': candidate_mask,
@@ -120,32 +128,37 @@ class _CustomizeCallback(CustomizeNodesCallback):
         # Use adaptive sampling
         if num_candidates < 40:
             sample_size = num_candidates
+        elif num_candidates < 80:
+            sample_size = num_candidates // 2
         else:
             sample_size = 40
         
-        # Generate action (returns selection_mask)
+        # Generate action
         if self.collector.use_policy:
-            # Use policy network (respects policy.training state)
-            # Always sample, never greedy
-            selection_mask, _logp = self.collector.policy.sample(
+            # Time policy sample only
+            policy_start = time.perf_counter()
+            selection_mask, logp = self.collector.policy.sample(
                 state, 
                 self.collector.problem_data,
                 sample_size,
                 temperature=self.collector.temperature
             )
-            logp = _logp.item() if torch.is_tensor(_logp) else _logp
+            policy_end = time.perf_counter()
+            self.collector.policy_sample_time += (policy_end - policy_start)
+            self.collector.policy_call_count += 1
         else:
-            # Random sampling: extract candidates locally
+            # Random sampling
             candidate_nodes = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
             selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
             sampled = self.collector.rng.choice(candidate_nodes, sample_size, replace=False)
             selection_mask[sampled] = 1
             selection_mask = selection_mask.tolist()
             logp = 0.0
-
+        
         self.collector.trajectory['logps'].append(logp)
         self.collector.trajectory['actions'].append(selection_mask)
-        return selection_mask  # Return selection mask (fixed length)
+        
+        return selection_mask
 
 
 class _RewardCallback(RewardCallback):
@@ -191,7 +204,7 @@ if __name__ == "__main__":
         print("Using Random Sampling")
         collector = CuOptCollector(n_locations=50, n_vehicles=5, time_limit=10.0, seed=42, use_policy=False)
 
-    for i in range(3):
+    for i in range(1):
         dm, settings = collector.reset()
         collector.run_solver(dm, settings)  
         
@@ -214,6 +227,12 @@ if __name__ == "__main__":
             print(f"Number of rewards: {len(rewards)}")
             print(f"Number of actions: {len(actions)}")
             if use_policy: print(f"Number of logps: {len(logps)}")
+            
+            # Performance statistics
+            if use_policy and collector.policy_call_count > 0:
+                avg_policy_time = collector.policy_sample_time / collector.policy_call_count * 1000
+                print(f"Avg policy sample time: {avg_policy_time:.2f}ms")
+            
             print(f"--------------------------------\n")
         else:
             print("No steps recorded (callback not triggered)")
