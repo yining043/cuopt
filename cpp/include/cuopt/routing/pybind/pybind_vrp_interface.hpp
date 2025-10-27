@@ -67,6 +67,9 @@ public:
     
     // Sliding search method - sliding window optimization
     bool run_sliding_search();
+    
+    // Cycle finder method - large neighborhood search with negative cycle detection
+    bool run_cycle_finder();
 
     // Resource management methods - following cuOpt's pattern
     void acquire_resource();
@@ -115,6 +118,7 @@ public:
     bool perform_vrp_search_impl();
     bool run_two_opt_search_impl();
     bool run_sliding_search_impl();
+    bool run_cycle_finder_impl();
     void setup_solution_impl(const std::vector<std::vector<int>>& routes, 
                             const std::vector<int>& vehicle_ids);
     void validate_routes(const std::vector<std::vector<int>>& routes, const std::string& context);
