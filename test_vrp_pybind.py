@@ -137,114 +137,85 @@ def main(num_locations=20, num_vehicles=5, num_orders=15, vehicle_capacity=100):
     solutions = []
     costs = []
     
-    def perform_search_round(round_name):
-        """Perform a round of local search"""
-        print(f"\n🔍 {round_name}...")
-        cuopt_env.acquire_resource()
-        cuopt_env.reset_move_candidates()
-        cuopt_env.set_routes_to_search()
-        cuopt_env.extract_nodes_to_search()
-        
-        # Store initial state
-        solutions.append(cuopt_env.get_solution_routes().copy())
-        costs.append(cuopt_env.get_cost())
-        
-        # Perform search iterations
-        move_found = True
-        i = 0
-        while move_found:
-            i += 1
-            print(f"      Before sample_nodes_to_search: {len(cuopt_env.get_move_candidates())} move candidates")
-            sampled_nodes = cuopt_env.sample_nodes_to_search()
-            cuopt_env.sync_streams()
-            print(f"      After sample_nodes_to_search: {len(cuopt_env.get_move_candidates())} move candidates")
+    # Perform local search
+    print(f"\n🔍 Starting Local Search...")
+    cuopt_env.acquire_resource()
+    cuopt_env.reset_move_candidates()
+    cuopt_env.set_routes_to_search()
+    cuopt_env.extract_nodes_to_search()
+    
+    # Store initial state
+    solutions.append(cuopt_env.get_solution_routes().copy())
+    costs.append(cuopt_env.get_cost())
+    
+    # Perform search iterations
+    iteration = 0
+    while True:
+        iteration += 1
+        sampled = cuopt_env.sample_nodes_to_search()
+        if not sampled:
+            break
             
-            # Test move candidates get/set functionality
-            print(f"    Testing move candidates get/set for iteration {i+1}:")
-            
-            # Test set/get functionality without detailed printing
-            # if len(move_candidates) > 0:
-            #     # Test setting modified candidates (filter out some if we have many)
-            #     if len(move_candidates) > 5:
-            #         # Keep only first 5 candidates as a test
-            #         modified_candidates = move_candidates[:5]
-            #         cuopt_env.set_move_candidates(modified_candidates)
-            #         cuopt_env.sync_streams()
-            #         print(f"      ✓ Set {len(modified_candidates)} modified candidates")
-            #     else:
-            #         # If we have few candidates, just set them back as-is
-            #         cuopt_env.set_move_candidates(move_candidates)
-            #         print(f"      ✓ Set back all {len(move_candidates)} candidates unchanged")
-            # else:
-            #     print(f"      No candidates available for testing")
-            
-            # Compare with sampled nodes (the actual data used by perform_vrp_search)
-            sampled_nodes = cuopt_env.get_sampled_nodes()
-            print(f"      Sampled nodes: {len(sampled_nodes)} candidates")
-            
-            move_found = cuopt_env.perform_vrp_search()
-            cuopt_env.restore_found_nodes()
-            print(f"      After restore_found_nodes: Restored {len(cuopt_env.get_move_candidates())} move candidates")
-            cuopt_env.sync_streams()
-            
-            current_cost = cuopt_env.get_cost()
-            current_routes = cuopt_env.get_solution_routes()
-            
-            # Check node coverage
-            current_nodes = set()
-            for route in current_routes:
-                current_nodes.update(route)
-            current_nodes.discard(0)
-            missing_nodes = set(range(1, num_orders + 1)) - current_nodes
-            
-            if move_found:
-                print(f"  Iteration {i+1}: ✓ Cost = {current_cost:.2f}")
-                if missing_nodes:
-                    print(f"    ⚠️  Missing nodes: {sorted(missing_nodes)}")
-            else:
-                print(f"  Iteration {i+1}: ✗ No improvement, Cost = {current_cost:.2f}")
-                if missing_nodes:
-                    print(f"    ⚠️  Missing nodes: {sorted(missing_nodes)}")
-            
-            if move_found:
-                solutions.append(current_routes.copy())
-                costs.append(current_cost)
-            else:
-                break
-
-        cuopt_env.release_resource()
         cuopt_env.sync_streams()
+        
+        # Perform both VRP and Two-Opt searches
+        vrp_found = cuopt_env.perform_vrp_search()
+        two_opt_found = cuopt_env.run_two_opt_search()
+        move_found = vrp_found or two_opt_found
+        
+        cuopt_env.restore_found_nodes()
+        cuopt_env.sync_streams()
+        
+        current_cost = cuopt_env.get_cost()
+        current_routes = cuopt_env.get_solution_routes()
+        
+        # Check node coverage
+        current_nodes = set()
+        for route in current_routes:
+            current_nodes.update(route)
+        current_nodes.discard(0)
+        missing_nodes = set(range(1, num_orders + 1)) - current_nodes
+        
+        if move_found:
+            improvements = []
+            if vrp_found:
+                improvements.append("VRP")
+            if two_opt_found:
+                improvements.append("2-Opt")
+            print(f"  Iteration {iteration}: ✓ Cost = {current_cost:.2f} ({'+'.join(improvements)})")
+            if missing_nodes:
+                print(f"      ⚠️  Missing nodes: {sorted(missing_nodes)}")
+            solutions.append(current_routes.copy())
+            costs.append(current_cost)
+        else:
+            print(f"  Iteration {iteration}: ✗ No improvement, Cost = {current_cost:.2f}")
+            if missing_nodes:
+                print(f"      ⚠️  Missing nodes: {sorted(missing_nodes)}")
+            break
+
+    cuopt_env.release_resource()
+    cuopt_env.sync_streams()
     
-        return current_cost, current_routes
-    
-    # Two rounds of search
-    final_cost_1, final_routes_1 = perform_search_round("First Round")
-    first_round_end = len(solutions)
-    
-    print(f"\n🔄 Resetting solution...")
-    reset_routes = final_routes_1 #create_random_initial_solution(vrp_instance)
-    cuopt_env.setup_solution(reset_routes)
-    reset_cost = cuopt_env.get_cost()
-    
-    final_cost_2, _ = perform_search_round("Second Round")
+    final_cost = current_cost
     
     # Create visualization
     print(f"\n📊 Creating visualization...")
-    create_local_search_visualization(solutions, costs, node_coords, reset_point=first_round_end)
+    create_local_search_visualization(solutions, costs, node_coords)
     
     print(f"\n✓ Search completed")
-    print(f"  Initial: {initial_cost:.2f} → First: {final_cost_1:.2f} → Reset: {reset_cost:.2f} → Final: {final_cost_2:.2f}")
+    print(f"  Initial: {initial_cost:.2f} → Final: {final_cost:.2f}")
+    print(f"  Improvement: {initial_cost - final_cost:.2f} ({((initial_cost - final_cost)/initial_cost*100):.1f}%)")
     
     return cuopt_env
 
-def create_local_search_visualization(solutions, costs, node_coords, reset_point=None):
+def create_local_search_visualization(solutions, costs, node_coords):
     """Create simplified visualization of the local search process"""
     import matplotlib.pyplot as plt
     import numpy as np
     
     # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle('VRP Local Search Results', fontsize=14, fontweight='bold')
+    fig.suptitle('VRP Local Search Results (VRP + Two-Opt)', fontsize=14, fontweight='bold')
     
     # Cost evolution
     ax1[0].plot(range(len(costs)), costs, 'bo-', linewidth=2, markersize=6)
@@ -253,29 +224,10 @@ def create_local_search_visualization(solutions, costs, node_coords, reset_point
     ax1[0].set_title('Cost Evolution')
     ax1[0].grid(True, alpha=0.3)
     
-    # Find reset point more accurately
-    if reset_point is None:
-        # Look for significant cost increases as potential reset points
-        for i in range(1, len(costs)):
-            # Look for cost increases > 10% as potential reset points
-            if costs[i] > costs[i-1] * 1.1:
-                reset_point = i
-                break
-        
-        # If no clear reset point found, use the middle point
-        if reset_point is None:
-            reset_point = len(costs) // 2
-    
+    # Mark best solution
     best_point = costs.index(min(costs))
-    
-    # Add vertical lines and labels
-    ax1[0].axvline(x=reset_point, color='red', linestyle='--', alpha=0.7, label='Second Round Start')
     ax1[0].axvline(x=best_point, color='green', linestyle='--', alpha=0.7, label='Best solution')
     ax1[0].legend()
-    
-    # Add text annotations
-    ax1[0].text(reset_point, max(costs), 'Round 2', rotation=90, va='top', ha='right', color='red', fontweight='bold')
-    ax1[0].text(0, max(costs), 'Round 1', va='top', ha='left', color='blue', fontweight='bold')
     
     # Node coordinates
     x_pos = node_coords[:, 0]
@@ -304,10 +256,7 @@ def create_local_search_visualization(solutions, costs, node_coords, reset_point
     
     # Plot key iterations
     plot_routes(ax1[1], 0, 'Initial Solution')
-    if reset_point > 1:
-        plot_routes(ax2[0], reset_point-1, 'First Round End')
-    else:
-        plot_routes(ax2[0], 0, 'First Round End')
+    plot_routes(ax2[0], best_point, 'Best Solution')
     plot_routes(ax2[1], len(costs)-1, 'Final Solution')
     
     plt.tight_layout()
@@ -316,19 +265,7 @@ def create_local_search_visualization(solutions, costs, node_coords, reset_point
     
     print(f"  📊 Visualization saved as 'local_search_process.png'")
     print(f"  📈 Total improvement: {costs[0] - costs[-1]:.1f} ({((costs[0] - costs[-1])/costs[0]*100):.1f}%)")
-    
-    # Print round statistics
-    if reset_point < len(costs):
-        first_round_costs = costs[:reset_point]
-        second_round_costs = costs[reset_point:]
-        
-        if first_round_costs:
-            first_improvement = first_round_costs[0] - first_round_costs[-1]
-            print(f"  🔵 Round 1: {len(first_round_costs)} iterations, improvement: {first_improvement:.1f}")
-        
-        if second_round_costs:
-            second_improvement = second_round_costs[0] - second_round_costs[-1]
-            print(f"  🔴 Round 2: {len(second_round_costs)} iterations, improvement: {second_improvement:.1f}")
+    print(f"  🔍 Total iterations: {len(costs)}, Best at iteration: {best_point}")
 
 
 if __name__ == "__main__":

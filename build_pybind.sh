@@ -79,7 +79,7 @@ fi
 
 # Build
 print_status "Building cuOpt with Python bindings..."
-make -j$(nproc) cuopt_pybind
+ninja cuopt_pybind
 
 if [ $? -ne 0 ]; then
     print_error "Build failed"
@@ -90,7 +90,7 @@ print_status "Build completed successfully!"
 
 # Install
 print_status "Installing Python bindings..."
-make install
+ninja install
 
 if [ $? -ne 0 ]; then
     print_error "Installation failed"
