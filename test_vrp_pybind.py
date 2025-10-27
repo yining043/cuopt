@@ -158,10 +158,11 @@ def main(num_locations=20, num_vehicles=5, num_orders=15, vehicle_capacity=100):
             
         cuopt_env.sync_streams()
         
-        # Perform both VRP and Two-Opt searches
+        # Perform VRP, Sliding, and Two-Opt searches
         vrp_found = cuopt_env.perform_vrp_search()
+        sliding_found = cuopt_env.run_sliding_search()
         two_opt_found = cuopt_env.run_two_opt_search()
-        move_found = vrp_found or two_opt_found
+        move_found = vrp_found or sliding_found or two_opt_found
         
         cuopt_env.restore_found_nodes()
         cuopt_env.sync_streams()
@@ -180,6 +181,8 @@ def main(num_locations=20, num_vehicles=5, num_orders=15, vehicle_capacity=100):
             improvements = []
             if vrp_found:
                 improvements.append("VRP")
+            if sliding_found:
+                improvements.append("Sliding")
             if two_opt_found:
                 improvements.append("2-Opt")
             print(f"  Iteration {iteration}: ✓ Cost = {current_cost:.2f} ({'+'.join(improvements)})")
@@ -215,7 +218,7 @@ def create_local_search_visualization(solutions, costs, node_coords):
     
     # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle('VRP Local Search Results (VRP + Two-Opt)', fontsize=14, fontweight='bold')
+    fig.suptitle('VRP Local Search Results (VRP + Sliding + Two-Opt)', fontsize=14, fontweight='bold')
     
     # Cost evolution
     ax1[0].plot(range(len(costs)), costs, 'bo-', linewidth=2, markersize=6)

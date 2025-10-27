@@ -138,7 +138,35 @@ bool VrpLS::run_two_opt_search_impl() {
     auto* solution_obj = static_cast<Solution*>(solution_ptr_);
     auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
     
-    return local_search_obj->perform_two_opt(*solution_obj, local_search_obj->move_candidates);
+    bool move_found = local_search_obj->perform_two_opt(*solution_obj, local_search_obj->move_candidates);
+    solution_obj->sol_handle->sync_stream();
+    if (move_found) {
+      solution_obj->compute_cost();
+      solution_obj->check_cost_coherence(local_search_obj->move_candidates.weights);
+      return true;
+    }
+    return false;
+}
+
+// Perform sliding search - sliding window optimization
+bool VrpLS::run_sliding_search_impl() {
+    check_initialized(finalize_called_, "run_sliding_search()");
+    
+    auto* solution_obj = static_cast<Solution*>(solution_ptr_);
+    auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
+    
+    // Replicate the logic from local_search_t::run_sliding_search (private method)
+    bool move_found = solution_obj->problem_ptr->is_tsp 
+        ? local_search_obj->perform_sliding_tsp(*solution_obj, local_search_obj->move_candidates)
+        : local_search_obj->perform_sliding_window(*solution_obj, local_search_obj->move_candidates);
+    
+    solution_obj->sol_handle->sync_stream();
+    if (move_found) {
+        solution_obj->compute_cost();
+        solution_obj->check_cost_coherence(local_search_obj->move_candidates.weights);
+        return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -584,6 +612,11 @@ bool VrpLS::run_two_opt_search() {
     return run_two_opt_search_impl();
 }
 
+bool VrpLS::run_sliding_search() {
+    check_initialized(finalize_called_, "run_sliding_search()");
+    return run_sliding_search_impl();
+}
+
 double VrpLS::get_cost() const {
     return get_cost_impl();
 }
@@ -620,6 +653,7 @@ PYBIND11_MODULE(cuopt_pybind, m) {
             py::arg("routes"), py::arg("vehicle_ids") = std::vector<int>())
         .def("perform_vrp_search", &cuopt::routing::pybind::VrpLS::perform_vrp_search)
         .def("run_two_opt_search", &cuopt::routing::pybind::VrpLS::run_two_opt_search)
+        .def("run_sliding_search", &cuopt::routing::pybind::VrpLS::run_sliding_search)
         .def("acquire_resource", &cuopt::routing::pybind::VrpLS::acquire_resource)
         .def("release_resource", &cuopt::routing::pybind::VrpLS::release_resource)
         .def("sync_streams", &cuopt::routing::pybind::VrpLS::sync_streams)

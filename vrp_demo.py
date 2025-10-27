@@ -78,7 +78,12 @@ def perform_local_search(cuopt_env):
         cuopt_env.sample_nodes_to_search()
         cuopt_env.sync_streams()
         
-        move_found = cuopt_env.perform_vrp_search()
+        # Perform all available search operators
+        vrp_found = cuopt_env.perform_vrp_search()
+        sliding_found = cuopt_env.run_sliding_search()
+        two_opt_found = cuopt_env.run_two_opt_search()
+        move_found = vrp_found or sliding_found or two_opt_found
+        
         cuopt_env.restore_found_nodes()
         cuopt_env.sync_streams()
         

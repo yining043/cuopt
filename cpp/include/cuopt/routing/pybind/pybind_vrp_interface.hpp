@@ -64,6 +64,9 @@ public:
     
     // Two-opt search method - intra-route optimization
     bool run_two_opt_search();
+    
+    // Sliding search method - sliding window optimization
+    bool run_sliding_search();
 
     // Resource management methods - following cuOpt's pattern
     void acquire_resource();
@@ -111,6 +114,7 @@ public:
                                const std::vector<int>& vehicle_ids);
     bool perform_vrp_search_impl();
     bool run_two_opt_search_impl();
+    bool run_sliding_search_impl();
     void setup_solution_impl(const std::vector<std::vector<int>>& routes, 
                             const std::vector<int>& vehicle_ids);
     void validate_routes(const std::vector<std::vector<int>>& routes, const std::string& context);
