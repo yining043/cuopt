@@ -131,6 +131,16 @@ bool VrpLS::perform_vrp_search_impl() {
     return cuopt::routing::detail::perform_vrp_search(*solution_obj, local_search_obj->move_candidates);
 }
 
+// Perform two-opt local search - intra-route optimization
+bool VrpLS::run_two_opt_search_impl() {
+    check_initialized(finalize_called_, "run_two_opt_search()");
+    
+    auto* solution_obj = static_cast<Solution*>(solution_ptr_);
+    auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
+    
+    return local_search_obj->perform_two_opt(*solution_obj, local_search_obj->move_candidates);
+}
+
 // ============================================================================
 // Resource management - simplified for single solution
 // ============================================================================
@@ -569,6 +579,11 @@ bool VrpLS::perform_vrp_search() {
     return perform_vrp_search_impl();
 }
 
+bool VrpLS::run_two_opt_search() {
+    check_initialized(finalize_called_, "run_two_opt_search()");
+    return run_two_opt_search_impl();
+}
+
 double VrpLS::get_cost() const {
     return get_cost_impl();
 }
@@ -604,6 +619,7 @@ PYBIND11_MODULE(cuopt_pybind, m) {
         .def("setup_solution", &cuopt::routing::pybind::VrpLS::setup_solution,
             py::arg("routes"), py::arg("vehicle_ids") = std::vector<int>())
         .def("perform_vrp_search", &cuopt::routing::pybind::VrpLS::perform_vrp_search)
+        .def("run_two_opt_search", &cuopt::routing::pybind::VrpLS::run_two_opt_search)
         .def("acquire_resource", &cuopt::routing::pybind::VrpLS::acquire_resource)
         .def("release_resource", &cuopt::routing::pybind::VrpLS::release_resource)
         .def("sync_streams", &cuopt::routing::pybind::VrpLS::sync_streams)

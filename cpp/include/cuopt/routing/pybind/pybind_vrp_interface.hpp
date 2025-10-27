@@ -61,6 +61,9 @@ public:
 
     // The core method - directly call cuOpt's perform_vrp_search via local_search_t
     bool perform_vrp_search();
+    
+    // Two-opt search method - intra-route optimization
+    bool run_two_opt_search();
 
     // Resource management methods - following cuOpt's pattern
     void acquire_resource();
@@ -107,6 +110,7 @@ public:
     void initialize_search_impl(const std::vector<std::vector<int>>& routes, 
                                const std::vector<int>& vehicle_ids);
     bool perform_vrp_search_impl();
+    bool run_two_opt_search_impl();
     void setup_solution_impl(const std::vector<std::vector<int>>& routes, 
                             const std::vector<int>& vehicle_ids);
     void validate_routes(const std::vector<std::vector<int>>& routes, const std::string& context);
