@@ -29,6 +29,7 @@
 #include "../../solution/solution.cuh"
 #include "../../solution/pool_allocator.cuh"
 #include "../local_search.cuh"
+#include "../compute_insertions.cuh"
 #include "vrp_search.cuh"
 
 namespace py = pybind11;
@@ -127,7 +128,7 @@ bool VrpLS::perform_vrp_search_impl() {
     
     auto* solution_obj = static_cast<Solution*>(solution_ptr_);
     auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
-    
+    solution_obj->sol_handle->sync_stream();
     return cuopt::routing::detail::perform_vrp_search(*solution_obj, local_search_obj->move_candidates);
 }
 
@@ -138,14 +139,7 @@ bool VrpLS::run_two_opt_search_impl() {
     auto* solution_obj = static_cast<Solution*>(solution_ptr_);
     auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
     
-    bool move_found = local_search_obj->perform_two_opt(*solution_obj, local_search_obj->move_candidates);
-    solution_obj->sol_handle->sync_stream();
-    if (move_found) {
-      solution_obj->compute_cost();
-      solution_obj->check_cost_coherence(local_search_obj->move_candidates.weights);
-      return true;
-    }
-    return false;
+    return local_search_obj->run_two_opt_search(*solution_obj);
 }
 
 // Perform sliding search - sliding window optimization
@@ -155,17 +149,83 @@ bool VrpLS::run_sliding_search_impl() {
     auto* solution_obj = static_cast<Solution*>(solution_ptr_);
     auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
     
-    // Replicate the logic from local_search_t::run_sliding_search (private method)
-    bool move_found = solution_obj->problem_ptr->is_tsp 
-        ? local_search_obj->perform_sliding_tsp(*solution_obj, local_search_obj->move_candidates)
-        : local_search_obj->perform_sliding_window(*solution_obj, local_search_obj->move_candidates);
+    return local_search_obj->run_sliding_search(*solution_obj);
+}
+
+// Run cycle finder - Large Neighborhood Search with negative cycle detection
+// Replicate the logic from local_search.cu lines 295-328
+bool VrpLS::run_cycle_finder_impl() {
+    check_initialized(finalize_called_, "run_cycle_finder()");
     
+    auto* solution_obj = static_cast<Solution*>(solution_ptr_);
+    auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
+    
+    // Check preconditions (same as in run_best_local_search)
+    if (solution_obj->n_routes > 1023) { 
+        return false; 
+    }
+    
+    // cycle finder is needed even for single route in PDP cases
+    // For VRP, need at least 2 routes
+    constexpr auto REQUEST = cuopt::routing::request_t::VRP;
+    if (REQUEST == cuopt::routing::request_t::VRP && solution_obj->n_routes < 2) { 
+        return false; 
+    }
+    
+    // Reset and prepare candidates
+    local_search_obj->move_candidates.reset(solution_obj->sol_handle);
+    local_search_obj->calculate_route_compatibility(*solution_obj);
+    cuopt::routing::detail::find_insertions<int, float, REQUEST>(
+        *solution_obj, 
+        local_search_obj->move_candidates, 
+        cuopt::routing::detail::search_type_t::IMPROVE
+    );
+    
+    RAFT_CHECK_CUDA(solution_obj->sol_handle->get_stream());
     solution_obj->sol_handle->sync_stream();
-    if (move_found) {
-        solution_obj->compute_cost();
-        solution_obj->check_cost_coherence(local_search_obj->move_candidates.weights);
+    
+    // Fill GPU graph - need to call through local_search (private method, but we can work around)
+    // Use the public interface approach: directly manipulate the graph
+    local_search_obj->fill_gpu_graph(*solution_obj);
+    
+    // Find best negative cycles
+    local_search_obj->move_candidates.find_best_negative_cycles(
+        solution_obj->n_routes, 
+        local_search_obj->cycle_finder_small, 
+        local_search_obj->cycle_finder_big, 
+        solution_obj->sol_handle
+    );
+    
+    [[maybe_unused]] double cost_before = 0., cost_after = 0.;
+    cuopt_func_call(cost_before = solution_obj->get_cost(
+        local_search_obj->move_candidates.include_objective, 
+        local_search_obj->move_candidates.weights
+    ));
+    
+    local_search_obj->populate_move_path(*solution_obj, local_search_obj->move_candidates);
+    
+    bool improved = local_search_obj->move_candidates.move_path.n_insertions.value(
+        solution_obj->sol_handle->get_stream()) != 0;
+    
+    if (improved) {
+        solution_obj->unset_routes_to_search();
+        local_search_obj->perform_moves(*solution_obj, local_search_obj->move_candidates);
+        cuopt_func_call(solution_obj->check_cost_coherence(local_search_obj->move_candidates.weights));
+        
+        // Recompute cost
+        cuopt_func_call(solution_obj->compute_cost());
+        cuopt_func_call(cost_after = solution_obj->get_cost(
+            local_search_obj->move_candidates.include_objective, 
+            local_search_obj->move_candidates.weights
+        ));
+        
+        cuopt_assert((cost_after - cost_before) - local_search_obj->move_candidates.cycles.total_cycle_cost < 1.,
+                     "Cost mismatch after a move");
+        
+        solution_obj->sol_handle->sync_stream();
         return true;
     }
+    
     return false;
 }
 
@@ -617,6 +677,11 @@ bool VrpLS::run_sliding_search() {
     return run_sliding_search_impl();
 }
 
+bool VrpLS::run_cycle_finder() {
+    check_initialized(finalize_called_, "run_cycle_finder()");
+    return run_cycle_finder_impl();
+}
+
 double VrpLS::get_cost() const {
     return get_cost_impl();
 }
@@ -654,6 +719,7 @@ PYBIND11_MODULE(cuopt_pybind, m) {
         .def("perform_vrp_search", &cuopt::routing::pybind::VrpLS::perform_vrp_search)
         .def("run_two_opt_search", &cuopt::routing::pybind::VrpLS::run_two_opt_search)
         .def("run_sliding_search", &cuopt::routing::pybind::VrpLS::run_sliding_search)
+        .def("run_cycle_finder", &cuopt::routing::pybind::VrpLS::run_cycle_finder)
         .def("acquire_resource", &cuopt::routing::pybind::VrpLS::acquire_resource)
         .def("release_resource", &cuopt::routing::pybind::VrpLS::release_resource)
         .def("sync_streams", &cuopt::routing::pybind::VrpLS::sync_streams)

@@ -182,11 +182,15 @@ class local_search_t {
   vehicle_assignment_t<i_t, f_t, REQUEST> vehicle_assignment;
   void calculate_route_compatibility(solution_t<i_t, f_t, REQUEST>& sol);
 
- private:
+  // move out of the private section to make them public!
   void fill_gpu_graph(solution_t<i_t, f_t, REQUEST>& sol);
-  void sort_move_candidates_by_cost(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_sliding_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_two_opt_search(solution_t<i_t, f_t, REQUEST>& sol);
+  ExactCycleFinder<i_t, f_t, 128> cycle_finder_small;
+  ExactCycleFinder<i_t, f_t, 1024> cycle_finder_big;
+
+private:
+  void sort_move_candidates_by_cost(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_cross_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_inter_search(solution_t<i_t, f_t, REQUEST>& sol);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::PDP, bool> = true>
@@ -203,8 +207,6 @@ class local_search_t {
   static inline f_t time_limit;
   static inline std::chrono::time_point<std::chrono::steady_clock> start;
   static inline bool time_limit_reached;
-  ExactCycleFinder<i_t, f_t, 128> cycle_finder_small;
-  ExactCycleFinder<i_t, f_t, 1024> cycle_finder_big;
   rmm::device_uvector<found_sliding_solution_t<i_t>> found_sliding_solution_data_;
   rmm::device_uvector<two_opt_cand_t<i_t>> two_opt_cand_data_;
   rmm::device_uvector<two_opt_cand_t<i_t>> sampled_nodes_data_;

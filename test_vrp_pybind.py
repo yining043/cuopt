@@ -1,45 +1,42 @@
 #!/usr/bin/env python3
 """
-Test script for cuOpt Local Search (VrpLS) interface - 20 points comprehensive test
+cuOpt VRP Local Search Test
+Replicates cuOpt's run_best_local_search logic with pybind interface
 """
-
+import matplotlib.pyplot as plt
 import numpy as np
 import sys
 import os
+import random
 
 # Add the cuOpt build directory to Python path
 cuopt_build_path = os.path.join(os.path.dirname(__file__), 'cpp', 'build', 'install', 'lib', 'python3', 'dist-packages')
 if cuopt_build_path not in sys.path:
     sys.path.insert(0, cuopt_build_path)
 
-def create_vrp_instance(num_locations=20, num_vehicles=5, num_orders=15, vehicle_capacity=100):
-    """Create a complete VRP instance with all data"""
+
+def create_vrp_instance(num_locations=20, num_vehicles=5, vehicle_capacity=100):
+    """Create VRP instance: location 0 = depot, locations 1..n-1 = orders"""
     import cuopt_pybind
     
-    # Generate node coordinates first
-    node_coords = np.random.rand(num_locations, 2) * 10  # Random coordinates in [0,10] x [0,10]
+    num_orders = num_locations - 1
     
-    # Calculate cost matrix based on Euclidean distances
+    node_coords = np.random.rand(num_locations, 2) * 10
+    
     cost_matrix = np.zeros((num_locations, num_locations), dtype=np.float32)
     for i in range(num_locations):
         for j in range(num_locations):
             if i != j:
-                # Euclidean distance between nodes
                 distance = np.sqrt(np.sum((node_coords[i] - node_coords[j])**2))
                 cost_matrix[i, j] = distance
-            else:
-                cost_matrix[i, j] = 0
     
-    # Generate demands for all nodes
-    demands = [0] + list(np.random.randint(10, 31, num_orders)) + [0]  # depot has 0 demand
-    capacities = [vehicle_capacity] * num_vehicles  # all vehicles have same capacity
+    demands = [0] + list(np.random.randint(1, 10, num_orders))
+    capacities = [vehicle_capacity] * num_vehicles
     
-    # Create VRP problem with configurable parameters
     cuopt_env = cuopt_pybind.VrpLS(num_locations, num_vehicles, num_orders)
     cuopt_env.add_cost_matrix(cost_matrix)
     cuopt_env.add_capacity_dimension("weight", demands, capacities)
     
-    # Return the complete VRP instance
     return {
         'cuopt_env': cuopt_env,
         'node_coords': node_coords,
@@ -54,194 +51,165 @@ def create_vrp_instance(num_locations=20, num_vehicles=5, num_orders=15, vehicle
 
 
 def create_random_initial_solution(vrp_instance):
-    """Create a random initial solution for VRP with capacity constraints"""
-    import random
-    
-    # Extract data from VRP instance
+    """Create a random initial solution respecting capacity constraints"""
     demands = vrp_instance['demands']
     num_orders = vrp_instance['num_orders']
     num_vehicles = vrp_instance['num_vehicles']
     vehicle_capacity = vrp_instance['vehicle_capacity']
     
-    # Create list of all order nodes (1 to num_orders) with their demands
     order_nodes = list(range(1, num_orders + 1))
     random.shuffle(order_nodes)
     
-    # Distribute orders across vehicles while respecting capacity constraints
     routes = []
     remaining_orders = order_nodes.copy()
     
     for vehicle_id in range(num_vehicles):
-        route = [0]  # Start with depot
+        route = [0]
         current_load = 0
         
-        # Try to add orders to this vehicle while respecting capacity
-        orders_for_vehicle = []
-        temp_remaining = remaining_orders.copy()
-        
-        for order in temp_remaining:
+        for order in remaining_orders.copy():
             order_demand = demands[order]
             if current_load + order_demand <= vehicle_capacity:
-                orders_for_vehicle.append(order)
+                route.append(order)
                 current_load += order_demand
                 remaining_orders.remove(order)
         
-        # Shuffle orders within this route
-        random.shuffle(orders_for_vehicle)
-        route.extend(orders_for_vehicle)
-        route.append(0)  # End with depot
-        routes.append(route)
+        random.shuffle(route[1:-1] if len(route) > 2 else route[1:])
+        routes.append(route if route[-1] == 0 else route + [0])
     
-    # Handle any remaining orders that couldn't fit in previous vehicles
-    # Add them to the last vehicle (even if it exceeds capacity - this will be handled by the solver)
     if remaining_orders:
-        print(f"Adding remaining orders to last vehicle: {remaining_orders}")
         last_route = routes[-1]
-        # Remove the final depot
-        last_route.pop()
-        # Add remaining orders
-        random.shuffle(remaining_orders)
+        if last_route[-1] == 0:
+            last_route.pop()
         last_route.extend(remaining_orders)
-        # Add depot back
         last_route.append(0)
     
     return routes
 
 
-def main(num_locations=20, num_vehicles=5, num_orders=15, vehicle_capacity=100):
-    print(f"🚀 Starting cuOpt VRP Local Search Test")
-    print(f"Configuration: {num_locations} locations, {num_vehicles} vehicles, {num_orders} orders, capacity {vehicle_capacity}")
-    print("="*80)
-    
-    vrp_instance = create_vrp_instance(num_locations, num_vehicles, num_orders, vehicle_capacity)
-    print("✓ VRP instance created successfully")
+def customize_nodes_to_search(cuopt_env):
+    """
+    Custom node selection logic
+    Users can modify nodes_to_search before sampling
+    """
+    nodes = cuopt_env.get_move_candidates()
+    # Example: sort according to x [[x, ..., ...], [x, ..., ...], ...]
+    nodes.sort(key=lambda x: x[0])
+    cuopt_env.set_move_candidates(nodes)
+    print(f"Number of nodes to search: {len(nodes)}")
 
-    """Test basic VRP functionality"""
-    print("="*60)
-    print("Testing Basic VRP Functionality")
-    print(f"Problem: {vrp_instance['num_locations']} locations, {vrp_instance['num_vehicles']} vehicles, {vrp_instance['num_orders']} orders")
-    print("="*60)
-    
-    cuopt_env = vrp_instance['cuopt_env']
-    node_coords = vrp_instance['node_coords']
-    num_orders = vrp_instance['num_orders']
-    initial_routes = create_random_initial_solution(vrp_instance)
-    cuopt_env.initialize_search(initial_routes)
-    initial_cost = cuopt_env.get_cost()
-    print(f"✓ Initial solution - Cost: {initial_cost:.2f}")
 
-    # Handle weights
-    current_weights = cuopt_env.get_weights()
-    cuopt_env.set_selection_weights(current_weights)
-    
-    solutions = []
-    costs = []
-    
-    # Perform local search
-    print(f"\n🔍 Starting Local Search...")
+def run_local_search(cuopt_env, num_orders, node_coords, use_custom_sampling=False):
+    """Run local search replicating cuOpt's run_best_local_search logic"""
     cuopt_env.acquire_resource()
     cuopt_env.reset_move_candidates()
     cuopt_env.set_routes_to_search()
-    cuopt_env.extract_nodes_to_search()
     
-    # Store initial state
-    solutions.append(cuopt_env.get_solution_routes().copy())
-    costs.append(cuopt_env.get_cost())
+    cuopt_env.sync_streams()
     
-    # Perform search iterations
-    iteration = 0
-    while True:
-        iteration += 1
-        sampled = cuopt_env.sample_nodes_to_search()
-        if not sampled:
-            break
+    solutions = [cuopt_env.get_solution_routes().copy()]
+    costs = [cuopt_env.get_cost()]
+    cycle_finder_iterations = []
+    
+    max_outer_iterations = 100000
+    total_iterations = 0
+    
+    for outer_iter in range(max_outer_iterations):
+        print(f"\nOuter Iteration {outer_iter + 1}")
+        cuopt_env.extract_nodes_to_search()
+        
+        fast_search_iter = 0     
+        while True:
+            fast_search_iter += 1
+            total_iterations += 1
+
+            if use_custom_sampling:
+                customize_nodes_to_search(cuopt_env)
             
-        cuopt_env.sync_streams()
-        
-        # Perform VRP, Sliding, and Two-Opt searches
-        vrp_found = cuopt_env.perform_vrp_search()
-        sliding_found = cuopt_env.run_sliding_search()
-        two_opt_found = cuopt_env.run_two_opt_search()
-        move_found = vrp_found or sliding_found or two_opt_found
-        
-        cuopt_env.restore_found_nodes()
-        cuopt_env.sync_streams()
-        
-        current_cost = cuopt_env.get_cost()
-        current_routes = cuopt_env.get_solution_routes()
-        
-        # Check node coverage
-        current_nodes = set()
-        for route in current_routes:
-            current_nodes.update(route)
-        current_nodes.discard(0)
-        missing_nodes = set(range(1, num_orders + 1)) - current_nodes
-        
-        if move_found:
+            if not cuopt_env.sample_nodes_to_search(full_set=use_custom_sampling):
+                print(f"  Fast search: Node pool exhausted")
+                break
+            
+            fast_operators = ['vrp', 'sliding', 'two_opt']
+            random.shuffle(fast_operators)
+            
             improvements = []
-            if vrp_found:
-                improvements.append("VRP")
-            if sliding_found:
-                improvements.append("Sliding")
-            if two_opt_found:
-                improvements.append("2-Opt")
-            print(f"  Iteration {iteration}: ✓ Cost = {current_cost:.2f} ({'+'.join(improvements)})")
-            if missing_nodes:
-                print(f"      ⚠️  Missing nodes: {sorted(missing_nodes)}")
-            solutions.append(current_routes.copy())
+            move_found = False
+            for op in fast_operators:
+                move_found_here = False
+                if op == 'vrp':
+                    move_found_here = cuopt_env.perform_vrp_search()
+                elif op == 'sliding':
+                    move_found_here = cuopt_env.run_sliding_search()
+                elif op == 'two_opt':
+                    move_found_here = cuopt_env.run_two_opt_search()
+                
+                if move_found_here:
+                    improvements.append(op.upper())
+                move_found = move_found or move_found_here
+            
+            cuopt_env.restore_found_nodes()
+            
+            if move_found:
+                current_cost = cuopt_env.get_cost()
+                print(f"  Fast search {fast_search_iter}: ✓ Cost = {current_cost:.2f} ({'+'.join(improvements)})")
+                solutions.append(cuopt_env.get_solution_routes().copy())
+                costs.append(current_cost)
+            else:
+                print(f"  Fast search {fast_search_iter}: No improvement")
+        
+        print(f"  Running Cycle Finder...")
+        cycle_found = cuopt_env.run_cycle_finder()
+        
+        if cycle_found:
+            current_cost = cuopt_env.get_cost()
+            print(f"  Cycle Finder: ✓ Cost = {current_cost:.2f}")
+            solutions.append(cuopt_env.get_solution_routes().copy())
             costs.append(current_cost)
+            cycle_finder_iterations.append(len(costs) - 1)
         else:
-            print(f"  Iteration {iteration}: ✗ No improvement, Cost = {current_cost:.2f}")
-            if missing_nodes:
-                print(f"      ⚠️  Missing nodes: {sorted(missing_nodes)}")
+            print(f"  Cycle Finder: No improvement")
             break
 
+    cuopt_env.set_routes_to_search()
     cuopt_env.release_resource()
     cuopt_env.sync_streams()
     
-    final_cost = current_cost
-    
-    # Create visualization
-    print(f"\n📊 Creating visualization...")
-    create_local_search_visualization(solutions, costs, node_coords)
-    
-    print(f"\n✓ Search completed")
-    print(f"  Initial: {initial_cost:.2f} → Final: {final_cost:.2f}")
-    print(f"  Improvement: {initial_cost - final_cost:.2f} ({((initial_cost - final_cost)/initial_cost*100):.1f}%)")
-    
-    return cuopt_env
+    return solutions, costs, total_iterations, cycle_finder_iterations
 
-def create_local_search_visualization(solutions, costs, node_coords):
-    """Create simplified visualization of the local search process"""
-    import matplotlib.pyplot as plt
-    import numpy as np
+
+def create_local_search_visualization(solutions, costs, node_coords, cycle_finder_iterations=None):
+    """Create visualization of the local search process"""
     
-    # Create figure
     fig, (ax1, ax2) = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle('VRP Local Search Results (VRP + Sliding + Two-Opt)', fontsize=14, fontweight='bold')
+    fig.suptitle('VRP Local Search Results', fontsize=14, fontweight='bold')
     
     # Cost evolution
-    ax1[0].plot(range(len(costs)), costs, 'bo-', linewidth=2, markersize=6)
+    ax1[0].plot(range(len(costs)), costs, 'bo-', linewidth=2, markersize=6, label='Cost')
     ax1[0].set_xlabel('Iteration')
     ax1[0].set_ylabel('Cost')
     ax1[0].set_title('Cost Evolution')
     ax1[0].grid(True, alpha=0.3)
+    
+    # Mark Cycle Finder iterations
+    if cycle_finder_iterations:
+        for cf_iter in cycle_finder_iterations:
+            ax1[0].plot(cf_iter, costs[cf_iter], 'r*', markersize=15, label='Cycle Finder' if cf_iter == cycle_finder_iterations[0] else '')
     
     # Mark best solution
     best_point = costs.index(min(costs))
     ax1[0].axvline(x=best_point, color='green', linestyle='--', alpha=0.7, label='Best solution')
     ax1[0].legend()
     
-    # Node coordinates
+    # Route visualization
     x_pos = node_coords[:, 0]
     y_pos = node_coords[:, 1]
     colors = ['red', 'blue', 'green', 'orange', 'purple']
     
     def plot_routes(ax, iter_idx, title):
-        """Plot routes for an iteration"""
         if iter_idx >= len(solutions):
             return
-            
+        
         for route_idx, route in enumerate(solutions[iter_idx]):
             if len(route) >= 2:
                 valid_nodes = [node for node in route if 0 <= node < len(x_pos)]
@@ -257,34 +225,79 @@ def create_local_search_visualization(solutions, costs, node_coords):
         ax.set_title(f'{title}\nCost: {costs[iter_idx]:.1f}')
         ax.grid(True, alpha=0.3)
     
-    # Plot key iterations
     plot_routes(ax1[1], 0, 'Initial Solution')
     plot_routes(ax2[0], best_point, 'Best Solution')
     plot_routes(ax2[1], len(costs)-1, 'Final Solution')
     
     plt.tight_layout()
     plt.savefig('local_search_process.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    print(f"  Visualization saved as 'local_search_process.png'")
     
-    print(f"  📊 Visualization saved as 'local_search_process.png'")
-    print(f"  📈 Total improvement: {costs[0] - costs[-1]:.1f} ({((costs[0] - costs[-1])/costs[0]*100):.1f}%)")
-    print(f"  🔍 Total iterations: {len(costs)}, Best at iteration: {best_point}")
+    if cycle_finder_iterations:
+        print(f"  Cycle Finder executed {len(cycle_finder_iterations)} times at iterations: {cycle_finder_iterations}")
+
+
+def main(num_locations=20, num_vehicles=5, vehicle_capacity=100, use_custom_sampling=False):
+    if num_locations < 2:
+        raise ValueError(f"num_locations must be >= 2 (got {num_locations})")
+    if num_vehicles < 1:
+        raise ValueError(f"num_vehicles must be >= 1 (got {num_vehicles})")
+    
+    num_orders = num_locations - 1
+    print(f"🚀 cuOpt VRP Local Search Test")
+    print(f"Configuration: {num_locations} locations (1 depot + {num_orders} orders), {num_vehicles} vehicles, capacity {vehicle_capacity}")
+    print(f"Custom sampling: {'Enabled' if use_custom_sampling else 'Disabled'}")
+    print("="*80)
+    
+    vrp_instance = create_vrp_instance(num_locations, num_vehicles, vehicle_capacity)
+    cuopt_env = vrp_instance['cuopt_env']
+    node_coords = vrp_instance['node_coords']
+    
+    initial_routes = create_random_initial_solution(vrp_instance)
+    cuopt_env.initialize_search(initial_routes)
+    initial_cost = cuopt_env.get_cost()
+    print(f"✓ Initial solution - Cost: {initial_cost:.2f}")
+    
+    cuopt_env.set_selection_weights(cuopt_env.get_weights())
+    
+    solutions, costs, total_iterations, cycle_finder_iterations = run_local_search(
+        cuopt_env, vrp_instance['num_orders'], node_coords, use_custom_sampling)
+    
+    # Create visualization
+    print(f"\n📊 Creating visualization...")
+    create_local_search_visualization(solutions, costs, node_coords, cycle_finder_iterations)
+    
+    # Print summary
+    final_cost = cuopt_env.get_cost()
+    improvement = initial_cost - final_cost
+    improvement_pct = (improvement / initial_cost * 100)
+    
+    print(f"\n✓ Search completed")
+    print(f"  Fast search iterations: {total_iterations}")
+    print(f"  Cycle Finder improvements: {len(cycle_finder_iterations)}")
+    print(f"  Solutions recorded: {len(solutions)}")
+    print(f"  Initial: {initial_cost:.2f} → Final: {final_cost:.2f}")
+    print(f"  Improvement: {improvement:.2f} ({improvement_pct:.1f}%)")
+    
+    return cuopt_env
 
 
 if __name__ == "__main__":
     import argparse
     
-    # Parse command line arguments
     parser = argparse.ArgumentParser(description='cuOpt VRP Local Search Test')
-    parser.add_argument('--locations', type=int, default=20, help='Number of locations (default: 20)')
-    parser.add_argument('--vehicles', type=int, default=5, help='Number of vehicles (default: 5)')
-    parser.add_argument('--orders', type=int, default=15, help='Number of orders (default: 15)')
-    parser.add_argument('--capacity', type=int, default=100, help='Vehicle capacity (default: 100)')
+    parser.add_argument('--lo', '--locations', type=int, default=20, dest='locations', 
+                        help='Number of locations (depot + orders)')
+    parser.add_argument('--vehicle', '--vehicles', type=int, default=5, dest='vehicles', 
+                        help='Number of vehicles')
+    parser.add_argument('--capacity', type=int, default=100, help='Vehicle capacity')
+    parser.add_argument('--diy', action='store_true', 
+                        help='Enable custom node sampling (use customize_nodes_to_search)')
     
     args = parser.parse_args()
     
     try:
-        cuopt_env = main(args.locations, args.vehicles, args.orders, args.capacity)
+        main(args.locations, args.vehicles, args.capacity, args.diy)
         print("\n✅ Test completed successfully!")
         sys.exit(0)
     except Exception as e:
