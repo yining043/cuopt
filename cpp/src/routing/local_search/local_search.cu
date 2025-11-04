@@ -211,7 +211,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     }
   }
   auto& h_nodes = nodes_to_search.h_nodes_to_search;
-  bool needs_customization = h_nodes.size() > 0;
+  bool needs_customization = h_nodes.size() > 40;
   if (!full_set && needs_customization && obs_callback) {
     // Prepare current solution for observation
     size_t n_nodes = sol.get_num_orders();
