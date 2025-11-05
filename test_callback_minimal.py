@@ -43,14 +43,11 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
             'cost_before': solution_cost,
             'is_circle_found': False
         }
-        
         num_candidates = sum(candidate_mask)
         sample_size = min(40, num_candidates) if num_candidates >= 80 else (num_candidates // 2 if num_candidates >= 40 else num_candidates)
-        
         candidate_nodes = [i for i, m in enumerate(candidate_mask) if m == 1]
         selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
         selection_mask[random.sample(candidate_nodes, min(sample_size, len(candidate_nodes)))] = 1
-        
         return selection_mask.tolist()
 
 
@@ -101,7 +98,7 @@ class TestLocalSearchStartCallback(LocalSearchStartCallback):
         print(f"Global iter: {self.global_history['current_global_iter']}, Local search count: {self.global_history['current_local_search_id']}")
         # print(f"Weights: {weights}")
         # print(f"Selection weights: {selection_weights}")
-        # print(f"Should all nodes be served: {should_all_nodes_be_served}")
+        print(f"Should all nodes be served: {should_all_nodes_be_served}")
         assert should_all_nodes_be_served, "All nodes should be served"
 
 
@@ -326,11 +323,10 @@ def test_callback():
     
     # Setup problem using Problem class
     problem_gen = Problem(
-        n_locations=100,
-        n_vehicles=50,
-        seed=42,
+        n_locations=1000,
+        n_vehicles=300,
         coordinate_range=100.0,
-        capacity=100.0,
+        capacity=200.0,
         demand_range=(1, 10)
     )
     problem_data = problem_gen.generate()
@@ -349,7 +345,7 @@ def test_callback():
     after_callback = TestAfterCycleFinderCallback(global_history)
     
     solver_settings = routing.SolverSettings()
-    solver_settings.set_time_limit(1)
+    solver_settings.set_time_limit(10)
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
     solver_settings.set_routing_callback(start_callback)

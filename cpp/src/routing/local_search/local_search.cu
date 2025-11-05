@@ -306,7 +306,10 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         &selection_mask,
         iter
     );
-    if (selection_mask.size() != (size_t)total_nodes) { exit(1); }
+    if (selection_mask.size() != (size_t)total_nodes) { 
+      printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)total_nodes);
+      exit(1); 
+    }
     // Extract selected nodes from mask and build sampled lists (single pass)
     std::vector<i_t> sampled_indices;
     nodes_to_search.h_sampled_nodes.clear();

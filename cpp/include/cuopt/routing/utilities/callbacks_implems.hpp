@@ -56,8 +56,22 @@ public:
                 }
             }
         }
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
         
         if (result) Py_DECREF(result);
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
     }
     
     PyObject* pyCallbackClass;
@@ -85,6 +99,13 @@ public:
         );
         
         if (result) Py_DECREF(result);
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
     }
     
     PyObject* pyCallbackClass;
@@ -114,6 +135,13 @@ public:
         );
         
         if (result) Py_DECREF(result);
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
     }
     
     PyObject* pyCallbackClass;
@@ -139,6 +167,13 @@ public:
         );
         
         if (result) Py_DECREF(result);
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
     }
     
     PyObject* pyCallbackClass;
@@ -166,6 +201,13 @@ public:
         );
         
         if (result) Py_DECREF(result);
+        else {
+            if (PyErr_Occurred()) {
+                PyErr_Print();  // 打印异常信息
+                PyErr_Clear();  // 清理异常状态
+                exit(1);
+            }
+        }
     }
     
     PyObject* pyCallbackClass;
