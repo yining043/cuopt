@@ -434,7 +434,6 @@ def test_callback():
                 final_cost,
                 problem_data['coordinates']
             )
-    import pdb; pdb.set_trace()
     # Return complete global history for external analysis
     return global_history['history']
 
