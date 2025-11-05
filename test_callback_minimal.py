@@ -1,123 +1,205 @@
 """
-Test for routing callback functionality (Customize-Nodes and Reward)
+Test for routing callback functionality
 
-Demonstrates the two callback types:
+Demonstrates the callback types:
 - CustomizeNodesCallback: Customizes node sampling for local search
 - RewardCallback: Receives iteration feedback
+- LocalSearchStartCallback: Observes state before local search begins
+- BeforeCycleFinderCallback: Observes state before cycle finder execution
+- AfterCycleFinderCallback: Observes state after cycle finder execution
 """
 import numpy as np
-import cudf
 from cuopt import routing
-from cuopt.routing import CustomizeNodesCallback, RewardCallback
+from cuopt.routing import (
+    CustomizeNodesCallback, 
+    RewardCallback,
+    LocalSearchStartCallback,
+    BeforeCycleFinderCallback,
+    AfterCycleFinderCallback
+)
+from cuopt_collector import Problem
 import matplotlib.pyplot as plt
 import random
 
 
 class TestCustomizeNodesCallback(CustomizeNodesCallback):
-    """Example callback - customizes node sampling with observation tracking"""
+    """Stores before state and implements adaptive node sampling."""
     
-    def __init__(self):
+    def __init__(self, global_history):
         super().__init__()
-        self.call_count = 0
-        self.observations = []
+        self.global_history = global_history
     
-    def customize_nodes_to_search(self, solution_flat, num_routes, solution_cost, candidate_mask):
-        """Customize sampling and record state"""
-        self.call_count += 1
+    def customize_nodes_to_search(self, solution_flat, num_routes, solution_cost, candidate_mask, iter):
+        """Store before state and implement adaptive node sampling."""
+        self.global_history['current_local_iter'] = self.global_history.get('current_local_iter', -1) + 1
+        local_search_id = self.global_history.get('current_local_search_id', 0)
+        global_iter = self.global_history.get('current_global_iter', 0)
+        self.global_history.setdefault('pending_fast_search', {})[global_iter] = {
+            'local_search_id': local_search_id,
+            'global_iter': global_iter,
+            'sol_before': solution_flat.copy(),
+            'num_routes_before': num_routes,
+            'cost_before': solution_cost,
+            'is_circle_found': False
+        }
         
-        # Compute number of candidates
         num_candidates = sum(candidate_mask)
+        sample_size = min(40, num_candidates) if num_candidates >= 80 else (num_candidates // 2 if num_candidates >= 40 else num_candidates)
         
-        # Record observation (without candidate_node_ids - redundant)
-        self.observations.append({
-            'iteration': self.call_count,
-            'cost': solution_cost,
-            'num_routes': num_routes,
-            'solution_flat': solution_flat,
-            'candidate_mask': candidate_mask,
-            'num_candidates': num_candidates
-        })
-        
-        # Adaptive sampling strategy
-        if num_candidates < 40:
-            sample_size = num_candidates
-        elif num_candidates < 80:
-            sample_size = num_candidates // 2
-        else:
-            sample_size = 40
-        
-        # Extract candidates locally and create selection mask
-        candidate_nodes = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
+        candidate_nodes = [i for i, m in enumerate(candidate_mask) if m == 1]
         selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
-        sampled = random.sample(candidate_nodes, min(sample_size, len(candidate_nodes)))
-        selection_mask[sampled] = 1
-        selection_mask = selection_mask.tolist()
+        selection_mask[random.sample(candidate_nodes, min(sample_size, len(candidate_nodes)))] = 1
         
-        print(f"  [Customize {self.call_count}] Sampled {sample_size}/{num_candidates} nodes (cost={solution_cost:.2f})")
-        print(f"    Solution flat length: {len(solution_flat)}, Candidate mask length: {len(candidate_mask)}, Active candidates: {sum(candidate_mask)}")
-        
-        route_2d = solution_flat_to_routes_2d(solution_flat, num_routes, 20)
-        for route in route_2d:
-            print(f"  route: {route}")
-        print(f"  solution_flat: {solution_flat}")
-
-        return selection_mask  # Return selection mask (fixed length)
+        return selection_mask.tolist()
 
 
 class TestRewardCallback(RewardCallback):
-    """Example reward callback - tracks improvement signals"""
+    """Completes fast search record with after state."""
     
-    def __init__(self):
+    def __init__(self, global_history):
         super().__init__()
-        self.reward_count = 0
-        self.improvements = []
-        self.cost_history = []
+        self.global_history = global_history
     
-    def receive_reward(self, improvement_found, solution_cost):
-        """Process reward signal"""
-        self.reward_count += 1
-        self.cost_history.append(solution_cost)
+    def receive_reward(self, improvement_found, solution_cost, iter):
+        """Complete fast search record with after state and move result."""
+        global_iter = self.global_history.get('current_global_iter', 0)
+        self.global_history['current_global_iter'] = global_iter + 1
         
-        if improvement_found:
-            self.improvements.append({
-                'iteration': self.reward_count,
-                'cost': solution_cost
-            })
-            print(f"  [Reward {self.reward_count}] ✓ Improvement! cost={solution_cost:.2f}")
+        pending = self.global_history.get('pending_fast_search', {}).pop(global_iter, None)
+        if pending:
+            record = {
+                'local_search_id': pending['local_search_id'],
+                'global_iter': global_iter,
+                'sol_before': pending['sol_before'],
+                'sol_after': None,
+                'num_routes_before': pending.get('num_routes_before'),
+                'num_routes_after': None,
+                'cost_before': pending['cost_before'],
+                'cost_after': solution_cost,
+                'move_found': improvement_found,
+                'is_circle_found': False
+            }
         else:
-            print(f"  [Reward {self.reward_count}] ✗ No improvement, cost={solution_cost:.2f}")
+            assert False, "No pending record found"
+        self.global_history['history'].append(record)
 
 
-def generate_random_vrp(n_locations, n_vehicles, seed=42):
-    """Generate a random VRP problem"""
-    # np.random.seed(seed)
-    coords = np.random.rand(n_locations, 2) * 100
-    distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2)
+class TestLocalSearchStartCallback(LocalSearchStartCallback):
+    """Manages global iteration offset and local search ID."""
     
-    return {
-        'cost_matrix': cudf.DataFrame(distances),
-        'demand': cudf.Series(np.concatenate([[0], np.random.randint(5, 15, n_locations - 1)])),
-        'vehicle_capacity': cudf.Series([100] * n_vehicles),
-        'coordinates': coords
-    }
+    def __init__(self, global_history, customize_callback=None, reward_callback=None):
+        super().__init__()
+        self.global_history = global_history
+        self.customize_callback = customize_callback
+        self.reward_callback = reward_callback
+    
+    def on_local_search_start(self, solution_flat, num_routes, solution_cost, weights, selection_weights, should_all_nodes_be_served):
+        """Update global iter and increment local search ID."""
+        self.global_history['current_global_iter'] = self.global_history.get('current_global_iter', -1) + 1
+        self.global_history['current_local_search_id'] = self.global_history.get('current_local_search_id', -1) + 1
+        self.global_history['current_local_iter'] = -1
+        print(f"Global iter: {self.global_history['current_global_iter']}, Local search count: {self.global_history['current_local_search_id']}")
+        # print(f"Weights: {weights}")
+        # print(f"Selection weights: {selection_weights}")
+        # print(f"Should all nodes be served: {should_all_nodes_be_served}")
+        assert should_all_nodes_be_served, "All nodes should be served"
 
 
-def plot_cost_curve(solutions, filename='callback_cost_curve.png'):
-    """Plot cost evolution during optimization"""
-    costs = [s['cost'] for s in solutions]
-    plt.figure(figsize=(10, 6))
-    plt.plot(costs, marker='o', linestyle='-', linewidth=2, markersize=4)
-    plt.xlabel('Callback Iteration', fontsize=12)
-    plt.ylabel('Objective Value (Cost)', fontsize=12)
-    plt.title('Cost Evolution During Optimization', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
+class TestBeforeCycleFinderCallback(BeforeCycleFinderCallback):
+    """Stores before state for cycle finder."""
+    
+    def __init__(self, global_history):
+        super().__init__()
+        self.global_history = global_history
+    
+    def on_before_cycle_finder(self, solution_flat, num_routes, solution_cost, iter):
+        """Store before state for cycle finder."""
+        self.global_history['current_local_iter'] = self.global_history.get('current_local_iter', -1) + 1
+        local_search_id = self.global_history.get('current_local_search_id', 0)
+        global_iter = self.global_history.get('current_global_iter', 0)
+        self.global_history.setdefault('pending_cycle_finder', {})[global_iter] = {
+            'local_search_id': local_search_id,
+            'global_iter': global_iter,
+            'sol_before': solution_flat.copy(),
+            'num_routes_before': num_routes,
+            'cost_before': solution_cost,
+            'is_circle_found': True
+        }
+
+
+class TestAfterCycleFinderCallback(AfterCycleFinderCallback):
+    """Completes cycle finder record with after state."""
+    
+    def __init__(self, global_history):
+        super().__init__()
+        self.global_history = global_history
+    
+    def on_after_cycle_finder(self, solution_flat, num_routes, solution_cost, iter, improved):
+        """Complete cycle finder record with after state and improvement result."""
+        global_iter = self.global_history.get('current_global_iter', 0)
+        self.global_history['current_global_iter'] = global_iter + 1
+        
+        pending = self.global_history.get('pending_cycle_finder', {}).pop(global_iter, None)
+        if pending:
+            record = {
+                'local_search_id': pending['local_search_id'],
+                'global_iter': global_iter,
+                'sol_before': pending['sol_before'],
+                'sol_after': solution_flat.copy(),
+                'num_routes_before': pending.get('num_routes_before'),
+                'num_routes_after': num_routes,
+                'cost_before': pending['cost_before'],
+                'cost_after': solution_cost,
+                'move_found': improved,
+                'is_circle_found': True
+            }
+        else:
+            assert False, "No pending record found"
+        self.global_history['history'].append(record)
+
+def plot_cost_curve(global_history, filename='callback_cost_curve.png'):
+    """Plot cost evolution using records from global_history."""
+    history = global_history['history']
+    if not history:
+        print("No records to plot")
+        return
+    
+    # Separate by is_circle_found
+    all_search = [(r['global_iter'], r['cost_after']) for r in history if r['cost_after'] is not None]
+    cycle_finder = [(r['global_iter'], r['cost_after']) for r in history if r['is_circle_found'] and r['cost_after'] is not None]
+    
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Plot fast search trajectory
+    if all_search:
+        iters, costs = zip(*all_search)
+        ax.plot(iters, costs, marker='o', linestyle='-', linewidth=1.5, markersize=4,
+               color='#2E86AB', label='Fast Search', alpha=0.6, zorder=2)
+    
+    # Plot cycle finder points
+    if cycle_finder:
+        iters, costs = zip(*cycle_finder)
+        ax.scatter(iters, costs, marker='o', s=20, color='#F18F01',
+                  label='Cycle Finder', alpha=0.9, zorder=4, edgecolors='none')
+    
+    ax.set_xlabel('Global Iteration', fontsize=13, fontweight='bold')
+    ax.set_ylabel('Objective Value (Cost)', fontsize=13, fontweight='bold')
+    ax.set_title('Cost Evolution During Optimization', fontsize=15, fontweight='bold', pad=15)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(loc='best', fontsize=11, framealpha=0.9, shadow=True)
+    
     plt.tight_layout()
-    plt.savefig(filename, dpi=150)
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
     
+    # Statistics
+    all_costs = [r['cost_after'] for r in history if r['cost_after'] is not None]
     print(f"\nCost Statistics:")
-    print(f"  Initial: {costs[0]:.2f}")
-    print(f"  Best: {min(costs):.2f}")
-    print(f"  Improvement: {costs[0] - min(costs):.2f} ({(1 - min(costs)/costs[0])*100:.1f}%)")
+    print(f"  Initial: {all_costs[0]:.2f}")
+    print(f"  Best: {min(all_costs):.2f}")
+    print(f"  Improvement: {all_costs[0] - min(all_costs):.2f} ({(1 - min(all_costs)/all_costs[0])*100:.1f}%)")
+    print(f"  Total iterations: {len(history)}")
+    print(f"  All search: {len(all_search)}")
+    print(f"  Cycle finder: {len(cycle_finder)}")
     print(f"  Saved to: {filename}")
 
 
@@ -215,27 +297,63 @@ def compare_solutions(callback_sol, final_routes, final_cost, coords, filename='
 
 
 def test_callback():
+    """
+    Test routing callback functionality with global history tracking.
+    
+    Creates a shared global history dictionary that tracks:
+    - Local search session IDs
+    - Global and local iteration counts
+    - Event types (customize, reward, cycle_finder, etc.)
+    - Solution states at each iteration
+    - Whether cycle finder was used
+    
+    Returns:
+        list: Complete global history of all search events
+    """
     print("=" * 60)
     print("Testing Routing Callback")
     print("=" * 60)
     
-    # Setup problem
-    n_locations, n_vehicles = 20, 3
-    problem_data = generate_random_vrp(n_locations, n_vehicles)
+    # Initialize shared global history dictionary
+    # This dictionary is passed to all callbacks for coordinated state tracking
+    global_history = {
+        'history': [],
+        'current_local_search_id': -1,
+        'current_global_iter': -1,
+        'current_local_iter': -1
+    }
     
-    data_model = routing.DataModel(n_locations, n_vehicles)
-    data_model.add_cost_matrix(problem_data['cost_matrix'])
-    data_model.add_capacity_dimension("demand", problem_data['demand'], 
-                                      problem_data['vehicle_capacity'])
+    # Setup problem using Problem class
+    problem_gen = Problem(
+        n_locations=100,
+        n_vehicles=50,
+        seed=42,
+        coordinate_range=100.0,
+        capacity=100.0,
+        demand_range=(1, 10)
+    )
+    problem_data = problem_gen.generate()
+    data_model = problem_gen.create_data_model(problem_data)
     
-    # Setup callbacks
-    customize_callback = TestCustomizeNodesCallback()
-    reward_callback = TestRewardCallback()
+    # Setup callbacks with shared global_history
+    # Note: All callbacks receive the same global_history dictionary reference
+    customize_callback = TestCustomizeNodesCallback(global_history)
+    reward_callback = TestRewardCallback(global_history)
+    start_callback = TestLocalSearchStartCallback(
+        global_history, 
+        customize_callback,  # Pass references for offset management
+        reward_callback
+    )
+    before_callback = TestBeforeCycleFinderCallback(global_history)
+    after_callback = TestAfterCycleFinderCallback(global_history)
     
     solver_settings = routing.SolverSettings()
-    solver_settings.set_time_limit(10)
+    solver_settings.set_time_limit(1)
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
+    solver_settings.set_routing_callback(start_callback)
+    solver_settings.set_routing_callback(before_callback)
+    solver_settings.set_routing_callback(after_callback)
     
     # Note: callback uses policy.eval() mode by default, with sampling (not greedy)
     
@@ -248,48 +366,75 @@ def test_callback():
     print("RESULTS SUMMARY")
     print("=" * 60)
     print(f"Solution status: {solution.get_status()}")
-    print(f"Customize nodes calls: {customize_callback.call_count}")
-    print(f"Reward calls: {reward_callback.reward_count}")
-    print(f"Total improvements: {len(reward_callback.improvements)}")
+    
+    # Statistics from global history
+    history = global_history['history']
+    total_history_records = len(history)
+    local_search_count = global_history['current_local_search_id'] + 1
+    cycle_finder_count = sum(1 for r in history if r['is_circle_found'])
+    improvements = sum(1 for r in history if r['move_found'])
+    
+    print(f"Total local searches: {local_search_count}")
+    print(f"Total history records: {total_history_records}")
+    print(f"Cycle finder used: {cycle_finder_count} times")
+    print(f"Total improvements: {improvements}")
+    if history:
+        all_costs = [r['cost_after'] for r in history if r['cost_after'] is not None]
+        if all_costs:
+            best_cost = min(all_costs)
+            print(f"Best cost in history: {best_cost:.2f}")
     print("=" * 60)
     
-    # Detailed analysis
-    if customize_callback.observations:
-        plot_cost_curve(customize_callback.observations)
+    # Sample history output
+    print("\n" + "=" * 60)
+    print("SAMPLE HISTORY RECORDS (first 10)")
+    print("=" * 60)
+    for i, record in enumerate(history[:10]):
+        print(f"\nRecord {i}:")
+        print(f"  Local Search ID: {record['local_search_id']}")
+        print(f"  Global Iter: {record['global_iter']}")
+        print(f"  Cost Before: {record['cost_before']:.2f}" if record['cost_before'] else "  Cost Before: None")
+        print(f"  Cost After: {record['cost_after']:.2f}" if record['cost_after'] else "  Cost After: None")
+        print(f"  Move Found: {record['move_found']}")
+        print(f"  Cycle Finder: {record['is_circle_found']}")
+        if record['sol_after']:
+            flat_preview = record['sol_after'][:20] if len(record['sol_after']) > 20 else record['sol_after']
+            print(f"  Solution After (preview): {flat_preview}...")
+    
+    # Detailed analysis with enhanced visualization
+    if history:
+        plot_cost_curve(global_history)
         
-        best_obs = min(customize_callback.observations, key=lambda x: x['cost'])
-        
-        # Convert solution_flat to routes_2d for visualization
-        best_routes_2d = solution_flat_to_routes_2d(
-            best_obs['solution_flat'],
-            best_obs['num_routes'],
-            n_locations
-        )
+        best_record = min([r for r in history if r['cost_after'] is not None], key=lambda x: x['cost_after'])
         
         final_routes = parse_solution_to_routes(solution.get_route())
         final_cost = solution.get_total_objective()
         
-        print(f"\nCustomize Nodes Callback:")
-        print(f"  Best observed cost: {best_obs['cost']:.2f} (iteration {best_obs['iteration']})")
-        
-        print(f"\nReward Callback:")
-        print(f"  Total reward signals: {reward_callback.reward_count}")
-        print(f"  Positive rewards (improvements): {len(reward_callback.improvements)}")
-        if reward_callback.improvements:
-            best_improvement = min(imp['cost'] for imp in reward_callback.improvements)
-            print(f"  Best improvement cost: {best_improvement:.2f}")
+        print(f"\nBest Record from History:")
+        print(f"  Cost: {best_record['cost_after']:.2f} (global iter {best_record['global_iter']})")
+        print(f"  Move Found: {best_record['move_found']}")
+        print(f"  Cycle Finder: {best_record['is_circle_found']}")
         
         print(f"\nFinal Solution:")
         print(f"  Cost: {final_cost:.2f}")
-        print(f"  Gap from best observed: {abs(final_cost - best_obs['cost']):.2f}")
+        print(f"  Gap from best: {abs(final_cost - best_record['cost_after']):.2f}")
         
-        # Use converted routes_2d for visualization
-        compare_solutions(
-            {'routes': best_routes_2d, 'cost': best_obs['cost'], 'iteration': best_obs['iteration']},
-            final_routes, 
-            final_cost, 
-            problem_data['coordinates']
-        )
+        # Visualize best solution from history vs final solution
+        if best_record['sol_after'] and best_record['num_routes_after']:
+            best_routes_2d = solution_flat_to_routes_2d(
+                best_record['sol_after'],
+                best_record['num_routes_after'],
+                problem_gen.n_locations
+            )
+            compare_solutions(
+                {'routes': best_routes_2d, 'cost': best_record['cost_after'], 'iteration': best_record['global_iter']},
+                final_routes,
+                final_cost,
+                problem_data['coordinates']
+            )
+    
+    # Return complete global history for external analysis
+    return global_history['history']
 
 
 if __name__ == "__main__":

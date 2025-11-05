@@ -10,6 +10,120 @@ import tqdm
 from cuopt import routing
 from cuopt.routing import CustomizeNodesCallback, RewardCallback
 from transformer_policy import TransformerCandidatePolicy
+import matplotlib.pyplot as plt
+from scipy.stats import pearsonr
+
+class Problem:
+    """Unified problem generator for VRP instances"""
+    
+    def __init__(self, n_locations=100, n_vehicles=50, seed=42, 
+                 coordinate_range=100.0, capacity=50.0, 
+                 demand_range=(1, 10)):
+        """
+        Initialize problem generator
+        
+        Parameters
+        ----------
+        n_locations : int
+            Number of locations (including depot)
+        n_vehicles : int
+            Number of vehicles
+        seed : int
+            Random seed for reproducibility
+        coordinate_range : float
+            Maximum coordinate value (coordinates in [0, coordinate_range])
+        capacity : float
+            Vehicle capacity
+        demand_range : tuple
+            (min, max) demand range for customer nodes
+        """
+        self.n_locations = n_locations
+        self.n_vehicles = n_vehicles
+        self.seed = seed
+        self.coordinate_range = coordinate_range
+        self.capacity = capacity
+        self.demand_range = demand_range
+        self.rng = np.random.default_rng(seed)
+        self._problem_data = None
+    
+    def generate(self, seed=None):
+        """
+        Generate a new VRP problem instance
+        
+        Parameters
+        ----------
+        seed : int, optional
+            Override seed for this generation
+            
+        Returns
+        -------
+        dict
+            Problem data dictionary with keys:
+            - n_locations: int
+            - n_vehicles: int
+            - cost_matrix: cudf.DataFrame
+            - demand: cudf.Series
+            - vehicle_capacity: cudf.Series
+            - coordinates: numpy.ndarray
+            - problem_scale: float
+            - capacity_scale: float
+        """
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
+            np.random.seed(seed)
+        
+        n = self.n_locations
+        coords = self.rng.random((n, 2)) * self.coordinate_range
+        distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2)
+        demand = np.concatenate([[0], self.rng.integers(self.demand_range[0], 
+                                                         self.demand_range[1] + 1, 
+                                                         n - 1)])
+        vehicle_capacity = np.full(self.n_vehicles, self.capacity, dtype=np.int32)
+        
+        self._problem_data = {
+            'n_locations': n,
+            'n_vehicles': self.n_vehicles,
+            'cost_matrix': cudf.DataFrame(distances),
+            'demand': cudf.Series(demand),
+            'vehicle_capacity': cudf.Series(vehicle_capacity),
+            'coordinates': coords,
+            'problem_scale': self.coordinate_range,
+            'capacity_scale': self.capacity
+        }
+        
+        return self._problem_data
+    
+    def create_data_model(self, problem_data=None):
+        """
+        Create CuOpt DataModel from problem data
+        
+        Parameters
+        ----------
+        problem_data : dict, optional
+            Problem data (uses cached data if None)
+            
+        Returns
+        -------
+        routing.DataModel
+            Configured CuOpt DataModel
+        """
+        if problem_data is None:
+            if self._problem_data is None:
+                self.generate()
+            problem_data = self._problem_data
+        
+        dm = routing.DataModel(problem_data['n_locations'], 
+                              problem_data['n_vehicles'])
+        dm.add_cost_matrix(problem_data['cost_matrix'])
+        dm.add_capacity_dimension("demand", problem_data['demand'], 
+                                 problem_data['vehicle_capacity'])
+        return dm
+    
+    def get_problem_data(self):
+        """Get cached problem data"""
+        if self._problem_data is None:
+            self.generate()
+        return self._problem_data
 
 
 class CuOptCollector:
@@ -95,18 +209,25 @@ class CuOptCollector:
     
     def reset(self):
         """Generate new problem and prepare solver"""
-        self.problem_data = self._generate_problem()
+        # Use Problem class to generate problem
+        if not hasattr(self, '_problem_generator'):
+            self._problem_generator = Problem(
+                n_locations=self.n_locations,
+                n_vehicles=self.n_vehicles,
+                seed=42,
+                coordinate_range=100.0,
+                capacity=50.0,
+                demand_range=(1, 10)
+            )
+        
+        self.problem_data = self._problem_generator.generate()
         self.trajectory = {'best_cost': None, 'states': [], 'actions': [], 'rewards': [], 'logps': [], 'selected_sequences': [], 'step_improvements': []}
         
         # Reset performance tracking
         self.policy_sample_time = 0.0
         self.policy_call_count = 0
         
-        dm = routing.DataModel(self.problem_data['n_locations'], 
-                               self.problem_data['n_vehicles'])
-        dm.add_cost_matrix(self.problem_data['cost_matrix'])
-        dm.add_capacity_dimension("demand", self.problem_data['demand'], 
-                                 self.problem_data['vehicle_capacity'])
+        dm = self._problem_generator.create_data_model(self.problem_data)
         
         settings = routing.SolverSettings()
         settings.set_time_limit(self.time_limit)
@@ -119,29 +240,6 @@ class CuOptCollector:
     def run_solver(self, dm, settings):
         """Run solver and return collected trajectory"""
         self.solution = routing.Solve(dm, settings)
-    
-    def _generate_problem(self):
-        seed = 42
-        np.random.seed(seed)
-        self.rng = np.random.default_rng(seed)
-        """Generate random VRP (same as test_callback_minimal)"""
-        n = self.n_locations
-        coords = self.rng.random((n, 2)) * 100
-        # print(f"coords: {coords[:3]}")
-        distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2)
-        demand = np.concatenate([[0], self.rng.integers(1, 10, n - 1)])
-        vehicle_capacity = np.full(self.n_vehicles, 50, dtype=np.int32)
-        
-        return {
-            'n_locations': n,
-            'n_vehicles': self.n_vehicles,
-            'cost_matrix': cudf.DataFrame(distances),
-            'demand': cudf.Series(demand),
-            'vehicle_capacity': cudf.Series(vehicle_capacity),
-            'coordinates': coords,
-            'problem_scale': 100.0,  # Coordinate range [0, 100]
-            'capacity_scale': 50.0   # Max vehicle capacity
-        }
 
 
 class _CustomizeCallback(CustomizeNodesCallback):
@@ -155,13 +253,12 @@ class _CustomizeCallback(CustomizeNodesCallback):
                                   solution_cost, candidate_mask):
         # Compute number of candidates
         num_candidates = sum(candidate_mask)
-        sample_size = 40
-        # if num_candidates < 40:
-        #     sample_size = num_candidates
-        # elif num_candidates < 80:
-        #     sample_size = num_candidates // 2
-        # else:
-        #     sample_size = 40
+        if num_candidates < 40:
+            sample_size = num_candidates
+        elif num_candidates < 80:
+            sample_size = num_candidates // 2
+        else:
+            sample_size = 40
 
         # Record state
         state = {
@@ -242,10 +339,7 @@ class _RewardCallback(RewardCallback):
 def plot_reward_vs_cost(n_episodes=10, n_locations=100, n_vehicles=10, time_limit=5.0, use_policy=False, save_path='reward_vs_cost.png'):
     """
     Simple plot function: AVG reward vs Final cost + Step-level analysis
-    """
-    import matplotlib.pyplot as plt
-    from scipy.stats import pearsonr
-    
+    """    
     print("=" * 50)
     print(f"Testing Reward vs Cost ({n_episodes} episodes)")
     print("=" * 50)
@@ -340,7 +434,7 @@ if __name__ == "__main__":
                        help='Path to trained policy checkpoint (e.g., output/xxx/best_policy.pt)')
     parser.add_argument('--plot', action='store_true', help='Generate reward vs cost plot')
     parser.add_argument('--n_locations', type=int, default=100, help='Number of locations')
-    parser.add_argument('--n_vehicles', type=int, default=30, help='Number of vehicles')
+    parser.add_argument('--n_vehicles', type=int, default=50, help='Number of vehicles')
     parser.add_argument('--n_episodes', type=int, default=3, help='Number of episodes to run')
     parser.add_argument('--time_limit', type=float, default=10.0, help='Time limit per episode')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')

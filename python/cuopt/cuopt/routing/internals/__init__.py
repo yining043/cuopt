@@ -13,7 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cuopt.routing.internals.internals import CustomizeNodesCallback, RewardCallback
+from cuopt.routing.internals.internals import (
+    CustomizeNodesCallback,
+    RewardCallback,
+    LocalSearchStartCallback,
+    BeforeCycleFinderCallback,
+    AfterCycleFinderCallback
+)
 
-__all__ = ["CustomizeNodesCallback", "RewardCallback"]
+__all__ = [
+    "CustomizeNodesCallback",
+    "RewardCallback",
+    "LocalSearchStartCallback",
+    "BeforeCycleFinderCallback",
+    "AfterCycleFinderCallback"
+]
 

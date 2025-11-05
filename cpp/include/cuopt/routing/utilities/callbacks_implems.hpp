@@ -32,16 +32,18 @@ public:
         int num_routes,
         float solution_cost,
         const std::vector<int>* candidate_mask,
-        std::vector<int>* selection_mask_out
+        std::vector<int>* selection_mask_out,
+        int iter
     ) override {
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_customize_nodes_to_search",
-            "(KifK)",
+            "(KifKi)",
             reinterpret_cast<unsigned long long>(solution_flat),
             num_routes,
             solution_cost,
-            reinterpret_cast<unsigned long long>(candidate_mask)
+            reinterpret_cast<unsigned long long>(candidate_mask),
+            iter
         );
         
         if (result && PyList_Check(result)) {
@@ -66,14 +68,97 @@ class default_reward_callback_t : public reward_callback_t {
 public:
     void receive_reward(
         bool improvement_found,
-        float solution_cost
+        float solution_cost,
+        int iter
     ) override {
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_receive_reward",
-            "(if)",
+            "(ifi)",
             improvement_found ? 1 : 0,
-            solution_cost
+            solution_cost,
+            iter
+        );
+        
+        if (result) Py_DECREF(result);
+    }
+    
+    PyObject* pyCallbackClass;
+};
+
+// Default local search start callback implementation (bridges C++ to Python)
+class default_local_search_start_callback_t : public local_search_start_callback_t {
+public:
+    void on_local_search_start(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        double solution_cost,
+        const std::vector<double>* weights,
+        const std::vector<double>* selection_weights,
+        bool should_all_nodes_be_served
+    ) override {
+        PyObject* result = PyObject_CallMethod(
+            this->pyCallbackClass,
+            "_cpp_on_local_search_start",
+            "(KidKKi)",
+            reinterpret_cast<unsigned long long>(solution_flat),
+            num_routes,
+            solution_cost,
+            reinterpret_cast<unsigned long long>(weights),
+            reinterpret_cast<unsigned long long>(selection_weights),
+            should_all_nodes_be_served ? 1 : 0
+        );
+        
+        if (result) Py_DECREF(result);
+    }
+    
+    PyObject* pyCallbackClass;
+};
+
+// Default before cycle finder callback implementation (bridges C++ to Python)
+class default_before_cycle_finder_callback_t : public before_cycle_finder_callback_t {
+public:
+    void on_before_cycle_finder(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        float solution_cost,
+        int iter
+    ) override {
+        PyObject* result = PyObject_CallMethod(
+            this->pyCallbackClass,
+            "_cpp_on_before_cycle_finder",
+            "(Kifi)",
+            reinterpret_cast<unsigned long long>(solution_flat),
+            num_routes,
+            solution_cost,
+            iter
+        );
+        
+        if (result) Py_DECREF(result);
+    }
+    
+    PyObject* pyCallbackClass;
+};
+
+// Default after cycle finder callback implementation (bridges C++ to Python)
+class default_after_cycle_finder_callback_t : public after_cycle_finder_callback_t {
+public:
+    void on_after_cycle_finder(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        float solution_cost,
+        int iter,
+        bool improved
+    ) override {
+        PyObject* result = PyObject_CallMethod(
+            this->pyCallbackClass,
+            "_cpp_on_after_cycle_finder",
+            "(Kifii)",
+            reinterpret_cast<unsigned long long>(solution_flat),
+            num_routes,
+            solution_cost,
+            iter,
+            improved ? 1 : 0
         );
         
         if (result) Py_DECREF(result);

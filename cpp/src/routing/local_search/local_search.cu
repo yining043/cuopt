@@ -25,6 +25,7 @@
 
 #include <routing/utilities/cuopt_utils.cuh>
 #include <utilities/copy_helpers.hpp>
+#include <cuopt/routing/utilities/internals.hpp>
 
 #include <thrust/fill.h>
 #include <unordered_set>
@@ -149,7 +150,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_cross_search(solution_t<i_t, f_t, RE
 template <typename i_t, typename f_t, request_t REQUEST>
 template <request_t r_t, std::enable_if_t<r_t == request_t::PDP, bool>>
 bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t>& sol,
-                                                        bool full_set)
+                                                        bool full_set,
+                                                        int iter)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
 
@@ -189,9 +191,71 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
+template <request_t r_t>
+std::vector<i_t> 
+local_search_t<i_t, f_t, REQUEST>::build_solution_flat(solution_t<i_t, f_t, r_t>& sol) const
+{
+  size_t n_nodes = sol.get_num_orders();
+  i_t total_nodes = n_nodes + sol.n_routes * 4;
+  
+  // Copy data from GPU to CPU
+  std::vector<i_t> h_route_ids(n_nodes);
+  std::vector<i_t> h_intra_idx(n_nodes);
+  raft::copy(h_route_ids.data(), 
+            sol.route_node_map.route_id_per_node.data(), 
+            n_nodes, 
+            sol.sol_handle->get_stream());
+  raft::copy(h_intra_idx.data(), 
+            sol.route_node_map.intra_route_idx_per_node.data(), 
+            n_nodes, 
+            sol.sol_handle->get_stream());
+  
+  // Initialize solution_flat
+  std::vector<i_t> solution_flat;
+  solution_flat.reserve(total_nodes);
+  
+  // Initialize temporary route storage
+  std::vector<std::vector<i_t>> routes_temp(sol.n_routes);
+  std::vector<i_t> max_route_length(sol.n_routes, 0);
+  for (i_t r = 0; r < sol.n_routes; ++r) {
+    routes_temp[r].resize(n_nodes, -1);
+  }
+  
+  // Rebuild route structure from node mappings
+  sol.sol_handle->sync_stream();
+  for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
+    i_t route_id = h_route_ids[node_id];
+    i_t intra_idx = h_intra_idx[node_id];
+    if (route_id != -1) {
+      routes_temp[route_id][intra_idx] = node_id;
+      max_route_length[route_id] = std::max(max_route_length[route_id], intra_idx);
+    }
+  }
+  
+  // Build flattened solution: for each route, add 4 dummy depot nodes + real nodes
+  for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
+    // Add 4 dummy depot nodes
+    for (i_t batch = 0; batch < 4; ++batch) {
+      i_t dummy_id = n_nodes + route_id * 4 + batch;
+      solution_flat.push_back(dummy_id);
+    }
+    // Add real nodes (only iterate to actual max, skip position 0 depot)
+    for (i_t i = 1; i <= max_route_length[route_id]; ++i) {
+      i_t node_id = routes_temp[route_id][i];
+      if (node_id != -1) {
+        solution_flat.push_back(node_id);
+      }
+    }
+  }
+  
+  return solution_flat;
+}
+
+template <typename i_t, typename f_t, request_t REQUEST>
 template <request_t r_t, std::enable_if_t<r_t == request_t::VRP, bool>>
 bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t>& sol,
-                                                        bool full_set)
+                                                        bool full_set,
+                                                        int iter)
 {
   raft::common::nvtx::range fun_scope("run_fast_search");
 
@@ -211,21 +275,14 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     }
   }
   auto& h_nodes = nodes_to_search.h_nodes_to_search;
-  bool needs_customization = h_nodes.size() > 40;
+  bool needs_customization = h_nodes.size() > 0;
   if (!full_set && needs_customization && obs_callback) {
     // Prepare current solution for observation
     size_t n_nodes = sol.get_num_orders();
     i_t total_nodes = n_nodes + sol.n_routes * 4;
-    std::vector<i_t> h_route_ids(n_nodes);
-    std::vector<i_t> h_intra_idx(n_nodes);
-    raft::copy(h_route_ids.data(), 
-              sol.route_node_map.route_id_per_node.data(), 
-              n_nodes, 
-              sol.sol_handle->get_stream());
-    raft::copy(h_intra_idx.data(), 
-              sol.route_node_map.intra_route_idx_per_node.data(), 
-              n_nodes, 
-              sol.sol_handle->get_stream());
+
+    // Build solution_flat using extracted function
+    std::vector<i_t> solution_flat = build_solution_flat(sol);
 
     // Prepare nodes to search and candidate_mask
     std::vector<i_t> candidate_mask(total_nodes, 0);
@@ -237,39 +294,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       node_id_to_h_idx[node_id] = i;  // Store index in h_nodes
     }
 
-    // Build solution_flat
+    // Calculate objective for callback
     f_t objective = sol.get_cost(true, move_candidates.weights);
-    std::vector<i_t> solution_flat;
-    solution_flat.reserve(total_nodes);
-    std::vector<std::vector<i_t>> routes_temp(sol.n_routes);
-    std::vector<i_t> max_route_length(sol.n_routes, 0);
-    for (i_t r = 0; r < sol.n_routes; ++r) {
-      routes_temp[r].resize(n_nodes, -1);
-    }
-    // start building solution_flat
-    sol.sol_handle->sync_stream();
-    for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
-      i_t route_id = h_route_ids[node_id];
-      i_t intra_idx = h_intra_idx[node_id];
-      if (route_id != -1) {
-        routes_temp[route_id][intra_idx] = node_id;
-        max_route_length[route_id] = std::max(max_route_length[route_id], intra_idx);
-      }
-    }
-    for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
-      // Add 4 dummy depot nodes
-      for (i_t batch = 0; batch < 4; ++batch) {
-        i_t dummy_id = n_nodes + route_id * 4 + batch;
-        solution_flat.push_back(dummy_id);
-      }
-      // Add real nodes (only iterate to actual max, skip position 0 depot)
-      for (i_t i = 1; i <= max_route_length[route_id]; ++i) {
-        i_t node_id = routes_temp[route_id][i];
-        if (node_id != -1) {
-          solution_flat.push_back(node_id);
-        }
-      }
-    }
 
     // Callback: Get selection_mask from callback
     std::vector<i_t> selection_mask;
@@ -278,7 +304,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         sol.n_routes,
         objective,
         &candidate_mask,
-        &selection_mask
+        &selection_mask,
+        iter
     );
     if (selection_mask.size() != (size_t)total_nodes) { exit(1); }
     // Extract selected nodes from mask and build sampled lists (single pass)
@@ -365,7 +392,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       if (callback->get_type() == callbacks::callback_type_t::REWARD) {
         auto reward_callback = static_cast<callbacks::reward_callback_t*>(callback);
         f_t solution_cost = sol.get_cost(true, move_candidates.weights);
-        reward_callback->receive_reward(move_found, solution_cost);
+        reward_callback->receive_reward(move_found, solution_cost, iter);
         break;
       }
     }
@@ -402,6 +429,33 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
     consider_unserviced && !sol.problem_ptr->has_prize_collection();
   sol.global_runtime_checks(should_all_nodes_be_served, false, "run_best_local_search_begin");
   [[maybe_unused]] double cost_before = 0., cost_after = 0.;
+
+  // Local search start callback
+  callbacks::local_search_start_callback_t* local_search_start_callback = nullptr;
+  for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
+    if (callback->get_type() == callbacks::callback_type_t::LOCAL_SEARCH_START) {
+      local_search_start_callback = static_cast<callbacks::local_search_start_callback_t*>(callback);
+      break;
+    }
+  }
+  if (local_search_start_callback) {
+    std::vector<i_t> solution_flat = build_solution_flat(sol);
+    f_t cost = sol.get_cost(true, move_candidates.weights);
+    
+    // Convert weights to std::vector<double> for callback
+    std::vector<double> weights_vec = move_candidates.weights.to_vec();
+    std::vector<double> selection_weights_vec = move_candidates.selection_weights.to_vec();
+    
+    local_search_start_callback->on_local_search_start(
+      &solution_flat,
+      sol.n_routes,
+      cost,
+      &weights_vec,
+      &selection_weights_vec,
+      should_all_nodes_be_served
+    );
+  }
+
   while (iter < iter_limit) {
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
@@ -409,7 +463,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
     while (true) {
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
-      bool move_found = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2);
+      bool move_found = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, iter);
       // printf("move_found: %d\n", move_found);
       if (move_found) { continue; }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
@@ -418,6 +472,26 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       }
       if (!sol.problem_ptr->special_nodes.is_empty() && perform_break_moves(sol)) { continue; }
       break;
+    }
+
+    // Before cycle finder callback
+    callbacks::before_cycle_finder_callback_t* before_cycle_finder_callback = nullptr;
+    for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
+      if (callback->get_type() == callbacks::callback_type_t::BEFORE_CYCLE_FINDER) {
+        before_cycle_finder_callback = static_cast<callbacks::before_cycle_finder_callback_t*>(callback);
+        break;
+      }
+    }
+    if (before_cycle_finder_callback) {
+      std::vector<i_t> solution_flat = build_solution_flat(sol);
+      f_t cost = sol.get_cost(true, move_candidates.weights);
+      
+      before_cycle_finder_callback->on_before_cycle_finder(
+        &solution_flat,
+        sol.n_routes,
+        cost,
+        iter + 1
+      );
     }
 
     sol.global_runtime_checks(
@@ -456,6 +530,27 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
       cuopt_assert((cost_after - cost_before) - move_candidates.cycles.total_cycle_cost < 1.,
                    "Cost mismatch after a move");
       sol.sol_handle->sync_stream();
+    }
+
+    // After cycle finder callback
+    callbacks::after_cycle_finder_callback_t* after_cycle_finder_callback = nullptr;
+    for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
+      if (callback->get_type() == callbacks::callback_type_t::AFTER_CYCLE_FINDER) {
+        after_cycle_finder_callback = static_cast<callbacks::after_cycle_finder_callback_t*>(callback);
+        break;
+      }
+    }
+    if (after_cycle_finder_callback) {
+      std::vector<i_t> solution_flat = build_solution_flat(sol);
+      f_t cost = sol.get_cost(true, move_candidates.weights);
+      
+      after_cycle_finder_callback->on_after_cycle_finder(
+        &solution_flat,
+        sol.n_routes,
+        cost,
+        iter + 1,
+        improved
+      );
     }
 
     // If there is no improvement at all, break the local search loop

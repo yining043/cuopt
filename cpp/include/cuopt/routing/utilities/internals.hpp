@@ -32,7 +32,10 @@ public:
 // Callback type enumeration
 enum class callback_type_t {
     CUSTOMIZE_NODES,
-    REWARD
+    REWARD,
+    LOCAL_SEARCH_START,
+    BEFORE_CYCLE_FINDER,
+    AFTER_CYCLE_FINDER
 };
 
 // Base routing callback
@@ -57,7 +60,8 @@ public:
         int num_routes,
         float solution_cost,
         const std::vector<int>* candidate_mask,
-        std::vector<int>* selection_mask_out
+        std::vector<int>* selection_mask_out,
+        int iter
     ) = 0;
     
     callback_type_t get_type() const override {
@@ -74,11 +78,81 @@ public:
     // @param solution_cost      Current solution objective cost
     virtual void receive_reward(
         bool improvement_found,
-        float solution_cost
+        float solution_cost,
+        int iter
     ) = 0;
     
     callback_type_t get_type() const override {
         return callback_type_t::REWARD;
+    }
+};
+
+// Local search start callback - observes state before local search begins
+class local_search_start_callback_t : public base_routing_callback_t {
+public:
+    // Observe search state before local search begins
+    // 
+    // @param solution_flat              Current solution (flat array by route)
+    // @param num_routes                 Number of routes in current solution
+    // @param solution_cost              Current objective cost value
+    // @param weights                    Weights used for cost computation
+    // @param selection_weights          Weights used for move selection
+    // @param should_all_nodes_be_served Whether all nodes should be served
+    virtual void on_local_search_start(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        double solution_cost,
+        const std::vector<double>* weights,
+        const std::vector<double>* selection_weights,
+        bool should_all_nodes_be_served
+    ) = 0;
+    
+    callback_type_t get_type() const override {
+        return callback_type_t::LOCAL_SEARCH_START;
+    }
+};
+
+// Before cycle finder callback - observes state before cycle finder execution
+class before_cycle_finder_callback_t : public base_routing_callback_t {
+public:
+    // Observe search state before cycle finder execution
+    // 
+    // @param solution_flat  Current solution (flat array by route)
+    // @param num_routes     Number of routes in current solution
+    // @param solution_cost  Current objective cost value
+    // @param iter           Current iteration number
+    virtual void on_before_cycle_finder(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        float solution_cost,
+        int iter
+    ) = 0;
+    
+    callback_type_t get_type() const override {
+        return callback_type_t::BEFORE_CYCLE_FINDER;
+    }
+};
+
+// After cycle finder callback - observes state after cycle finder execution
+class after_cycle_finder_callback_t : public base_routing_callback_t {
+public:
+    // Observe search state after cycle finder execution
+    // 
+    // @param solution_flat  Current solution (flat array by route)
+    // @param num_routes     Number of routes in current solution
+    // @param solution_cost  Current objective cost value
+    // @param iter           Current iteration number
+    // @param improved       Whether improvement was found
+    virtual void on_after_cycle_finder(
+        const std::vector<int>* solution_flat,
+        int num_routes,
+        float solution_cost,
+        int iter,
+        bool improved
+    ) = 0;
+    
+    callback_type_t get_type() const override {
+        return callback_type_t::AFTER_CYCLE_FINDER;
     }
 };
 

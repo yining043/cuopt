@@ -190,9 +190,14 @@ class local_search_t {
   bool run_cross_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_inter_search(solution_t<i_t, f_t, REQUEST>& sol);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::PDP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set, int iter);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::VRP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set, int iter);
+
+  // Build flattened solution representation
+  // Copies route/node mapping data from GPU and constructs flattened solution
+  template <request_t r_t = REQUEST>
+  std::vector<i_t> build_solution_flat(solution_t<i_t, f_t, r_t>& sol) const;
 
   void reset_cross_vectors(solution_t<i_t, f_t, REQUEST>& solution);
 

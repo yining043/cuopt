@@ -23,4 +23,10 @@ from cuopt.routing.utils import (
 from cuopt.routing.utils_wrapper import DatasetDistribution
 from cuopt.routing.vehicle_routing import DataModel, Solve, SolverSettings
 from cuopt.routing.vehicle_routing_wrapper import ErrorStatus, Objective
-from cuopt.routing.internals import CustomizeNodesCallback, RewardCallback
+from cuopt.routing.internals import (
+    CustomizeNodesCallback,
+    RewardCallback,
+    LocalSearchStartCallback,
+    BeforeCycleFinderCallback,
+    AfterCycleFinderCallback
+)

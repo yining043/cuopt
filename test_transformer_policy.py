@@ -5,19 +5,28 @@ import numpy as np
 import torch
 import cudf
 from transformer_policy import TransformerCandidatePolicy
+from cuopt_collector import Problem
 
 
 def create_test_problem(n_locations=100, n_routes=10, seed=42):
-    """Create a single test problem (matches cuopt_collector format)"""
-    np.random.seed(seed)
+    """Create a single test problem using Problem class"""
     total_nodes = n_locations + n_routes * 4
     
-    # Match cuopt_collector.py format
-    demand = np.concatenate([[0], np.random.randint(1, 10, n_locations - 1)])
+    # Use Problem class to generate problem data
+    problem_gen = Problem(
+        n_locations=n_locations,
+        n_vehicles=n_routes,
+        seed=seed,
+        coordinate_range=100.0,
+        capacity=50.0,
+        demand_range=(1, 10)
+    )
+    problem_data_dict = problem_gen.generate()
     
+    # Extract data in format expected by test
     problem_data = {
-        'coordinates': np.random.rand(n_locations, 2) * 100,  # numpy array
-        'demand': cudf.Series(demand)  # cudf.Series (like cuopt_collector)
+        'coordinates': problem_data_dict['coordinates'],  # numpy array
+        'demand': problem_data_dict['demand']  # cudf.Series (like cuopt_collector)
     }
     
     # Create candidate_mask
