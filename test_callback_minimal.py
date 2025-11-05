@@ -31,12 +31,13 @@ class TestCustomizeNodesCallback(CustomizeNodesCallback):
     
     def customize_nodes_to_search(self, solution_flat, num_routes, solution_cost, candidate_mask, iter):
         """Store before state and implement adaptive node sampling."""
-        self.global_history['current_local_iter'] = self.global_history.get('current_local_iter', -1) + 1
-        local_search_id = self.global_history.get('current_local_search_id', 0)
-        global_iter = self.global_history.get('current_global_iter', 0)
-        self.global_history.setdefault('pending_fast_search', {})[global_iter] = {
+        local_iter = self.global_history['current_local_iter'] = self.global_history['current_local_iter'] + 1
+        global_iter = self.global_history['current_global_iter'] = self.global_history['current_global_iter'] + 1
+        local_search_id = self.global_history['current_local_search_id']
+        self.global_history['pending_state'] = {
             'local_search_id': local_search_id,
             'global_iter': global_iter,
+            'local_iter': local_iter,
             'sol_before': solution_flat.copy(),
             'num_routes_before': num_routes,
             'cost_before': solution_cost,
@@ -60,25 +61,25 @@ class TestRewardCallback(RewardCallback):
         super().__init__()
         self.global_history = global_history
     
-    def receive_reward(self, improvement_found, solution_cost, iter):
+    def receive_reward(self, improvement_found, solution_cost, iter, solution_flat, num_routes):
         """Complete fast search record with after state and move result."""
-        global_iter = self.global_history.get('current_global_iter', 0)
-        self.global_history['current_global_iter'] = global_iter + 1
-        
-        pending = self.global_history.get('pending_fast_search', {}).pop(global_iter, None)
+
+        pending = self.global_history.get('pending_state', None)
         if pending:
             record = {
                 'local_search_id': pending['local_search_id'],
-                'global_iter': global_iter,
+                'global_iter': pending['global_iter'],
+                'local_iter': pending['local_iter'],
                 'sol_before': pending['sol_before'],
-                'sol_after': None,
-                'num_routes_before': pending.get('num_routes_before'),
-                'num_routes_after': None,
+                'sol_after': solution_flat.copy(),
+                'num_routes_before': pending['num_routes_before'],
+                'num_routes_after': num_routes,
                 'cost_before': pending['cost_before'],
                 'cost_after': solution_cost,
                 'move_found': improvement_found,
                 'is_circle_found': False
             }
+            self.global_history['pending_state'] = None
         else:
             assert False, "No pending record found"
         self.global_history['history'].append(record)
@@ -95,7 +96,6 @@ class TestLocalSearchStartCallback(LocalSearchStartCallback):
     
     def on_local_search_start(self, solution_flat, num_routes, solution_cost, weights, selection_weights, should_all_nodes_be_served):
         """Update global iter and increment local search ID."""
-        self.global_history['current_global_iter'] = self.global_history.get('current_global_iter', -1) + 1
         self.global_history['current_local_search_id'] = self.global_history.get('current_local_search_id', -1) + 1
         self.global_history['current_local_iter'] = -1
         print(f"Global iter: {self.global_history['current_global_iter']}, Local search count: {self.global_history['current_local_search_id']}")
@@ -114,12 +114,13 @@ class TestBeforeCycleFinderCallback(BeforeCycleFinderCallback):
     
     def on_before_cycle_finder(self, solution_flat, num_routes, solution_cost, iter):
         """Store before state for cycle finder."""
-        self.global_history['current_local_iter'] = self.global_history.get('current_local_iter', -1) + 1
-        local_search_id = self.global_history.get('current_local_search_id', 0)
-        global_iter = self.global_history.get('current_global_iter', 0)
-        self.global_history.setdefault('pending_cycle_finder', {})[global_iter] = {
+        local_iter = self.global_history['current_local_iter'] = self.global_history['current_local_iter'] + 1
+        global_iter = self.global_history['current_global_iter'] = self.global_history['current_global_iter'] + 1
+        local_search_id = self.global_history['current_local_search_id']
+        self.global_history['pending_state'] = {
             'local_search_id': local_search_id,
             'global_iter': global_iter,
+            'local_iter': local_iter,
             'sol_before': solution_flat.copy(),
             'num_routes_before': num_routes,
             'cost_before': solution_cost,
@@ -136,23 +137,23 @@ class TestAfterCycleFinderCallback(AfterCycleFinderCallback):
     
     def on_after_cycle_finder(self, solution_flat, num_routes, solution_cost, iter, improved):
         """Complete cycle finder record with after state and improvement result."""
-        global_iter = self.global_history.get('current_global_iter', 0)
-        self.global_history['current_global_iter'] = global_iter + 1
-        
-        pending = self.global_history.get('pending_cycle_finder', {}).pop(global_iter, None)
+
+        pending = self.global_history.get('pending_state', None)
         if pending:
             record = {
                 'local_search_id': pending['local_search_id'],
-                'global_iter': global_iter,
+                'global_iter': pending['global_iter'],
+                'local_iter': pending['local_iter'],
                 'sol_before': pending['sol_before'],
                 'sol_after': solution_flat.copy(),
-                'num_routes_before': pending.get('num_routes_before'),
+                'num_routes_before': pending['num_routes_before'],
                 'num_routes_after': num_routes,
                 'cost_before': pending['cost_before'],
                 'cost_after': solution_cost,
                 'move_found': improved,
                 'is_circle_found': True
             }
+            self.global_history['pending_state'] = None
         else:
             assert False, "No pending record found"
         self.global_history['history'].append(record)
@@ -393,6 +394,7 @@ def test_callback():
         print(f"\nRecord {i}:")
         print(f"  Local Search ID: {record['local_search_id']}")
         print(f"  Global Iter: {record['global_iter']}")
+        print(f"  Local Iter: {record['local_iter']}")
         print(f"  Cost Before: {record['cost_before']:.2f}" if record['cost_before'] else "  Cost Before: None")
         print(f"  Cost After: {record['cost_after']:.2f}" if record['cost_after'] else "  Cost After: None")
         print(f"  Move Found: {record['move_found']}")
@@ -411,7 +413,7 @@ def test_callback():
         final_cost = solution.get_total_objective()
         
         print(f"\nBest Record from History:")
-        print(f"  Cost: {best_record['cost_after']:.2f} (global iter {best_record['global_iter']})")
+        print(f"  Cost: {best_record['cost_after']:.2f} (global iter {best_record['global_iter']}, local iter {best_record['local_iter']})")
         print(f"  Move Found: {best_record['move_found']}")
         print(f"  Cycle Finder: {best_record['is_circle_found']}")
         
@@ -432,7 +434,7 @@ def test_callback():
                 final_cost,
                 problem_data['coordinates']
             )
-    
+    import pdb; pdb.set_trace()
     # Return complete global history for external analysis
     return global_history['history']
 

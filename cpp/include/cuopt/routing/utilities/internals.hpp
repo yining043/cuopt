@@ -76,10 +76,15 @@ public:
     // 
     // @param improvement_found  Whether an improving move was discovered
     // @param solution_cost      Current solution objective cost
+    // @param iter               Local iteration counter within current local search
+    // @param solution_flat      Current solution as flat array organized by route
+    // @param num_routes         Number of routes in current solution
     virtual void receive_reward(
         bool improvement_found,
         float solution_cost,
-        int iter
+        int iter,
+        const std::vector<int>* solution_flat,
+        int num_routes
     ) = 0;
     
     callback_type_t get_type() const override {

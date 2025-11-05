@@ -69,15 +69,19 @@ public:
     void receive_reward(
         bool improvement_found,
         float solution_cost,
-        int iter
+        int iter,
+        const std::vector<int>* solution_flat,
+        int num_routes
     ) override {
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_receive_reward",
-            "(ifi)",
+            "(ifiKi)",
             improvement_found ? 1 : 0,
             solution_cost,
-            iter
+            iter,
+            reinterpret_cast<unsigned long long>(solution_flat),
+            num_routes
         );
         
         if (result) Py_DECREF(result);

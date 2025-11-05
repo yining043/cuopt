@@ -283,6 +283,8 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 
     // Build solution_flat using extracted function
     std::vector<i_t> solution_flat = build_solution_flat(sol);
+    // Calculate objective for callback
+    f_t objective = sol.get_cost(true, move_candidates.weights);
 
     // Prepare nodes to search and candidate_mask
     std::vector<i_t> candidate_mask(total_nodes, 0);
@@ -293,9 +295,6 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       candidate_mask[node_id] = 1;
       node_id_to_h_idx[node_id] = i;  // Store index in h_nodes
     }
-
-    // Calculate objective for callback
-    f_t objective = sol.get_cost(true, move_candidates.weights);
 
     // Callback: Get selection_mask from callback
     std::vector<i_t> selection_mask;
@@ -392,7 +391,9 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
       if (callback->get_type() == callbacks::callback_type_t::REWARD) {
         auto reward_callback = static_cast<callbacks::reward_callback_t*>(callback);
         f_t solution_cost = sol.get_cost(true, move_candidates.weights);
-        reward_callback->receive_reward(move_found, solution_cost, iter);
+        // Build solution_flat for reward callback
+        std::vector<i_t> solution_flat = build_solution_flat(sol);
+        reward_callback->receive_reward(move_found, solution_cost, iter, &solution_flat, sol.n_routes);
         break;
       }
     }
