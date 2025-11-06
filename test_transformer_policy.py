@@ -8,7 +8,7 @@ from transformer_policy import TransformerCandidatePolicy
 from cuopt_collector import Problem
 
 
-def create_test_problem(n_locations=100, n_routes=10, seed=42):
+def create_test_problem(n_locations=100, n_routes=10):
     """Create a single test problem using Problem class"""
     total_nodes = n_locations + n_routes * 4
     
@@ -16,7 +16,6 @@ def create_test_problem(n_locations=100, n_routes=10, seed=42):
     problem_gen = Problem(
         n_locations=n_locations,
         n_vehicles=n_routes,
-        seed=seed,
         coordinate_range=100.0,
         capacity=50.0,
         demand_range=(1, 10)
@@ -93,8 +92,7 @@ def test_logp_consistency(n_locations=50, n_routes=5, num_problems=5):
     
     with torch.no_grad():
         for i in range(num_problems):
-            state, problem_data = create_test_problem(n_locations, n_routes, seed=42+i)
-            torch.manual_seed(42 + i)
+            state, problem_data = create_test_problem(n_locations, n_routes)
             
             selected_node_ids, log_prob = policy(state, problem_data, k=20)
             

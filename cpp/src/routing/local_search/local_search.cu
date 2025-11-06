@@ -413,6 +413,9 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
                                                               const bool time_limit_enabled,
                                                               const bool run_cycle_finder)
 {
+  if (!consider_unserviced) {
+    return;
+  }
   // Handle a corner case when there is no single task that is feasible
   if (sol.n_routes == 0) { return; }
   // for production use working weights
@@ -427,7 +430,7 @@ void local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_
 
   i_t iter = 0;
   sol.sol_handle->sync_stream();
-  sol.compute_cost();
+  sol.compute_cost(); 
   const i_t iter_limit = max_iterations;
   const bool should_all_nodes_be_served =
     consider_unserviced && !sol.problem_ptr->has_prize_collection();

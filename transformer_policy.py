@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+import math
 
 # ============================================================================
 # Feature Embedding
@@ -223,88 +223,19 @@ class AutoregressiveDecoder(nn.Module):
         
         selected_indices = torch.stack(selected_indices, dim=1)
         log_probs_stacked = torch.stack(log_probs, dim=1)
-        log_probs_total = log_probs_stacked.mean(dim=1)
+        log_probs_total = log_probs_stacked.sum(dim=1) / k_batch.float()
         if return_entropy:
             entropies_stacked = torch.stack(entropies, dim=1)
             return selected_indices, log_probs_total, entropies_stacked
         
         return selected_indices, log_probs_total
-
-
-# ============================================================================
-# Heatmap Decoder
-# ============================================================================
-
-class HeatmapDecoder(nn.Module):
-    def __init__(self, d_model, num_heads=None):
-        super().__init__()
-        self.score_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, 1)
-        )
-    
-    def forward(self, candidate_embeddings, candidate_mask, k_batch, temperature=1.0, return_entropy=False, given_sequence=None):
-        """
-        Args:
-            candidate_embeddings: [batch, max_nodes, d_model]
-            candidate_mask: [batch, max_nodes]
-            k_batch: [batch] or int - number to select per batch
-            temperature: sampling temperature
-            return_sequence: return full logits
-            given_sequence: [batch, max_k] for teacher forcing
-        
-        Returns:
-            selected_indices: [batch, max_k]
-            log_probs: [batch]
-            all_logits: [batch, max_k, max_nodes] if return_sequence
-        """
-        
-        batch_size, max_nodes = candidate_embeddings.shape[:2]
-        device = candidate_embeddings.device
-        max_k = k_batch.max().item()
-        
-        logits = self.score_mlp(candidate_embeddings).squeeze(-1) / temperature
-        logits = logits.masked_fill(candidate_mask == 0, -1e20)
-        probs = F.softmax(logits, dim=-1)
-        
-        selected_indices = []
-        log_probs = []
-        entropies = [] if return_entropy else None
-        
-        for b_idx in range(batch_size):
-            k = k_batch[b_idx].item()
-            dist = torch.distributions.Categorical(probs[b_idx])
-            
-            if given_sequence is not None:
-                selected = given_sequence[b_idx]
-            else:
-                selected = torch.multinomial(probs[b_idx], k, replacement=False)
-            
-            log_prob = dist.log_prob(selected).sum()
-            
-            selected_indices.append(selected)
-            log_probs.append(log_prob)
-            if return_entropy:
-                entropies.append(-(probs[b_idx] * torch.log(probs[b_idx] + 1e-10)).sum())
-        
-        selected_indices = torch.stack(selected_indices, dim=0)
-        log_probs = torch.stack(log_probs, dim=0)
-        
-        if return_entropy:
-            entropies = torch.stack(entropies, dim=0).unsqueeze(1).expand(-1, max_k)
-            return selected_indices, log_probs, entropies
-        
-        return selected_indices, log_probs
-
-
 # ============================================================================
 # Complete Policy Network
 # ============================================================================
 
 class TransformerCandidatePolicy(nn.Module):
     def __init__(self, 
-                 d_model=128,
+                 d_model=64,
                  num_heads=8,
                  num_encoder_layers=3,
                  max_vehicles=20,
@@ -322,10 +253,19 @@ class TransformerCandidatePolicy(nn.Module):
         
         self.feature_embed = NodeFeatureEmbedding(d_model, problem_scale, capacity_scale)
         self.encoder = SolutionEncoder(d_model, num_heads, num_encoder_layers)
-        self.decoder = HeatmapDecoder(d_model, num_heads)
+        self.decoder = AutoregressiveDecoder(d_model, num_heads)
         self.positional_encoding = self._create_positional_encoding(self.max_length, d_model).to(self.device)
         
         self.to(self.device)
+
+        self.init_parameters()
+        
+    def init_parameters(self):
+
+        for param in self.parameters():
+            stdv = 1. / math.sqrt(param.size(-1))
+            param.data.uniform_(-stdv, stdv)
+
     
     def _create_positional_encoding(self, max_len, d_model):
         """Standard sinusoidal positional encoding"""

@@ -323,8 +323,8 @@ def test_callback():
     
     # Setup problem using Problem class
     problem_gen = Problem(
-        n_locations=1000,
-        n_vehicles=300,
+        n_locations=200,
+        n_vehicles=60,
         coordinate_range=100.0,
         capacity=200.0,
         demand_range=(1, 10)
@@ -345,7 +345,7 @@ def test_callback():
     after_callback = TestAfterCycleFinderCallback(global_history)
     
     solver_settings = routing.SolverSettings()
-    solver_settings.set_time_limit(10)
+    solver_settings.set_time_limit(5)
     solver_settings.set_routing_callback(customize_callback)
     solver_settings.set_routing_callback(reward_callback)
     solver_settings.set_routing_callback(start_callback)

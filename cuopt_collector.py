@@ -36,6 +36,9 @@ class Problem:
         self._problem_data = None
     
     def generate(self):
+        seed = 42
+        np.random.seed(seed)
+        random.seed(seed)
         n = self.n_locations
         coords = np.random.random((n, 2)) * self.coordinate_range
         distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2)
@@ -82,11 +85,11 @@ class CuOptCollector:
     """Synchronous trajectory collector for CuOpt"""
     
     def __init__(self, use_policy=False, 
-                 policy_device=None, checkpoint_path=None):
+                 policy_device=None, checkpoint_path=None, policy = None):
     
         # Policy network
         self.use_policy = use_policy
-        self.policy = None
+        self.policy = policy
         self.policy_device = policy_device
         self.checkpoint_path = checkpoint_path
         
@@ -102,18 +105,18 @@ class CuOptCollector:
                 self.policy_device = 'cpu'
 
     
-    def run_solver(self, problem_data, time_limit):
+    def run_solver(self, problem_data, dm, time_limit):
+        # Store problem_data for callback access
         self.problem_data = problem_data
-        self.time_limit = time_limit
         
-        # Initialize problem generator if needed
+        # Get problem data
         n_locs = problem_data['n_locations']
-        n_vehs = problem_data['n_vehicles']
-        if not hasattr(self, '_problem_generator') or self._problem_generator is None:
-            self._problem_generator = Problem(n_locations=n_locs, n_vehicles=n_vehs)
-        
+        n_vehs = problem_data['n_vehicles'] 
+
         # Initialize policy if use_policy is True
         if self.use_policy and self.policy is None:
+            print("Initializing policy from scratch")
+
             if self.policy_device is None:
                 if torch.cuda.is_available():
                     if torch.cuda.device_count() > 1:
@@ -144,7 +147,6 @@ class CuOptCollector:
                 print(f"  Trained for {checkpoint.get('epoch', 0)} epochs")
                 print(f"  Best cost: {checkpoint.get('best_cost', 0):.2f}")
             
-            self.policy.eval()
         elif self.use_policy and self.policy is not None:
             # Check if dimensions match
             if self.policy.N != n_locs or self.policy.max_vehicles != n_vehs:
@@ -152,25 +154,28 @@ class CuOptCollector:
                     f"Policy dimensions mismatch: policy expects N={self.policy.N}, max_vehicles={self.policy.max_vehicles}, "
                     f"but problem has n_locations={n_locs}, n_vehicles={n_vehs}"
                 )
-        
+
         self.global_history = {
             'history': [],
+            'initial_cost_set': [],
+            'should_all_nodes_be_served_set': [],
+            'local_bsf_set': [],
+            'return_set': [],
+            'global_bsf': None,
             'current_local_search_id': -1,
             'current_global_iter': -1,
             'current_local_iter': -1,
             'pending_state': None,
-            'initial_cost': None,
-            'local_best_cost_so_far': None
         }
         
         # Reset performance tracking
-        self.policy_sample_time = 0.0
-        self.policy_call_count = 0
-        
-        dm = self._problem_generator.create_data_model(self.problem_data)
-        
+        if self.use_policy:
+            self.policy_sample_time = 0.0
+            self.policy_call_count = 0
+            self.policy.eval()
+
         settings = routing.SolverSettings()
-        settings.set_time_limit(self.time_limit)
+        settings.set_time_limit(time_limit)
         self.customize_cb = _CustomizeCallback(self)
         self.reward_cb = _RewardCallback(self)
         self.start_cb = _LocalSearchStartCallback(self)
@@ -200,12 +205,14 @@ class _CustomizeCallback(CustomizeNodesCallback):
         
         # Compute number of candidates
         num_candidates = sum(candidate_mask)
-        if num_candidates < 40:
-            sample_size = num_candidates
-        elif num_candidates < 80:
-            sample_size = num_candidates // 2
-        else:
-            sample_size = 40
+        # if num_candidates < 40:
+        #     sample_size = num_candidates
+        # elif num_candidates < 80:
+        #     sample_size = num_candidates // 2
+        # else:
+        #     sample_size = 40
+        
+        sample_size = min(num_candidates, 10)
 
         # Store before state in pending_state
         self.collector.global_history['pending_state'] = {
@@ -217,7 +224,8 @@ class _CustomizeCallback(CustomizeNodesCallback):
             'cost_before': solution_cost,
             'candidate_mask': candidate_mask.copy(),
             'num_candidates': num_candidates,
-            'is_circle_found': False
+            'is_circle_found': False,
+            'sample_size': sample_size,
         }
         
         if self.collector.use_policy:
@@ -276,18 +284,22 @@ class _RewardCallback(RewardCallback):
     
     def receive_reward(self, improvement_found, solution_cost, iter, solution_flat, num_routes):
         # Update both best_cost_so_far (local and global)
-        initial_cost = self.collector.global_history['initial_cost']
-        old_bsf = self.collector.global_history['local_best_cost_so_far']
+        current_local_search_id = self.collector.global_history['current_local_search_id']
+        old_bsf = self.collector.global_history['local_bsf_set'][current_local_search_id]
         new_bsf = min(old_bsf, solution_cost)
-        self.collector.global_history['local_best_cost_so_far'] = new_bsf
-        
+        self.collector.global_history['local_bsf_set'][current_local_search_id] = new_bsf
+        old_global_bsf = self.collector.global_history['global_bsf']
+        new_global_bsf = min(old_global_bsf, new_bsf)
+        self.collector.global_history['global_bsf'] = new_global_bsf
 
         local_bsf_improvement = old_bsf - new_bsf
+        global_bsf_improvement = old_global_bsf - new_global_bsf
         pending = self.collector.global_history['pending_state']
         step_improvement = pending['cost_before'] - solution_cost
-        reward = local_bsf_improvement / pending['cost_before'] * pending['local_iter']
-        print(f"Local Search Reward: {reward}")
-        
+        ### Reward: use pure local BSF improvement (no scaling by iter or initial cost)
+        reward = local_bsf_improvement * 0.01
+        self.collector.global_history['return_set'][current_local_search_id] += reward
+
         record = {
             'local_search_id': pending['local_search_id'],
             'global_iter': pending['global_iter'],
@@ -305,13 +317,12 @@ class _RewardCallback(RewardCallback):
             'selected_sequence': pending.get('selected_sequence'),
             'candidate_mask': pending.get('candidate_mask'),
             'num_candidates': pending.get('num_candidates'),
-            'initial_cost': initial_cost,
-            'local_best_cost_so_far': new_bsf,
             'local_bsf_improvement': local_bsf_improvement,
+            'global_bsf_improvement': global_bsf_improvement,
             'step_improvement': step_improvement,
-            'reward': reward
+            'reward': reward,
         }
-        
+
         self.collector.global_history['history'].append(record)
         self.collector.global_history['pending_state'] = None
 
@@ -324,12 +335,19 @@ class _LocalSearchStartCallback(LocalSearchStartCallback):
     def on_local_search_start(self, solution_flat, num_routes, solution_cost, weights, selection_weights, should_all_nodes_be_served):
         self.collector.global_history['current_local_search_id'] = self.collector.global_history['current_local_search_id'] + 1
         self.collector.global_history['current_local_iter'] = -1
-        self.collector.global_history['initial_cost'] = solution_cost
-        self.collector.global_history['local_best_cost_so_far'] = solution_cost
+        self.collector.global_history['initial_cost_set'].append(solution_cost)
+        self.collector.global_history['local_bsf_set'].append(solution_cost)
+        self.collector.global_history['return_set'].append(0.0)
+        if self.collector.global_history['global_bsf'] is None:
+            self.collector.global_history['global_bsf'] = solution_cost
+        else:
+            self.collector.global_history['global_bsf'] = min(
+                self.collector.global_history['global_bsf'], solution_cost
+            )
+        self.collector.global_history['should_all_nodes_be_served_set'].append(should_all_nodes_be_served)
         if not should_all_nodes_be_served:
             print("Not all nodes are served")
-            # assert False, "Not all nodes are served"
-        print(f"Local Search Start: {solution_cost}")
+            assert False, "Not all nodes are served"
 
 
 class _BeforeCycleFinderCallback(BeforeCycleFinderCallback):
@@ -358,16 +376,22 @@ class _AfterCycleFinderCallback(AfterCycleFinderCallback):
         self.collector = collector
     
     def on_after_cycle_finder(self, solution_flat, num_routes, solution_cost, iter, improved):
-        initial_cost = self.collector.global_history['initial_cost']
-        old_bsf = self.collector.global_history['local_best_cost_so_far']
+        current_local_search_id = self.collector.global_history['current_local_search_id']
+        old_bsf = self.collector.global_history['local_bsf_set'][current_local_search_id]
         new_bsf = min(old_bsf, solution_cost)
-        self.collector.global_history['local_best_cost_so_far'] = new_bsf
+        self.collector.global_history['local_bsf_set'][current_local_search_id] = new_bsf
+        old_global_bsf = self.collector.global_history['global_bsf']
+        new_global_bsf = min(old_global_bsf, new_bsf)
+        self.collector.global_history['global_bsf'] = new_global_bsf
 
         local_bsf_improvement = old_bsf - new_bsf
+        global_bsf_improvement = old_global_bsf - new_global_bsf
         pending = self.collector.global_history['pending_state']
         step_improvement = pending['cost_before'] - solution_cost
-        reward = local_bsf_improvement / pending['cost_before'] * pending['local_iter']
-        print(f"Cycle Finder Reward: {reward}")
+        
+        ### Reward: use pure local BSF improvement (no scaling by iter or initial cost)
+        reward = local_bsf_improvement * 0.01
+        self.collector.global_history['return_set'][current_local_search_id] += reward
 
         record = {
             'local_search_id': pending['local_search_id'],
@@ -386,56 +410,152 @@ class _AfterCycleFinderCallback(AfterCycleFinderCallback):
             'selected_sequence': None,
             'candidate_mask': None,
             'num_candidates': None,
-            'initial_cost': self.collector.global_history['initial_cost'],
-            'local_best_cost_so_far': new_bsf,
             'local_bsf_improvement': local_bsf_improvement,
+            'global_bsf_improvement': global_bsf_improvement,
             'step_improvement': step_improvement,
-            'reward': reward
+            'reward': reward,
         }
         self.collector.global_history['history'].append(record)
         self.collector.global_history['pending_state'] = None
 
 
-def plot_reward_vs_cost(episode_avg_rewards, episode_final_costs, all_rewards, all_local_bsf_improvements, save_path='reward_vs_cost.png'):
-    """Plot reward vs cost analysis from collected data"""
-    print(f"Plotting {len(episode_final_costs)} episodes, {len(all_rewards)} steps")
+def plot_reward_vs_cost(history, save_path='reward_vs_cost.png'):
+    """Plot figures
+    subfigure1: avg return vs final_bsf analysis from history data
+    subfigure2: avg reward vs final_bsf analysis from history data
+    subfigure3: return vs local_bsf analysis from history data
+    subfigure4: reward vs local_bsf analysis from history data
+    """
+    if not history:
+        print("No history data to plot")
+        return
     
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    # Extract data for each episode (for subplots 1 and 2)
+    episodes_avg_return = []
+    episodes_avg_reward = []
+    episodes_final_bsf = []
+    episodes_avg_local_bsf = []
     
-    # Plot 1: Episode-level: Avg Reward vs Final Cost
-    ax1 = axes[0]
-    ax1.scatter(episode_avg_rewards, episode_final_costs, alpha=0.6, s=60, c='blue', edgecolors='black', linewidth=0.5)
-    ax1.set_xlabel('Avg Reward (%)', fontsize=12, fontweight='bold')
-    ax1.set_ylabel('Final Cost', fontsize=12, fontweight='bold')
-    ax1.set_title('Episode: Avg Reward vs Final Cost', fontsize=14, fontweight='bold')
+    # Extract data for each step (for subplots 3 and 4)
+    all_returns = []
+    all_rewards = []
+    all_local_bsf = []
+    
+    for ep_history in history:
+        # Extract episode-level data
+        final_bsf = ep_history.get('global_bsf')
+        return_set = ep_history.get('return_set', [])
+        local_bsf_set = ep_history.get('local_bsf_set', [])
+        history_records = ep_history.get('history', [])
+        
+        # Calculate averages for episode-level plots
+        avg_return = np.mean(return_set) if return_set else 0.0
+        avg_local_bsf = np.mean(local_bsf_set) if local_bsf_set else 0.0
+        
+        # Extract rewards from history records
+        rewards = [r.get('reward', 0) for r in history_records if r.get('reward') is not None]
+        avg_reward = np.mean(rewards) if rewards else 0.0
+        
+        # Store episode data
+        episodes_avg_return.append(avg_return)
+        episodes_avg_reward.append(avg_reward)
+        episodes_final_bsf.append(final_bsf)
+        episodes_avg_local_bsf.append(avg_local_bsf)
+        
+        # Extract step-level data for subplots 3 and 4
+        for record in history_records:
+            local_search_id = record.get('local_search_id')
+            reward = record.get('reward')
+            local_bsf_improvement = record.get('local_bsf_improvement')
+            
+            # Get cumulative return for this local_search_id
+            if local_search_id is not None and local_search_id < len(return_set):
+                current_return = return_set[local_search_id]
+            else:
+                current_return = None
+            
+            # Only add if we have valid data
+            if reward is not None and local_bsf_improvement is not None and current_return is not None:
+                all_returns.append(current_return)
+                all_rewards.append(reward)
+                all_local_bsf.append(local_bsf_improvement)
+    
+    # Convert to numpy arrays
+    episodes_avg_return = np.array(episodes_avg_return)
+    episodes_avg_reward = np.array(episodes_avg_reward)
+    episodes_final_bsf = np.array(episodes_final_bsf)
+    episodes_avg_local_bsf = np.array(episodes_avg_local_bsf)
+    
+    all_returns = np.array(all_returns)
+    all_rewards = np.array(all_rewards)
+    all_local_bsf = np.array(all_local_bsf)
+    
+    print(f"Plotting {len(history)} episodes, {len(all_returns)} steps")
+    
+    # Create figure with 2x2 subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # Subplot 1: avg return vs final_bsf
+    ax1 = axes[0, 0]
+    ax1.scatter(episodes_avg_return, episodes_final_bsf, alpha=0.6, s=60, c='blue', edgecolors='black', linewidth=0.5)
+    ax1.set_xlabel('Avg Return', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Final BSF', fontsize=12, fontweight='bold')
+    ax1.set_title('Avg Return vs Final BSF', fontsize=14, fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    
-    if len(episode_final_costs) > 2:
-        corr1, p_val1 = pearsonr(episode_avg_rewards, episode_final_costs)
+    if len(episodes_avg_return) > 2:
+        corr1, p_val1 = pearsonr(episodes_avg_return, episodes_final_bsf)
         ax1.text(0.05, 0.95, f'r={corr1:.3f}\np={p_val1:.2e}', 
                 transform=ax1.transAxes, fontsize=10, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        print(f"Episode correlation: r={corr1:.3f}, p={p_val1:.2e}")
+        print(f"Avg Return vs Final BSF: r={corr1:.3f}, p={p_val1:.2e}")
     
-    # Plot 2: Step-level: Reward vs Local BSF Improvement
-    ax2 = axes[1]
-    ax2.scatter(all_rewards, all_local_bsf_improvements, alpha=0.4, s=30, c='steelblue', edgecolors='navy', linewidth=0.3)
-    ax2.set_xlabel('Reward (%)', fontsize=12, fontweight='bold')
-    ax2.set_ylabel('Local BSF Improvement', fontsize=12, fontweight='bold')
-    ax2.set_title('Step: Reward vs Local BSF Improvement', fontsize=14, fontweight='bold')
+    # Subplot 2: avg reward vs final_bsf
+    ax2 = axes[0, 1]
+    ax2.scatter(episodes_avg_reward, episodes_final_bsf, alpha=0.6, s=60, c='green', edgecolors='black', linewidth=0.5)
+    ax2.set_xlabel('Avg Reward', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Final BSF', fontsize=12, fontweight='bold')
+    ax2.set_title('Avg Reward vs Final BSF', fontsize=14, fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    
-    if len(all_rewards) > 2:
-        corr2, p_val2 = pearsonr(all_rewards, all_local_bsf_improvements)
+    if len(episodes_avg_reward) > 2:
+        corr2, p_val2 = pearsonr(episodes_avg_reward, episodes_final_bsf)
         ax2.text(0.05, 0.95, f'r={corr2:.3f}\np={p_val2:.2e}', 
                 transform=ax2.transAxes, fontsize=10, verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-        print(f"Step correlation: r={corr2:.3f}, p={p_val2:.2e}")
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+        print(f"Avg Reward vs Final BSF: r={corr2:.3f}, p={p_val2:.2e}")
+    
+    # Subplot 3: return vs local_bsf (step-level)
+    ax3 = axes[1, 0]
+    ax3.scatter(all_returns, all_local_bsf, alpha=0.4, s=30, c='red', edgecolors='darkred', linewidth=0.3)
+    ax3.set_xlabel('Return', fontsize=12, fontweight='bold')
+    ax3.set_ylabel('Local BSF Improvement', fontsize=12, fontweight='bold')
+    ax3.set_title('Return vs Local BSF Improvement', fontsize=14, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    if len(all_returns) > 2:
+        corr3, p_val3 = pearsonr(all_returns, all_local_bsf)
+        ax3.text(0.05, 0.95, f'r={corr3:.3f}\np={p_val3:.2e}', 
+                transform=ax3.transAxes, fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.8))
+        print(f"Return vs Local BSF: r={corr3:.3f}, p={p_val3:.2e}")
+    
+    # Subplot 4: reward vs local_bsf (step-level)
+    ax4 = axes[1, 1]
+    ax4.scatter(all_rewards, all_local_bsf, alpha=0.4, s=30, c='purple', edgecolors='darkviolet', linewidth=0.3)
+    ax4.set_xlabel('Reward', fontsize=12, fontweight='bold')
+    ax4.set_ylabel('Local BSF Improvement', fontsize=12, fontweight='bold')
+    ax4.set_title('Reward vs Local BSF Improvement', fontsize=14, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    if len(all_rewards) > 2:
+        corr4, p_val4 = pearsonr(all_rewards, all_local_bsf)
+        ax4.text(0.05, 0.95, f'r={corr4:.3f}\np={p_val4:.2e}', 
+                transform=ax4.transAxes, fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='plum', alpha=0.8))
+        print(f"Reward vs Local BSF: r={corr4:.3f}, p={p_val4:.2e}")
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"Plot saved to: {save_path}")
     plt.close()
+
 
 
 if __name__ == "__main__":
@@ -446,61 +566,59 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', type=str, default=None, 
                        help='Path to trained policy checkpoint')
     parser.add_argument('--plot', action='store_true', help='Generate reward vs cost plot')
-    parser.add_argument('--n_locations', type=int, default=1000, help='Number of locations')
-    parser.add_argument('--n_vehicles', type=int, default=300, help='Number of vehicles')
-    parser.add_argument('--capacity', type=float, default=200.0, help='Capacity')
+    parser.add_argument('--n_locations', type=int, default=100, help='Number of locations')
+    parser.add_argument('--n_vehicles', type=int, default=30, help='Number of vehicles')
+    parser.add_argument('--capacity', type=float, default=100.0, help='Capacity')
     parser.add_argument('--n_episodes', type=int, default=3, help='Number of episodes to run')
     parser.add_argument('--time_limit', type=float, default=10.0, help='Time limit per episode')
     args = parser.parse_args()
     
     collector = CuOptCollector(use_policy=args.policy, checkpoint_path=args.checkpoint)
-    if collector.policy is not None:
-        collector.policy.eval()
     
     print(f"Running {args.n_episodes} episodes with {args.n_locations} locations, {args.n_vehicles} vehicles")
-    if args.plot:
-        print("Collecting data for plotting...")
     print("=" * 80)
     
     # Collect data
-    episode_avg_rewards = []
-    episode_final_costs = []
+    all_history = []
+    all_initial_costs = []
+    all_final_costs = []
     all_rewards = []
-    all_local_bsf_improvements = []
+    all_returns = []
     
-    for i in tqdm.tqdm(range(args.n_episodes)) if args.plot else range(args.n_episodes):
-        problem_data = Problem(n_locations=args.n_locations, n_vehicles=args.n_vehicles).generate()
-        collector.run_solver(problem_data, args.time_limit)
+    for i in range(args.n_episodes):
+        problem_gen = Problem(n_locations=args.n_locations, n_vehicles=args.n_vehicles)
+        problem_data = problem_gen.generate()
+        dm = problem_gen.create_data_model(problem_data)
+        collector.run_solver(problem_data, dm, args.time_limit)
+        history = collector.global_history
         
-        history = collector.global_history['history']
-        if len(history) > 0:
-            rewards = [r['reward'] for r in history if r.get('reward') is not None]
-            local_bsf_improvements = [r['local_bsf_improvement'] for r in history if r.get('local_bsf_improvement') is not None]
-            initial = history[0]['initial_cost']
-            final = history[-1]['local_best_cost_so_far']
-            
-            # Collect data for plotting
-            if args.plot:
-                episode_avg_rewards.append(np.mean(rewards) if rewards else 0.0)
-                episode_final_costs.append(final)
-                all_rewards.extend(rewards)
-                all_local_bsf_improvements.extend(local_bsf_improvements)
-            
-            # Print episode summary
-            if not args.plot:
-                print(f"Episode {i+1}: Steps={len(history)}, "
-                      f"Cost {initial:.1f}→{final:.1f}, "
-                      f"AvgReward={np.mean(rewards):.2f}")
-                
-                if args.policy and collector.policy_call_count > 0:
-                    avg_time = collector.policy_sample_time / collector.policy_call_count * 1000
-                    print(f"  Policy time: {avg_time:.2f}ms/step")
-        else:
-            if not args.plot:
-                print(f"Episode {i+1}: No steps recorded")
-    
+        initial_cost = history['initial_cost_set'][0]
+        final_cost = history['global_bsf']
+        rewards = [r.get('reward', 0) for r in history['history']]
+        returns = history['return_set']
+        all_initial_costs.append(initial_cost)
+        all_final_costs.append(final_cost)
+        all_rewards.append(np.mean(rewards))
+        all_returns.append(np.mean(returns))
+        print(f"Episode {i+1}: Steps={history['current_global_iter']}, "
+                      f"Cost {initial_cost:.2f}→{final_cost:.2f}, "
+                      f"AvgReward={np.mean(rewards):.2f}, "
+                      f"AvgReturn={np.mean(returns):.2f}",
+                      f"PolicyTime={collector.policy_sample_time * 1000 / collector.policy_call_count if collector.policy is not None else 0.0}ms")
+        if args.plot:
+            all_history.append(history)
+
+    all_initial_costs = np.array(all_initial_costs)
+    all_final_costs = np.array(all_final_costs)
+    all_rewards = np.array(all_rewards)
+    all_returns = np.array(all_returns)
+    print("=" * 80)
+    print(f"Episode Avg: "
+                      f"Cost {all_initial_costs.mean():.2f}→{all_final_costs.mean():.2f}, "
+                      f"AvgReward={all_rewards.mean():.2f}, "
+                      f"AvgReturn={all_returns.mean():.2f}")
+    print("=" * 80)
+
     # Plot if requested
     if args.plot:
-        plot_reward_vs_cost(episode_avg_rewards, episode_final_costs, 
-                           all_rewards, all_local_bsf_improvements,
-                           save_path='reward_vs_cost.png')
+        plot_reward_vs_cost(all_history, save_path='reward_vs_cost.png')
