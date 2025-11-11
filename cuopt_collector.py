@@ -2,8 +2,6 @@
 CuOpt Trajectory Collector
 Synchronously collects (state, action, reward) trajectories using fixed sampling policy
 """
-from cgi import print_form
-from hmac import new
 import numpy as np
 import cudf
 import torch
