@@ -25,7 +25,7 @@ GAMMA = 0.99          # Discount factor for return computation
 # ============================================================================
 # Plotting
 # ============================================================================
-def plot_training_progress(test_costs, entropies, selection_rates, avg_improvements, best_cost, save_path='training_progress.png'):
+def plot_training_progress(test_costs, entropies, advantages_avg, avg_improvements, best_cost, save_path='training_progress.png'):
     """Plot and save training progress"""
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
     epochs = list(range(1, len(test_costs) + 1))
@@ -46,14 +46,13 @@ def plot_training_progress(test_costs, entropies, selection_rates, avg_improveme
         ax2.legend(loc='best', fontsize=10)
         ax2.grid(True, alpha=0.3)
     
-    if selection_rates:
-        ax3.plot(epochs, selection_rates, 'g-o', label='Selection Rate', linewidth=2, markersize=4)
+    if advantages_avg:
+        ax3.plot(epochs, advantages_avg, 'g-o', label='Avg Advantages', linewidth=2, markersize=4)
         ax3.set_xlabel('Epoch', fontsize=12)
-        ax3.set_ylabel('Selection Rate (%)', fontsize=12)
-        ax3.set_title('PPO Training: Node Selection Rate', fontsize=14, fontweight='bold')
+        ax3.set_ylabel('Avg Advantages', fontsize=12)
+        ax3.set_title('PPO Training: Average Advantages', fontsize=14, fontweight='bold')
         ax3.legend(loc='best', fontsize=10)
         ax3.grid(True, alpha=0.3)
-        ax3.set_ylim(0, 100)
     
     if avg_improvements:
         ax4.plot(epochs, avg_improvements, 'm-o', label='Avg Step Improvement', linewidth=2, markersize=4)
@@ -75,7 +74,6 @@ def collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit):
     """Collect trajectories and return flat training data"""
     flat_data = []
     costs = []
-    selection_rates = []
     step_improvements = []
     policy_device = str(policy.device) if policy is not None else 'cpu'
     episode_max_local_search_ids = []
@@ -155,12 +153,6 @@ def collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit):
                         'old_logp': record['logp']
                     })
                     
-                    # Compute selection rate
-                    n_candidates = sum(state['candidate_mask'])
-                    n_selected = sum(record['action'])
-                    if n_candidates > 0:
-                        selection_rates.append(n_selected / n_candidates * 100)
-                    
                     step_improvements.append(record['step_improvement'])
     
     if not flat_data:
@@ -169,7 +161,10 @@ def collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit):
     # Calculate average max local_search_id across episodes
     avg_max_local_search_id = episode_max_local_search_ids
     
-    return flat_data, costs, selection_rates, step_improvements, avg_max_local_search_id
+    # Calculate average reward
+    avg_reward = np.mean([d['reward'] for d in flat_data]) if flat_data else 0.0
+    
+    return flat_data, costs, step_improvements, avg_max_local_search_id, avg_reward
 
 # ============================================================================
 # Testing
@@ -177,17 +172,17 @@ def collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit):
 def test_policy(policy, n_episodes=3, n_locations=50, n_vehicles=5, time_limit=5.0):
     """Test policy performance"""
     policy.eval()
-    _, costs, _, step_improvements, _ = collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit)
+    _, costs, step_improvements, _, avg_reward = collect_episodes(policy, n_episodes, n_locations, n_vehicles, time_limit)
     
     if not costs:
         print("  Warning: No valid episodes collected!")
-        return float('inf'), 0.0
+        return float('inf'), 0.0, 0.0
     
     avg_cost = np.mean(costs)
     std_cost = np.std(costs)
     avg_step_improvement = np.mean(step_improvements) if step_improvements else 0.0
-    print(f"  Cost: {avg_cost:.2f}±{std_cost:.2f}, Avg Step Impr: {avg_step_improvement:.4f}")
-    return avg_cost, avg_step_improvement
+    print(f"  Cost: {avg_cost:.2f}±{std_cost:.2f}, Avg Step Impr: {avg_step_improvement:.4f}, Avg Reward: {avg_reward:.4f}")
+    return avg_cost, avg_step_improvement, avg_reward
 
 
 # ============================================================================
@@ -200,17 +195,16 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
     # Collect trajectories (returns flat_data directly)
     print(f"Collecting {n_episodes} episodes...")
     policy.eval()
-    flat_data, costs, selection_rates, step_improvements, avg_max_local_search_id = collect_episodes(
+    flat_data, costs, step_improvements, avg_max_local_search_id, avg_reward = collect_episodes(
         policy, n_episodes, n_locations, n_vehicles, time_limit
     )
     
     # Print collection statistics
     avg_cost = np.mean(costs) if costs else 0.0
     std_cost = np.std(costs) if costs else 0.0
-    avg_selection_rate = np.mean(selection_rates) if selection_rates else 0.0
     avg_step_improvement = np.mean(step_improvements) if step_improvements else 0.0
     print(f"  Collected {len(costs)} episodes: cost={avg_cost:.2f}±{std_cost:.2f}, "
-          f"select={avg_selection_rate:.1f}%, avg_step_impr={avg_step_improvement:.4f}, "
+          f"avg_step_impr={avg_step_improvement:.4f}, "
           f"avg_max_ls_id={avg_max_local_search_id}")
     
     n_samples = len(flat_data)
@@ -290,15 +284,17 @@ def train_one_epoch(policy, optimizer, n_episodes=5, n_locations=50, n_vehicles=
     print(f"  Entropy: {first['entropy']:.3f} → {last['entropy']:.3f}")
     print(f"  Advantages avg: {first['advantages_avg']:.4f} → {last['advantages_avg']:.4f}\n")
     
-    return first['loss'], last['entropy'], avg_selection_rate, avg_step_improvement
+    # Use the last epoch's advantages_avg
+    avg_advantages = last['advantages_avg']
+    return first['loss'], last['entropy'], avg_advantages, avg_step_improvement, avg_reward
 
 
 # ============================================================================
 # Utilities
 # ============================================================================
 def _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost, test_costs,
-                     entropies, selection_rates, avg_improvements, losses, args,
-                     output_dir, filename='best_policy.pt', after_cost=None):
+                     entropies, advantages_avg, avg_improvements, losses, args,
+                     output_dir, filename='best_policy.pt', after_cost=None, avg_reward=None, rewards=None):
     """Save checkpoint"""
     checkpoint = {
         'epoch': epoch,
@@ -308,10 +304,12 @@ def _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost, test_cost
         'before_cost': before_cost,
         'test_costs': test_costs,
         'entropies': entropies,
-        'selection_rates': selection_rates,
+        'advantages_avg': advantages_avg,
         'avg_improvements': avg_improvements,
         'losses': losses,
-        'args': vars(args)
+        'args': vars(args),
+        'avg_reward': avg_reward,
+        'rewards': rewards
     }
     if after_cost is not None:
         checkpoint['after_cost'] = after_cost
@@ -349,6 +347,35 @@ def _cleanup_old_checkpoints(output_dir, keep_last_n=5):
             pass
 
 
+def _cleanup_old_checkpoints_by_reward(output_dir, keep_top_n=5):
+    """Remove old checkpoint files, keeping only the top N by reward"""
+    import glob
+    checkpoint_files = glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pt'))
+    
+    if len(checkpoint_files) <= keep_top_n:
+        return
+    
+    # Load checkpoints and extract rewards
+    checkpoint_rewards = []
+    for f in checkpoint_files:
+        try:
+            checkpoint = torch.load(f, weights_only=False, map_location='cpu')
+            reward = checkpoint.get('avg_reward', -float('inf'))
+            checkpoint_rewards.append((f, reward))
+        except:
+            checkpoint_rewards.append((f, -float('inf')))
+    
+    # Sort by reward (descending) and keep top N
+    checkpoint_rewards.sort(key=lambda x: x[1], reverse=True)
+    files_to_remove = [f for f, _ in checkpoint_rewards[keep_top_n:]]
+    
+    for f in files_to_remove:
+        try:
+            os.remove(f)
+        except:
+            pass
+
+
 def _get_device():
     """Auto-detect device"""
     if torch.cuda.is_available():
@@ -363,16 +390,16 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='PPO Training for VRP')
-    parser.add_argument('--n_epochs', type=int, default=1000, help='Number of training epochs')
+    parser.add_argument('--n_epochs', type=int, default=10000, help='Number of training epochs')
     parser.add_argument('--n_episodes', type=int, default=10, help='Episodes per epoch')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--n_locations', type=int, default=100, help='Number of locations')
     parser.add_argument('--n_vehicles', type=int, default=30, help='Number of vehicles')
     parser.add_argument('--grad_clip', type=float, default=1, help='Gradient clipping max norm')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='PPO update epochs per batch')
-    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
-    parser.add_argument('--batch_size', type=int, default=256, help='PPO mini-batch size')
-    parser.add_argument('--time_limit', type=float, default=2, help='Time limit per episode (seconds)')
+    parser.add_argument('--clip_epsilon', type=float, default=0.1, help='PPO clip epsilon')
+    parser.add_argument('--batch_size', type=int, default=512, help='PPO mini-batch size')
+    parser.add_argument('--time_limit', type=float, default=20, help='Time limit per episode (seconds)')
     parser.add_argument('--d_model', type=int, default=64, help='Transformer model dimension')
     parser.add_argument('--num_heads', type=int, default=4, help='Transformer attention heads')
     parser.add_argument('--num_encoder_layers', type=int, default=3, help='Transformer encoder layers')
@@ -431,8 +458,8 @@ def main():
             print("=" * 60)
             print(f"TEST ONLY - {args.test_episodes} episodes")
             print("=" * 60)
-            test_cost, test_impr = test_policy(policy, args.test_episodes, args.n_locations, args.n_vehicles, args.time_limit)
-            print(f"\nTest cost: {test_cost:.2f}, impr: {test_impr:.4f}")
+            test_cost, test_impr, test_reward = test_policy(policy, args.test_episodes, args.n_locations, args.n_vehicles, args.time_limit)
+            print(f"\nTest cost: {test_cost:.2f}, impr: {test_impr:.4f}, reward: {test_reward:.4f}")
             print(f"Checkpoint best: {checkpoint.get('best_cost', 0):.2f}")
             print("=" * 60)
             return
@@ -447,17 +474,21 @@ def main():
     
     if not args.resume:
         print("Testing before training...")
-        before_cost, _ = test_policy(policy, **test_kwargs)
+        before_cost, _, before_reward = test_policy(policy, **test_kwargs)
         print()
-        best_cost, losses, test_costs, entropies, selection_rates, avg_improvements = before_cost, [], [], [], [], []
+        best_cost, losses, test_costs, entropies, advantages_avg, avg_improvements = before_cost, [], [], [], [], []
+        rewards = [before_reward]
+        best_reward = before_reward
     else:
         before_cost = checkpoint.get('before_cost', 0)
         best_cost = checkpoint.get('best_cost', before_cost)
         losses = checkpoint.get('losses', [])
         test_costs = checkpoint.get('test_costs', [])
         entropies = checkpoint.get('entropies', [])
-        selection_rates = checkpoint.get('selection_rates', [])
+        advantages_avg = checkpoint.get('advantages_avg', [])
         avg_improvements = checkpoint.get('avg_improvements', [])
+        rewards = checkpoint.get('rewards', [])
+        best_reward = max(rewards) if rewards else -float('inf')
     
     # Training loop
     print("=" * 60)
@@ -478,37 +509,49 @@ def main():
     for epoch in range(start_epoch, args.n_epochs):
         print(f"\n--- Epoch {epoch+1}/{args.n_epochs} ---")
         
-        loss, entropy, selection_rate, train_impr = train_one_epoch(policy, optimizer, **train_kwargs)
+        loss, entropy, avg_adv, train_impr, avg_reward = train_one_epoch(policy, optimizer, **train_kwargs)
         losses.append(loss)
         entropies.append(entropy)
-        selection_rates.append(selection_rate)
+        advantages_avg.append(avg_adv)
+        rewards.append(avg_reward)
         
-        test_cost, test_impr = test_policy(policy, **test_kwargs)
+        test_cost, test_impr, test_reward = test_policy(policy, **test_kwargs)
         avg_improvements.append(test_impr)
         test_costs.append(test_cost)
         print(f"Epoch {epoch+1}: test_cost={test_cost:.2f}, test_impr={test_impr:.4f}, "
-              f"train_impr={train_impr:.4f}, loss={loss:.4f}")
+              f"train_impr={train_impr:.4f}, loss={loss:.4f}, reward={avg_reward:.4f}")
         
-        plot_training_progress(test_costs, entropies, selection_rates, avg_improvements, best_cost,
+        plot_training_progress(test_costs, entropies, advantages_avg, avg_improvements, best_cost,
                               save_path=os.path.join(output_dir, 'training_progress.png'))
         
-        # Save checkpoint for this epoch (keep last 5)
-        epoch_filename = f'checkpoint_epoch_{epoch}.pt'
-        _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost,
-                        test_costs, entropies, selection_rates, avg_improvements, losses, args,
-                        output_dir, epoch_filename, after_cost=test_cost)
-        _cleanup_old_checkpoints(output_dir, keep_last_n=5)
+        # Save checkpoint every 100 epochs
+        if (epoch + 1) % 100 == 0:
+            epoch_filename = f'checkpoint_epoch_{epoch}.pt'
+            _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost,
+                            test_costs, entropies, advantages_avg, avg_improvements, losses, args,
+                            output_dir, epoch_filename, after_cost=test_cost, avg_reward=avg_reward, rewards=rewards)
+            _cleanup_old_checkpoints_by_reward(output_dir, keep_top_n=5)
+            print(f"  ✓ Saved checkpoint at epoch {epoch+1} (reward: {avg_reward:.4f})")
         
-        # Save best checkpoint if improved
+        # Track best reward
+        if avg_reward > best_reward:
+            best_reward = avg_reward
+            print(f"  * New best reward: {best_reward:.4f}")
+            path = _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost,
+                                   test_costs, entropies, advantages_avg, avg_improvements, losses, args,
+                                   output_dir, 'best_policy_by_reward.pt', after_cost=test_cost, avg_reward=avg_reward, rewards=rewards)
+            print(f"  ✓ Saved best reward checkpoint: {path}")
+        
+        # Track best cost
         if test_cost < best_cost:
             best_cost = test_cost
             improvement = before_cost - best_cost
             improvement_pct = (improvement / before_cost * 100) if before_cost > 0 else 0
-            print(f"  * New best: {best_cost:.2f} (improved {improvement:.2f} / {improvement_pct:.2f}%)")
+            print(f"  * New best cost: {best_cost:.2f} (improved {improvement:.2f} / {improvement_pct:.2f}%)")
             path = _save_checkpoint(policy, optimizer, epoch, best_cost, before_cost,
-                                   test_costs, entropies, selection_rates, avg_improvements, losses, args,
-                                   output_dir, 'best_policy.pt', after_cost=test_cost)
-            print(f"  Saved to: {path}")
+                                   test_costs, entropies, advantages_avg, avg_improvements, losses, args,
+                                   output_dir, 'best_policy_by_cost.pt', after_cost=test_cost, avg_reward=avg_reward, rewards=rewards)
+            print(f"  ✓ Saved best cost checkpoint: {path}")
         
         gc.collect()
         if torch.cuda.is_available():
@@ -518,7 +561,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"Final testing ({args.test_episodes} episodes)...")
     print("=" * 60)
-    after_cost, after_impr = test_policy(policy, **test_kwargs)
+    after_cost, after_impr, after_reward = test_policy(policy, **test_kwargs)
     print()
     
     print("=" * 60)

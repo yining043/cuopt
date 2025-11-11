@@ -73,11 +73,11 @@ void run_extract_kernel(solution_t<i_t, f_t, REQUEST>& sol,
 template <typename i_t>
 i_t get_sample_size_vrp(i_t n_of_changed_nodes)
 {
-  i_t num = 40;
+  i_t num = 10;
   if (n_of_changed_nodes < num)
     num = n_of_changed_nodes;
-  else if (n_of_changed_nodes < num * 2)
-    num = n_of_changed_nodes / 2;
+  // else if (n_of_changed_nodes < num * 2)
+  //   num = n_of_changed_nodes / 2;
   return num;
 }
 

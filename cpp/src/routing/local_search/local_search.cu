@@ -260,6 +260,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   raft::common::nvtx::range fun_scope("run_fast_search");
 
   auto& nodes_to_search = move_candidates.nodes_to_search;
+  f_t trail_cost = 0;
   callbacks::customize_nodes_callback_t* obs_callback = nullptr;
   if (full_set) {
     sol.set_routes_to_search();
@@ -277,6 +278,25 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   auto& h_nodes = nodes_to_search.h_nodes_to_search;
   bool needs_customization = h_nodes.size() > 0;
   if (!full_set && needs_customization && obs_callback) {
+
+    // perform n_fake_moves fake move to get the baseline cost
+    auto base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
+
+    f_t trail_cost_sum = 0.0;
+    i_t n_fake_moves = 10;
+    for (i_t i = 0; i < n_fake_moves; i++) {
+      auto trail_sol = sol;
+      move_candidates.nodes_to_search.h_nodes_to_search = base_node_to_search;
+      move_candidates.nodes_to_search.n_sampled_nodes = base_node_to_search.size();
+      nodes_to_search.sample_nodes_to_search(trail_sol, rng, full_set);
+      perform_vrp_search(trail_sol, move_candidates);
+      run_sliding_search(trail_sol);
+      trail_cost_sum += trail_sol.get_cost(true, move_candidates.weights);
+    }
+    trail_cost = trail_cost_sum / n_fake_moves;
+    move_candidates.nodes_to_search.h_nodes_to_search = base_node_to_search;
+    move_candidates.nodes_to_search.n_sampled_nodes = base_node_to_search.size();
+
     // Prepare current solution for observation
     size_t n_nodes = sol.get_num_orders();
     i_t total_nodes = n_nodes + sol.n_routes * 4;
@@ -361,32 +381,34 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   std::shuffle(fast_operators.begin(), fast_operators.end(), rng);
 
   bool move_found = false;
+  move_found = perform_vrp_search(sol, move_candidates) || move_found;
+  move_found = run_sliding_search(sol) || move_found;
 
-  for (auto const& op : fast_operators) {
-    switch (op) {
-      case fast_operators_t::SLIDING: {
-        move_found = run_sliding_search(sol) || move_found;
-        break;
-      }
-      case fast_operators_t::VRP: {
-        move_found = perform_vrp_search(sol, move_candidates) || move_found;
-        break;
-      }
-      case fast_operators_t::REGRET: {
-        move_found =
-          run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
-          move_found;
-        break;
-      }
-      case fast_operators_t::TWO_OPT: {
-        move_found = run_two_opt_search(sol) || move_found;
-        break;
-      }
-      case fast_operators_t::CROSS: {
-        break;
-      }
-    }
-  }
+  // for (auto const& op : fast_operators) {
+  //   switch (op) {
+  //     case fast_operators_t::SLIDING: {
+  //       move_found = run_sliding_search(sol) || move_found;
+  //       break;
+  //     }
+  //     case fast_operators_t::VRP: {
+  //       move_found = perform_vrp_search(sol, move_candidates) || move_found;
+  //       break;
+  //     }
+  //     case fast_operators_t::REGRET: {
+  //       move_found =
+  //         run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
+  //         move_found;
+  //       break;
+  //     }
+  //     case fast_operators_t::TWO_OPT: {
+  //       move_found = run_two_opt_search(sol) || move_found;
+  //       break;
+  //     }
+  //     case fast_operators_t::CROSS: {
+  //       break;
+  //     }
+  //   }
+  // }
 
   // Reward: Send feedback to reward callback after search iteration
   if (!full_set && obs_callback && needs_customization) {
@@ -396,7 +418,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
         f_t solution_cost = sol.get_cost(true, move_candidates.weights);
         // Build solution_flat for reward callback
         std::vector<i_t> solution_flat = build_solution_flat(sol);
-        reward_callback->receive_reward(move_found, solution_cost, iter, &solution_flat, sol.n_routes);
+        reward_callback->receive_reward(move_found, solution_cost, trail_cost, iter, &solution_flat, sol.n_routes);
         break;
       }
     }

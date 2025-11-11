@@ -83,6 +83,7 @@ public:
     void receive_reward(
         bool improvement_found,
         float solution_cost,
+        float trail_cost,
         int iter,
         const std::vector<int>* solution_flat,
         int num_routes
@@ -90,9 +91,10 @@ public:
         PyObject* result = PyObject_CallMethod(
             this->pyCallbackClass,
             "_cpp_receive_reward",
-            "(ifiKi)",
+            "(iffiKi)",
             improvement_found ? 1 : 0,
             solution_cost,
+            trail_cost,
             iter,
             reinterpret_cast<unsigned long long>(solution_flat),
             num_routes

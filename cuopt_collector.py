@@ -2,6 +2,7 @@
 CuOpt Trajectory Collector
 Synchronously collects (state, action, reward) trajectories using fixed sampling policy
 """
+from cgi import print_form
 from hmac import new
 import numpy as np
 import cudf
@@ -282,7 +283,7 @@ class _RewardCallback(RewardCallback):
         super().__init__()
         self.collector = collector
     
-    def receive_reward(self, improvement_found, solution_cost, iter, solution_flat, num_routes):
+    def receive_reward(self, improvement_found, solution_cost, trail_cost, iter, solution_flat, num_routes):
         # Update both best_cost_so_far (local and global)
         current_local_search_id = self.collector.global_history['current_local_search_id']
         old_bsf = self.collector.global_history['local_bsf_set'][current_local_search_id]
@@ -297,7 +298,9 @@ class _RewardCallback(RewardCallback):
         pending = self.collector.global_history['pending_state']
         step_improvement = pending['cost_before'] - solution_cost
         ### Reward: use pure local BSF improvement (no scaling by iter or initial cost)
-        reward = local_bsf_improvement * 0.01
+        reward = (trail_cost - solution_cost) 
+
+        # print(f"Reward: {reward}, solution_cost: {solution_cost}, trail_cost: {trail_cost}")
         self.collector.global_history['return_set'][current_local_search_id] += reward
 
         record = {
@@ -310,6 +313,7 @@ class _RewardCallback(RewardCallback):
             'num_routes_after': num_routes,
             'cost_before': pending['cost_before'],
             'cost_after': solution_cost,
+            'trail_cost': trail_cost,
             'move_found': improvement_found,
             'is_circle_found': False,
             'action': pending.get('action'),
@@ -390,7 +394,7 @@ class _AfterCycleFinderCallback(AfterCycleFinderCallback):
         step_improvement = pending['cost_before'] - solution_cost
         
         ### Reward: use pure local BSF improvement (no scaling by iter or initial cost)
-        reward = local_bsf_improvement * 0.01
+        reward = 0
         self.collector.global_history['return_set'][current_local_search_id] += reward
 
         record = {
@@ -570,7 +574,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_vehicles', type=int, default=30, help='Number of vehicles')
     parser.add_argument('--capacity', type=float, default=100.0, help='Capacity')
     parser.add_argument('--n_episodes', type=int, default=3, help='Number of episodes to run')
-    parser.add_argument('--time_limit', type=float, default=10.0, help='Time limit per episode')
+    parser.add_argument('--time_limit', type=float, default=2.0, help='Time limit per episode')
     args = parser.parse_args()
     
     collector = CuOptCollector(use_policy=args.policy, checkpoint_path=args.checkpoint)

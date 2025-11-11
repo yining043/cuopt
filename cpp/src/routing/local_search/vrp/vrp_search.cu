@@ -26,7 +26,7 @@ namespace detail {
 #ifdef BENCHMARK
 constexpr int max_n_neighbors = 128;
 #else
-constexpr int max_n_neighbors = 96;
+constexpr int max_n_neighbors = 32;
 #endif
 
 template <typename i_t, typename f_t, request_t REQUEST>

@@ -58,7 +58,7 @@ class TestRewardCallback(RewardCallback):
         super().__init__()
         self.global_history = global_history
     
-    def receive_reward(self, improvement_found, solution_cost, iter, solution_flat, num_routes):
+    def receive_reward(self, improvement_found, solution_cost, trail_cost, iter, solution_flat, num_routes):
         """Complete fast search record with after state and move result."""
 
         pending = self.global_history.get('pending_state', None)

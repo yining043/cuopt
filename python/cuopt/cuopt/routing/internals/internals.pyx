@@ -185,12 +185,12 @@ cdef class RewardCallback(PyCallback):
     def get_native_callback(self):
         return <uintptr_t>&(self.native_callback)
     
-    def _cpp_receive_reward(self, int improvement_found, float solution_cost, int iter, unsigned long long solution_flat_ptr, int num_routes):
+    def _cpp_receive_reward(self, int improvement_found, float solution_cost, float trail_cost, int iter, unsigned long long solution_flat_ptr, int num_routes):
         cdef const vector[int]* solution_flat = <const vector[int]*>solution_flat_ptr if solution_flat_ptr else NULL
         py_solution_flat = solution_flat[0] if solution_flat else []
-        self.receive_reward(bool(improvement_found), solution_cost, iter, py_solution_flat, num_routes)
+        self.receive_reward(bool(improvement_found), solution_cost, trail_cost, iter, py_solution_flat, num_routes)
     
-    def receive_reward(self, improvement_found, solution_cost, iter, solution_flat, num_routes):
+    def receive_reward(self, improvement_found, solution_cost, trail_cost, iter, solution_flat, num_routes):
         """
         Receive reward signal from search iteration
         
@@ -202,6 +202,8 @@ cdef class RewardCallback(PyCallback):
             Whether an improving move was discovered in this iteration
         solution_cost : float
             Current solution objective cost
+        trail_cost : float
+            Cost of the trail solution (used for node sampling)
         iter : int
             Current iteration number in local search
         solution_flat : list of int
