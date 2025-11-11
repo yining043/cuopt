@@ -88,7 +88,7 @@ class vrp_move_candidates_t {
         }
         release_lock(&locks_per_node[node_id_1_]);
       }
-      // atomicExch(&active_nodes_impacted[node_id_1_], 1);
+      atomicExch(&active_nodes_impacted[node_id_1_], 1);
 
       if (cost_delta_ > cost_delta[route_pair_idx]) return;
       acquire_lock(&locks_per_route_pair[route_pair_idx]);
