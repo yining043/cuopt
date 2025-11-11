@@ -235,7 +235,7 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_ep()
 // squeeze all requests do a local search and then compare the excess, if it is better then save
 // if feasibilized then return true
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
 {
   raft::common::nvtx::range fun_scope("squeeze_all_and_save");
   auto stream = solution_ptr->sol_handle->get_stream();
@@ -259,7 +259,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
   const bool consider_unserviced = false;
   const bool enable_time_limit   = true;
   const bool enable_cycle_finder = false;
-  local_search_ptr_->run_best_local_search(
+  auto offset = local_search_ptr_->run_best_local_search(
     *solution_ptr, consider_unserviced, enable_time_limit, enable_cycle_finder);
 
   // reset the weights
@@ -270,7 +270,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
   // if the route is feasibled return true
   if (feasibilized) {
     solution_ptr->global_runtime_checks(true, true, "squeeze_all_and_save_after_feasibilized");
-    return true;
+    return {true, offset};
   }
   // else restore the solution and return false
   else {
@@ -284,7 +284,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_all_and_save()
     }
     solution_ptr->copy_device_solution(squeeze_save_state);
     EP.index_ += save_ep_size;
-    return false;
+    return {false, offset};
   }
 }
 
@@ -334,7 +334,7 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze(
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_feasible(
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_feasible(
   const request_info_t<i_t, REQUEST>* request, bool random_route)
 {
   raft::common::nvtx::range fun_scope("try_squeeze");
@@ -352,8 +352,9 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_feasible(
   const bool consider_unserviced = false;
   const bool enable_time_limit   = true;
   const bool enable_cycle_finder = false;
-  local_search_ptr_->run_best_local_search(
+  auto offset = local_search_ptr_->run_best_local_search(
     *solution_ptr, consider_unserviced, enable_time_limit, enable_cycle_finder);
+  
   // check if solution is feasible at the end
   bool feasibilized = solution_ptr->is_feasible();
   local_search_ptr_->set_active_weights(local_search_ptr_->move_candidates.weights,
@@ -361,12 +362,12 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_feasible(
 
   // if the route is feasibled return true
   if (feasibilized) {
-    return true;
+    return {true, offset};
   }
   // else restore the solution and return false
   else {
     solution_ptr->copy_device_solution(squeeze_save_state);
-    return false;
+    return {false, offset};
   }
 }
 
@@ -396,17 +397,17 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::squeeze_breaks()
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_breaks_feasible()
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_breaks_feasible()
 {
   raft::common::nvtx::range fun_scope("try_squeeze_breaks_feasible");
 
   size_t n_break_dims = solution_ptr->problem_ptr->get_max_break_dimensions();
-  if (n_break_dims == 0) { return solution_ptr->is_feasible(); }
+  if (n_break_dims == 0) { return {solution_ptr->is_feasible(), std::chrono::steady_clock::duration(0)}; }
   auto stream = solution_ptr->sol_handle->get_stream();
 
   squeeze_breaks();
 
-  if (solution_ptr->is_feasible()) { return true; }
+  if (solution_ptr->is_feasible()) { return {true, std::chrono::steady_clock::duration(0)}; }
 
   local_search_ptr_->start_timer(remaining_time());
 
@@ -415,34 +416,35 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::try_squeeze_breaks_feasible()
   const bool consider_unserviced = false;
   const bool enable_time_limit   = true;
   const bool enable_cycle_finder = false;
-  local_search_ptr_->run_best_local_search(
+  auto offset = local_search_ptr_->run_best_local_search(
     *solution_ptr, consider_unserviced, enable_time_limit, enable_cycle_finder);
 
   local_search_ptr_->set_active_weights(local_search_ptr_->move_candidates.weights,
                                         original_incl_objective);
-  return solution_ptr->is_feasible();
+  return {solution_ptr->is_feasible(), offset};
 }
 
 template bool guided_ejection_search_t<int, float, request_t::PDP>::repair_empty_routes();
 template bool guided_ejection_search_t<int, float, request_t::VRP>::repair_empty_routes();
 
-template bool guided_ejection_search_t<int, float, request_t::PDP>::squeeze_all_and_save();
-template bool guided_ejection_search_t<int, float, request_t::VRP>::squeeze_all_and_save();
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::PDP>::squeeze_all_and_save();
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::VRP>::squeeze_all_and_save();
 template void guided_ejection_search_t<int, float, request_t::PDP>::squeeze_all_ep();
 template void guided_ejection_search_t<int, float, request_t::VRP>::squeeze_all_ep();
 
-template bool guided_ejection_search_t<int, float, request_t::PDP>::try_squeeze_feasible(
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::PDP>::try_squeeze_feasible(
   const request_info_t<int, request_t::PDP>* request, bool random_route);
-template bool guided_ejection_search_t<int, float, request_t::VRP>::try_squeeze_feasible(
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::VRP>::try_squeeze_feasible(
   const request_info_t<int, request_t::VRP>* request, bool random_route);
+
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::PDP>::try_squeeze_breaks_feasible();
+template std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<int, float, request_t::VRP>::try_squeeze_breaks_feasible();
 
 template int guided_ejection_search_t<int, float, request_t::PDP>::try_multiple_feasible_insertions(
   int, bool);
 template int guided_ejection_search_t<int, float, request_t::VRP>::try_multiple_feasible_insertions(
   int, bool);
 
-template bool guided_ejection_search_t<int, float, request_t::PDP>::try_squeeze_breaks_feasible();
-template bool guided_ejection_search_t<int, float, request_t::VRP>::try_squeeze_breaks_feasible();
 }  // namespace detail
 }  // namespace routing
 }  // namespace cuopt

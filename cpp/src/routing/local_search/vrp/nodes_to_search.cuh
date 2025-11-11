@@ -74,7 +74,8 @@ class nodes_to_search_t {
   void restore_found_nodes(solution_t<i_t, f_t, request_t::VRP>& sol);
   bool sample_nodes_to_search(const solution_t<i_t, f_t, request_t::VRP>& sol,
                               std::mt19937& rng,
-                              bool full_set = false);
+                              bool full_set = false,
+                              bool random_shuffle = true);
   bool sample_nodes_for_recycle(const solution_t<i_t, f_t, request_t::VRP>& sol,
                                 move_candidates_t<i_t, f_t>& move_candidates);
 

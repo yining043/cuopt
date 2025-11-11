@@ -32,7 +32,7 @@ struct adapted_modifier_t {
     pool_allocator_t<i_t, f_t, detail::solution_t<i_t, f_t, REQUEST>, detail::problem_t<i_t, f_t>>;
   adapted_modifier_t(allocator& pool_allocator_);
   // improves the solution with feasible local search
-  void improve(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
+  std::chrono::steady_clock::duration improve(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
                costs final_weight,
                f_t time_limit,
                bool run_cycle_finder = true);

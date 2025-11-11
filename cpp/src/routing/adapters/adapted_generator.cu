@@ -35,7 +35,7 @@ adapted_generator_t<i_t, f_t, REQUEST>::adapted_generator_t(const problem_t<i_t,
 // then run GES to make it feasible
 // if this can't make it feasible, we squeeze the request
 template <typename i_t, typename f_t, request_t REQUEST>
-bool adapted_generator_t<i_t, f_t, REQUEST>::make_feasible(
+std::pair<bool, std::chrono::steady_clock::duration> adapted_generator_t<i_t, f_t, REQUEST>::make_feasible(
   adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
   f_t time_limit,
   costs const& weight,
@@ -60,16 +60,18 @@ bool adapted_generator_t<i_t, f_t, REQUEST>::make_feasible(
   for (i_t i = 0; i < perturbation_count; ++i) {
     resource.ls.run_random_local_search(adapted_solution.sol, false);
   }
-  resource.ges.fixed_route_loop();
+  auto [success, offset] = resource.ges.fixed_route_loop();
+  std::chrono::steady_clock::duration total_offset = offset;
 
   // If the breaks are ejected, we need to squeeze them back
-  resource.ges.try_squeeze_breaks_feasible();
+  auto [feasible, offset2] = resource.ges.try_squeeze_breaks_feasible();
+  total_offset += offset2;
 
   adapted_solution.populate_host_data(true);
   adapted_solution.check_device_host_coherence();
   cuopt_func_call(adapted_solution.sol.check_cost_coherence(gpu_weight));
   pool_allocator.resource_pool->release(index);
-  return adapted_solution.sol.is_feasible();
+  return {adapted_solution.sol.is_feasible(), total_offset};
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -92,7 +94,7 @@ void generate_tsp_solution(adapted_sol_t<i_t, f_t, REQUEST>& sol,
 // this generates a pool of solutions and returns a vector of solutions structure
 // if feasible_only is false, we can squeeze the rest of the EP to the solution
 template <typename i_t, typename f_t, request_t REQUEST>
-void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
+std::chrono::steady_clock::duration adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
   adapted_sol_t<i_t, f_t, REQUEST>& sol,
   const std::vector<i_t>& desired_vehicle_ids,
   f_t time_limit,
@@ -102,7 +104,7 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
   raft::common::nvtx::range fun_scope("generate_solution");
   if (sol.problem->is_tsp) {
     generate_tsp_solution<i_t, f_t, REQUEST>(sol, desired_vehicle_ids);
-    return;
+    return std::chrono::steady_clock::duration(0);
   }
 
   f_t ges_time_limit       = timer.clamp_remaining_time(time_limit);
@@ -119,10 +121,13 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
   cuopt_assert(n_routes > 0, "Number of routes cannot be zero.");
 
   const auto& dim_info = sol.sol.problem_ptr->dimensions_info;
+  std::chrono::steady_clock::duration total_offset(0);
 
   if (run_route_minimizer) {
-    resource.ges.construct_feasible_solution();
-    resource.ges.route_minimizer_loop();
+    auto [success, offset] = resource.ges.construct_feasible_solution();
+    total_offset += offset;
+    auto offset2 = resource.ges.route_minimizer_loop();
+    total_offset += offset2;
   } else {
     // FIXME:: We can do better
     sol.clear_solution(desired_vehicle_ids);
@@ -130,8 +135,12 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
     sol.sol.compute_initial_data();
     sol.sol.eject_until_feasible();
     resource.ges.init_ejection_pool();
-    resource.ges.fixed_route_loop();
-    if (dim_info.has_dimension(dim_t::BREAK)) { resource.ges.try_squeeze_breaks_feasible(); }
+    auto [success, offset] = resource.ges.fixed_route_loop();
+    total_offset += offset;
+    if (dim_info.has_dimension(dim_t::BREAK)) { 
+      auto [feasible, offset] = resource.ges.try_squeeze_breaks_feasible();
+      total_offset += offset;
+    }
   }
 
   resource.ges.repair_empty_routes();
@@ -141,6 +150,8 @@ void adapted_generator_t<i_t, f_t, REQUEST>::generate_solution(
   cuopt_func_call(sol.sol.check_cost_coherence(gpu_weight));
   pool_allocator.resource_pool->release(index);
   pool_allocator.sync_all_streams();
+  
+  return total_offset;
 }
 
 template struct adapted_generator_t<int, float, request_t::PDP>;

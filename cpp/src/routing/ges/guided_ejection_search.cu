@@ -208,7 +208,7 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::shuffle_pool()
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_t& counter,
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_t& counter,
                                                                               bool minimize_routes,
                                                                               i_t desired_ep_size)
 {
@@ -216,6 +216,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
   i_t iteration_limit              = 500000;
   i_t ges_loop_iterations          = 0;
   i_t consecutive_ejection_failure = 1;
+  std::chrono::steady_clock::duration total_offset(0);
 
   // When running route minimizer, if it is difficult to remove a particular route, we would want to
   // continue with removing another route, so having shorter time is preferable. In case of fixed
@@ -248,7 +249,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
       if (dump_intermediate) {
         dump_to_file("Iteration or time limit exhausted! Trying another route!");
       }
-      return false;
+      return {false, std::chrono::steady_clock::duration(0)};
     }
     ++ges_loop_iterations;
 
@@ -266,7 +267,9 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
 
     // if that was the last request in the pool, try to squeeze it
     if (EP.size() == 0) {
-      if (try_squeeze_feasible(request)) { return true; }
+      auto [feasible, offset] = try_squeeze_feasible(request);
+      total_offset += offset;
+      if (feasible) { return {true, total_offset}; }
     } else {
       // push the last one back because we will try to insert all
       EP.push_back_last();
@@ -274,7 +277,9 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
                                (EP.size() <= 5 && EP.size() <= min_ep_size) ||
                                (EP.size() <= 80 && EP.size() < min_ep_size - 10))) {
         min_ep_size = EP.size();
-        if (squeeze_all_and_save()) { return true; }
+        auto [feasible, offset] = squeeze_all_and_save();
+        total_offset += offset;
+        if (feasible) { return {true, total_offset}; }
       }
       EP.pop();
     }
@@ -296,7 +301,8 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
 
     if (!move_executed) {
       if (consecutive_ejection_failure % shuffle_interval == 0) {
-        bool squeeze_found = try_squeeze_feasible(request);
+        auto [squeeze_found, offset] = try_squeeze_feasible(request);
+        total_offset += offset;
         if (!squeeze_found) {
           // if cannot squeeze shuffle
           shuffle_pool();
@@ -313,7 +319,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
           dump_to_file("Consecutive ejection failure! Trying another route!");
         }
         EP.push_back_last();
-        return false;
+        return {false, std::chrono::steady_clock::duration(0)};
       }
 
       RAFT_CHECK_CUDA(solution_ptr->sol_handle->get_stream());
@@ -326,7 +332,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::guided_ejection_search_loop(i_
     solution_ptr->global_runtime_checks(false, true, "ges_while_loop_end");
   }
 
-  return true;
+  return {true, total_offset};
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -365,42 +371,48 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::init_ejection_pool()
 // if we can't reach within the given time an infeasible solution is returned
 // @todo provide an option to keep the feasible and return feasible solution too
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::fixed_route_loop()
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::fixed_route_loop()
 {
   raft::common::nvtx::range fun_scope("fixed_route_loop");
   i_t counter = 0;
+  std::chrono::steady_clock::duration total_offset(0);
 
   bool all_inserted = greedy_insert();
 
   // run guided ejection search with a very large EP
-  if (!all_inserted && !guided_ejection_search_loop(counter, false)) {
-    solution_ptr->global_runtime_checks(false, true, "fixed_route_loop");
-    solution_ptr->sol_handle->sync_stream();
-    bool success = squeeze_all_and_save();
+  if (!all_inserted) {
+    auto [success, offset] = guided_ejection_search_loop(counter, false);
+    total_offset += offset;
     if (!success) {
-      // In case of prize collection, we are ok with partial solutions. In the absence of prize
-      // collection, we require full solution even if it is infeasible and the diversity manager can
-      // make the solution feasible
-      if (!solution_ptr->problem_ptr->has_prize_collection()) {
-        solution_ptr->copy_device_solution(ges_loop_save_state);
+      solution_ptr->global_runtime_checks(false, true, "fixed_route_loop");
+      solution_ptr->sol_handle->sync_stream();
+      auto [success, offset] = squeeze_all_and_save();
+      total_offset += offset;
+      if (!success) {
+        // In case of prize collection, we are ok with partial solutions. In the absence of prize
+        // collection, we require full solution even if it is infeasible and the diversity manager can
+        // make the solution feasible
+        if (!solution_ptr->problem_ptr->has_prize_collection()) {
+          solution_ptr->copy_device_solution(ges_loop_save_state);
+        } else {
+          // In case of prize collection, sometimes we have infeasible nodes and we could be stuck
+          // trying to insert those nodes while there are easy ones and empty routes. This can
+          // particularly happen because we give far less time for GES when prize collection is
+          // present
+          if (!EP.empty()) { greedy_insert(true); }
+        }
       } else {
-        // In case of prize collection, sometimes we have infeasible nodes and we could be stuck
-        // trying to insert those nodes while there are easy ones and empty routes. This can
-        // particularly happen because we give far less time for GES when prize collection is
-        // present
-        if (!EP.empty()) { greedy_insert(true); }
+        solution_ptr->global_runtime_checks(true, true, "fixed_route_loop_done");
       }
-    } else {
-      solution_ptr->global_runtime_checks(true, true, "fixed_route_loop_done");
-    }
 
-    EP.clear();
-    return success;
+      EP.clear();
+      return {success, total_offset};
+    }
   }
 
   solution_ptr->sol_handle->sync_stream();
   solution_ptr->global_runtime_checks(true, true, "fixed_route_loop_done");
-  return true;
+  return {true, total_offset};
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -410,10 +422,11 @@ i_t guided_ejection_search_t<i_t, f_t, REQUEST>::get_num_non_empty_vehicles()
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-bool guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
+std::pair<bool, std::chrono::steady_clock::duration> guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
 {
   auto& problem  = *(solution_ptr->problem_ptr);
   auto& dim_info = problem.dimensions_info;
+  std::chrono::steady_clock::duration total_offset(0);
 
   // Clear EP and remove all routes and start from scratch
   EP.clear();
@@ -454,7 +467,8 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
     if (!all_inserted) { local_search_ptr_->perturb_solution(*solution_ptr); }
 
     if (dim_info.has_dimension(dim_t::BREAK)) {
-      bool breaks_squeeze_success = try_squeeze_breaks_feasible();
+      auto [breaks_squeeze_success, offset] = try_squeeze_breaks_feasible();
+      total_offset += offset;
       if (!breaks_squeeze_success) {
         solution_ptr->eject_until_feasible();
         EP.clear();
@@ -476,7 +490,7 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
     if (EP.empty()) {
       repair_empty_routes();
       solution_ptr->global_runtime_checks(true, true, "construct_feasible_solution_end");
-      return true;
+      return {true, total_offset};
     }
   }
 
@@ -487,17 +501,19 @@ bool guided_ejection_search_t<i_t, f_t, REQUEST>::construct_feasible_solution()
   if (!EP.empty()) { greedy_insert(true); }
 
   solution_ptr->global_runtime_checks(false, true, "construct_feasible_solution_end");
-  return false;
+  return {false, total_offset};
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
-void guided_ejection_search_t<i_t, f_t, REQUEST>::route_minimizer_loop()
+std::chrono::steady_clock::duration guided_ejection_search_t<i_t, f_t, REQUEST>::route_minimizer_loop()
 {
   raft::common::nvtx::range fun_scope("route_minimizer_loop");
+  std::chrono::steady_clock::duration total_offset(0);
 
   // If ejection pool is not empty first run fixed route loop with
   if (!EP.empty()) {
-    bool success = fixed_route_loop();
+    auto [success, offset] = fixed_route_loop();
+    total_offset += offset;
     // If we can't get feasible solution with full fleet, we can't run the minimizer loop
     if (!success) {
       // If fixed route loop is not succesful, (i.e. there is no feasible solution that can serve
@@ -516,7 +532,7 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::route_minimizer_loop()
       // order vehicle match
       solution_ptr->remove_empty_routes();
 
-      return;
+      return total_offset;
     }
   }
 
@@ -541,7 +557,9 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::route_minimizer_loop()
     if (EP.empty()) { continue; }
 
     // If ges loop left early, restore state
-    if (!guided_ejection_search_loop(counter, true)) {
+    auto [success, offset] = guided_ejection_search_loop(counter, true);
+    total_offset += offset;
+    if (!success) {
       stream.synchronize();
       solution_ptr->copy_device_solution(ges_loop_save_state);
       stream.synchronize();
@@ -554,6 +572,7 @@ void guided_ejection_search_t<i_t, f_t, REQUEST>::route_minimizer_loop()
   // lowest priority (highest in numerical value) first. This logic has to be added to route
   // minimization loop
   solution_ptr->remove_empty_routes();
+  return total_offset;
 }
 
 ges_config_t get_config()

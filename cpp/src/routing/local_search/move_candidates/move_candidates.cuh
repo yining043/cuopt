@@ -324,7 +324,7 @@ class move_candidates_t {
   move_candidates_t(i_t n_orders,
                     i_t n_routes,
                     solution_handle_t<i_t, f_t> const* sol_handle_,
-                    const viables_t<i_t, f_t>& viables_)
+                    viables_t<i_t, f_t>& viables_)
     : cand_matrix(n_orders, n_routes, sol_handle_),
       debug_delta(sol_handle_->get_stream()),
       temp_storage(0, sol_handle_->get_stream()),
@@ -507,7 +507,7 @@ class move_candidates_t {
   infeasible_cost_t selection_weights;
   bool include_objective;
   // viable structure
-  const viables_t<i_t, f_t>& viables;
+  viables_t<i_t, f_t>& viables;
   // route_compatibility, this is dynamic and is filled in place
   rmm::device_uvector<uint8_t> route_compatibility;
   scross_move_candidates_t<i_t, f_t> scross_move_candidates;
