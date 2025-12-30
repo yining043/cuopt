@@ -119,7 +119,7 @@ def test_logp_consistency(n_locations=50, n_routes=5, num_problems=5):
     selected_indices_padded = [seq + [-1] * (max_k - len(seq)) for seq in selected_sequences]
     selected_indices = torch.tensor(selected_indices_padded, dtype=torch.long, device=policy.device)
     
-    logps_batch, _ = policy(
+    logps_batch, _, _ = policy(
         states, problem_data_list, 
         k=max_k, 
         given_sequence=selected_indices

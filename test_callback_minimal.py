@@ -323,10 +323,10 @@ def test_callback():
     
     # Setup problem using Problem class
     problem_gen = Problem(
-        n_locations=200,
-        n_vehicles=60,
+        n_locations=1001,
+        n_vehicles=21,
         coordinate_range=100.0,
-        capacity=200.0,
+        capacity=250.0,
         demand_range=(1, 10)
     )
     problem_data = problem_gen.generate()

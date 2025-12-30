@@ -24,8 +24,8 @@ from scipy.stats import pearsonr
 class Problem:
     """Unified problem generator for VRP instances"""
     
-    def __init__(self, n_locations=100, n_vehicles=50, 
-                 coordinate_range=100.0, capacity=100.0, 
+    def __init__(self, n_locations=1001, n_vehicles=21, 
+                 coordinate_range=100.0, capacity=250.0, 
                  demand_range=(1, 10)):
         self.n_locations = n_locations
         self.n_vehicles = n_vehicles
@@ -35,13 +35,13 @@ class Problem:
         self._problem_data = None
     
     def generate(self):
-        seed = 42
+        seed = 41
         np.random.seed(seed)
         random.seed(seed)
         n = self.n_locations
-        coords = np.random.random((n, 2)) * self.coordinate_range
-        distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2)
-        demand = np.concatenate([[0], np.random.randint(low=self.demand_range[0], high=self.demand_range[1] + 1, size=n - 1)])
+        coords = np.random.random((n, 2))
+        distances = np.linalg.norm(coords[:, np.newaxis] - coords[np.newaxis, :], axis=2) * self.coordinate_range
+        demand = np.concatenate([[0], np.random.randint(low=self.demand_range[0], high=self.demand_range[1], size=n - 1)])
         vehicle_capacity = np.full(self.n_vehicles, self.capacity, dtype=np.int32)
         
         self._problem_data = {
@@ -128,23 +128,20 @@ class CuOptCollector:
             print(f"Policy device: {self.policy_device} (total GPUs: {torch.cuda.device_count()})")
             
             self.policy = TransformerCandidatePolicy(
-                d_model=64,
-                num_heads=4,
-                num_encoder_layers=3,
-                max_vehicles=n_vehs,
-                N=n_locs,
-                problem_scale=100.0,
-                capacity_scale=50.0,
-                device=self.policy_device
-            )
+                 d_model=128,
+                 num_heads=8,
+                 num_encoder_layers=3,
+                 max_vehicles=n_vehs,
+                 N=n_locs,
+                 use_autoregressive_decoder=True,
+                 device=self.policy_device
+                )
             
             # Load checkpoint if provided
             if self.checkpoint_path is not None:
                 checkpoint = torch.load(self.checkpoint_path, weights_only=False)
-                self.policy.load_state_dict(checkpoint['policy_state_dict'])
+                self.policy.load_state_dict(checkpoint['model_state_dict'])
                 print(f"Loaded trained policy from: {self.checkpoint_path}")
-                print(f"  Trained for {checkpoint.get('epoch', 0)} epochs")
-                print(f"  Best cost: {checkpoint.get('best_cost', 0):.2f}")
             
         elif self.use_policy and self.policy is not None:
             # Check if dimensions match
@@ -204,14 +201,12 @@ class _CustomizeCallback(CustomizeNodesCallback):
         
         # Compute number of candidates
         num_candidates = sum(candidate_mask)
-        # if num_candidates < 40:
-        #     sample_size = num_candidates
-        # elif num_candidates < 80:
-        #     sample_size = num_candidates // 2
-        # else:
-        #     sample_size = 40
-        
-        sample_size = min(num_candidates, 10)
+        if num_candidates < 40:
+            sample_size = num_candidates
+        elif num_candidates < 80:
+            sample_size = num_candidates // 2
+        else:
+            sample_size = 40
 
         # Store before state in pending_state
         self.collector.global_history['pending_state'] = {
@@ -230,31 +225,35 @@ class _CustomizeCallback(CustomizeNodesCallback):
         if self.collector.use_policy:
             policy_start = time.perf_counter()
 
-            # Prepare state for policy
-            state = {
-                'solution_flat': solution_flat,
-                'candidate_mask': candidate_mask,
-                'solution_cost': solution_cost,
-                'num_routes': num_routes,
-                'num_candidates': num_candidates,
-                'sample_size': sample_size,
-            }        
+            nodes_tensor = torch.tensor(self.collector.problem_data['coordinates'], dtype=torch.float32, device=self.collector.policy_device)
+            demands_tensor = torch.tensor(self.collector.problem_data['demand'], dtype=torch.float32, device=self.collector.policy_device)
+            capacity_tensor = torch.tensor(self.collector.problem_data['vehicle_capacity'], dtype=torch.float32, device=self.collector.policy_device)
+            demands_tensor = demands_tensor / capacity_tensor[0]
+            if len(solution_flat) < len(candidate_mask):
+                solution_flat = solution_flat + [-1] * (len(candidate_mask) - len(solution_flat))
+            current_sol_tensor = torch.tensor(solution_flat, dtype=torch.float32, device=self.collector.policy_device)
+            candidates_tensor = torch.tensor(candidate_mask, dtype=torch.bool, device=self.collector.policy_device)
+            k_batch = torch.tensor([sample_size], dtype=torch.long, device=self.collector.policy_device)
             with torch.no_grad():
-                selected_node_ids, log_prob = self.collector.policy(
-                    state, 
-                    self.collector.problem_data,
-                    temperature=1.0
+                actions, log_probs = self.collector.policy(
+                    nodes_tensor=nodes_tensor.view(1,-1, 2), 
+                    demands_tensor=demands_tensor.view(1,-1, 1), 
+                    current_sol_tensor=current_sol_tensor.view(1,-1), 
+                    candidates_tensor=candidates_tensor.view(1,-1),
+                    k_batch=k_batch.view(1,-1), 
+                    selected_tensor=None, 
+                    training=False
                 )
-            
+            # import pdb; pdb.set_trace()
             policy_end = time.perf_counter()
             self.collector.policy_sample_time += (policy_end - policy_start)
             self.collector.policy_call_count += 1
             
-            selected_node_ids = selected_node_ids[0].tolist()
+            selected_node_ids = actions[0].tolist()
             selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
-            selection_mask[selected_node_ids] = 1
+            selection_mask[actions.cpu()] = 1
             selection_mask = selection_mask.tolist()
-            logp = log_prob.item()
+            logp = log_probs[0].item()
             selected_sequence = selected_node_ids
         else:
             # Random sampling
@@ -568,11 +567,11 @@ if __name__ == "__main__":
     parser.add_argument('--checkpoint', type=str, default=None, 
                        help='Path to trained policy checkpoint')
     parser.add_argument('--plot', action='store_true', help='Generate reward vs cost plot')
-    parser.add_argument('--n_locations', type=int, default=100, help='Number of locations')
-    parser.add_argument('--n_vehicles', type=int, default=30, help='Number of vehicles')
-    parser.add_argument('--capacity', type=float, default=100.0, help='Capacity')
+    parser.add_argument('--n_locations', type=int, default=1001, help='Number of locations')
+    parser.add_argument('--n_vehicles', type=int, default=21, help='Number of vehicles')
+    parser.add_argument('--capacity', type=float, default=250.0, help='Capacity')
     parser.add_argument('--n_episodes', type=int, default=3, help='Number of episodes to run')
-    parser.add_argument('--time_limit', type=float, default=2.0, help='Time limit per episode')
+    parser.add_argument('--time_limit', type=float, default=5.0, help='Time limit per episode')
     args = parser.parse_args()
     
     collector = CuOptCollector(use_policy=args.policy, checkpoint_path=args.checkpoint)
