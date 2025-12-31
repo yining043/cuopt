@@ -1,6 +1,5 @@
 """
 Training script for Transformer Policy
-Contains training loop, data loading, checkpointing, and evaluation
 """
 import torch
 import torch.nn.functional as F
@@ -10,58 +9,17 @@ import wandb
 import argparse
 import os
 from datetime import datetime
-import glob
-
-from transformer_model import TransformerCandidatePolicy
-
-def adaptive_ranking_loss_simple(logp, scores):
-    """
-    logp:   模型输出, 形状 [Batch, 10] (10个候选动作的对数概率)
-    scores: 真实 Cost, 形状 [Batch, 10] (路径越短，值越小)
-    """
-    # 第一步：把 10 个数据变成 10x10 的对战表
-    # logp.unsqueeze(2) 变成 [Batch, 10, 1] (列)
-    # logp.unsqueeze(1) 变成 [Batch, 1, 10] (行)
-    # 相减得到 diff_logp: [Batch, 10, 10]
-    # diff_logp[i][j] 存储的是 logp[i] - logp[j]
-    diff_logp = logp.unsqueeze(2) - logp.unsqueeze(1)
-
-    # 第二步：计算 Cost 的差距
-    # 我们希望 Cost 越小的，logp 越大
-    # 所以算 scores[j] - scores[i]。如果 > 0，说明 i 比 j 好
-    diff_scores = scores.unsqueeze(1) - scores.unsqueeze(2)
-    diff_scores = diff_scores.to(logp.device)
-
-    # 第三步：只看"赢了"的那些对决
-    # 我们只关心那些 i 比 j 好的情况 (mask)
-    mask = (diff_scores > 0).float().to(logp.device)
-    
-    # 第四步：自适应修正 (这是你最关心的部分)
-    # 权重 = Cost 的实际差值。
-    # 如果 A 比 B 只好一点点，权重就小；如果 A 比 B 好非常多，权重就大。
-    weights = diff_scores * mask
-
-    # 第五步：计算损失
-    # 我们希望当 i 赢了 j 时，diff_logp (logp_i - logp_j) 越大越好
-    # 这里用 sigmoid 转化：sigmoid(logp_i - logp_j) 越接近 1 越好
-    # 对其取 -log 就是我们要最小化的 Loss
-    loss_matrix = -F.logsigmoid(diff_logp)
-
-    # 第六步：加权平均
-    # 只对有意义的对决 (mask=1) 求加权和
-    total_loss = (loss_matrix * weights).sum() / (mask.sum() + 1e-7)
-
-    return total_loss
+from model import Policy
 
 class VRPDataset(Dataset):
-    def __init__(self, data):
+    def __init__(self, datafile):
+        data = torch.load(datafile)
         self.nodes_tensor = data["nodes_tensor"]
         self.demands_tensor = data["demands_tensor"]
         self.current_sol_tensor = data["current_sol_tensor"]
         self.candidates_tensor = data["candidates_tensor"]
         self.selected_tensor = data["selected_tensor"]
         self.score_tensor = data["score_tensor"]
-        self.max_candidates_length = data["max_candidates_length"]
     
     def __len__(self):
         return self.nodes_tensor.shape[0]
@@ -73,241 +31,172 @@ class VRPDataset(Dataset):
             'current_sol': self.current_sol_tensor[idx],
             'candidates': self.candidates_tensor[idx],
             'selected': self.selected_tensor[idx],
-            'score': self.score_tensor[idx],
-            'max_candidates_length': self.max_candidates_length
+            'score': self.score_tensor[idx]
         }
 
-def save_checkpoint(policy, optimizer, epoch, global_step, checkpoint_dir, max_checkpoints=5):
+def save_checkpoint(model, optimizer, epoch, global_step, checkpoint_dir):
     os.makedirs(checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch+1}_step_{global_step}.pt")
-    
     torch.save({
-        'epoch': epoch + 1,
+        'epoch': epoch,
         'global_step': global_step,
-        'model_state_dict': policy.state_dict(),
+        'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-    }, checkpoint_path)
-    
-    checkpoints = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint_epoch_*.pt")), 
-                        key=lambda x: (int(x.split('_')[-3]), int(x.split('_')[-1].split('.')[0])))
-    
-    if len(checkpoints) > max_checkpoints:
-        for old_checkpoint in checkpoints[:-max_checkpoints]:
-            os.remove(old_checkpoint)
+    }, os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}.pt"))
 
-def load_checkpoint(checkpoint_path, policy, optimizer=None):
-    checkpoint = torch.load(checkpoint_path, map_location=policy.device)
-    policy.load_state_dict(checkpoint['model_state_dict'])
-    if optimizer is not None:
+def load_checkpoint(checkpoint_path, model, optimizer=None):
+    checkpoint = torch.load(checkpoint_path, map_location=model.device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if optimizer:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    return checkpoint['epoch'], checkpoint['global_step']
+    return checkpoint['epoch'], checkpoint.get('global_step', 0)
 
-def eval_only(checkpoint_path, use_autoregressive_decoder=True, loss_type="adaptive"):
-    policy = TransformerCandidatePolicy(use_autoregressive_decoder=use_autoregressive_decoder)
-    load_checkpoint(checkpoint_path, policy)
-    
-    data = torch.load("ml_data.pt")
-    dataset = VRPDataset(data)
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=False)
-    gamma = 0.5 if loss_type == "margin" else None
-    
-    policy.eval()
-    total_loss = 0
-    num_batches = 0
-    
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            batch_scores = batch['score']
-            set_log_probs = policy(
-                batch['nodes'], batch['demands'], batch['current_sol'], 
-                batch['candidates'], batch['selected']
-            )
-            
-            # batch_scores越小越好，所以用升序排序
-            sorted_indices = torch.argsort(batch_scores, dim=1, descending=False)
-            good_idx = sorted_indices[:, 0]  # score最小的（最好的）
-            bad_idx = sorted_indices[:, -1]  # score最大的（最差的）
-            
-            batch_range = torch.arange(set_log_probs.shape[0], device=set_log_probs.device)
-            sum_good = set_log_probs[batch_range, good_idx]
-            sum_bad = set_log_probs[batch_range, bad_idx]
-            if batch_scores[0, 0] != batch_scores[0, -1]:
-                print(torch.argsort(set_log_probs, dim=1, descending=True)[0].cpu())
-                print(set_log_probs[0], 'vs\n', batch_scores[0], 'at\n', batch_scores[0].gather(0, torch.argsort(set_log_probs, dim=1, descending=True)[0].cpu()))
-                print(sum_good[0], 'vs\n', sum_bad[0])
-            # Calculate loss based on loss_type
-            if loss_type == "adaptive":
-                loss = adaptive_ranking_loss_simple(set_log_probs, batch_scores)
-            else:  # margin ranking loss
-                loss = torch.clamp(gamma - (sum_good - sum_bad), min=0.0).mean()
-            
-            total_loss += loss.item()
-            num_batches += 1
-    
-    print(f"Loss: {total_loss / num_batches:.4f}, margin: {sum_good.mean().item() - sum_bad.mean().item():.4f}")
+def loss_function(logits, score, margin=0.1, mode='rank'):
+    # 1. Z-Score MSE Loss
+    # since we want to minimize the loss, we need to negate the score !!!
+    target_score = - score
+    s_mean, s_std = target_score.mean(dim=(1), keepdim=True), target_score.std(dim=(1), keepdim=True) + 1e-6
+    target = (target_score - s_mean) / s_std
+    l_mean, l_std = logits.mean(dim=(1), keepdim=True), logits.std(dim=(1), keepdim=True) + 1e-6
+    preds = (logits - l_mean) / l_std
+    mse_loss = F.mse_loss(preds, target)
 
-def train_transformer_policy(use_autoregressive_decoder=True, runname_prefix="", resume_checkpoint=None, loss_type="adaptive"):
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    runname = f"{runname_prefix}_{timestamp}" if runname_prefix else timestamp
-    checkpoint_dir = os.path.join("outputs", runname)
-    os.makedirs(checkpoint_dir, exist_ok=True)
+    # 2. All-Pairs Ranking Loss
+    preds_diff = preds.unsqueeze(2) - preds.unsqueeze(1)
+    target_diff = target.unsqueeze(2) - target.unsqueeze(1)
+    # label is 1 if target_i > target_j which is score_i < score_j
+    label = torch.sign(target_diff) 
+    score_weight = torch.abs(target_diff)
+    mask = torch.eye(logits.size(1), device=logits.device).unsqueeze(0) == 0
+    valid_pair_mask = mask & (label != 0)
+    # rank loss
+    rank_loss_matrix = torch.relu(margin - label * preds_diff) * score_weight
+    rank_loss = rank_loss_matrix.sum() / valid_pair_mask.sum()
+
+    if mode == 'mse': return mse_loss
+    elif mode == 'rank': return rank_loss
+    elif mode == 'both': return mse_loss + rank_loss
+    else: raise ValueError(f"Invalid mode: {mode}")
+
+
+def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step):
+    model.train()
+    train_loss = 0
+    train_acc = 0
     
-    policy = TransformerCandidatePolicy(use_autoregressive_decoder=use_autoregressive_decoder)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=5e-5)
+    for batch in tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]"):
+        
+        nodes = batch['nodes'].to(device)
+        demands = batch['demands'].to(device)
+        current_sol = batch['current_sol'].to(device)
+        candidates = batch['candidates'].to(device)
+        selected = batch['selected'].to(device)
+        score = batch['score'].to(device)
+        
+        optimizer.zero_grad()
+        logits = model(nodes, demands, current_sol, candidates, selected)
+        loss = loss_function(logits, score)        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        global_step += 1
+        train_loss += loss.item()
+        # 计算 Top-1 准确率
+        with torch.no_grad():
+            acc = (logits.argmax(dim=1) == score.argmin(dim=1)).float().mean()
+            train_acc += acc.item()
+        
+        # Log every 10 gradient steps
+        if global_step % 10 == 0:
+            wandb.log({
+                "train/loss": loss.item(),
+                "train/acc": acc.item(),
+                "global_step": global_step,
+                "epoch": epoch + 1
+            })
+        
+    avg_train_loss = train_loss / len(train_loader)
+    avg_train_acc = train_acc / len(train_loader)
+    return avg_train_loss, avg_train_acc, global_step
+
+def evaluate(model, val_loader, device):
+    model.eval()
+    val_loss = 0
+    val_acc = 0
     
+    for batch in tqdm(val_loader, desc="Evaluating"):
+        nodes = batch['nodes'].to(device)
+        demands = batch['demands'].to(device)
+        current_sol = batch['current_sol'].to(device)
+        candidates = batch['candidates'].to(device)
+        selected = batch['selected'].to(device)
+        score = batch['score'].to(device)
+        
+        logits = model(nodes, demands, current_sol, candidates, selected)
+        v_loss = loss_function(logits, score)
+        val_loss += v_loss.item()
+        val_acc += (logits.argmax(dim=1) == score.argmin(dim=1)).float().mean().item()
+    
+    avg_val_loss = val_loss / len(val_loader)
+    avg_val_acc = val_acc / len(val_loader)
+    return avg_val_loss, avg_val_acc
+
+def train(data_path, checkpoint_dir, num_epochs=1000, batch_size=64, lr=5e-5, resume_checkpoint=None, runname=None):
+    ###########################################################################
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = Policy().to(device)
+    ###########################################################################
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     start_epoch = 0
     global_step = 0
     
     if resume_checkpoint:
-        start_epoch, global_step = load_checkpoint(resume_checkpoint, policy, optimizer)
-        print(f"Resumed from checkpoint: epoch {start_epoch}, step {global_step}")
+        start_epoch, global_step = load_checkpoint(resume_checkpoint, model, optimizer)
     
-    data = torch.load("ml_data.pt")
-    dataset = VRPDataset(data)
-    
+    dataset = VRPDataset(data_path)
     train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    train_dataloader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_dataloader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-    
-    num_epochs = 200
-    gamma = 0.5 if loss_type == "margin" else None
-    
-    wandb.init(
-        project="cuopt",
-        name=runname,
-    )
-    
-    print(f"Training samples: {train_size}, Validation samples: {val_size}")
+    wandb.init(project="cuopt", name=runname or os.path.basename(checkpoint_dir))
     
     for epoch in range(start_epoch, num_epochs):
-        policy.train()
-        total_loss = 0
-        num_batches = 0
-
-        pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
-        for batch in pbar:
-            batch_scores = batch['score']
-            
-            optimizer.zero_grad()
-            set_log_probs = policy(
-                batch['nodes'], batch['demands'], batch['current_sol'], 
-                batch['candidates'], batch['selected']
-            )
-            
-            # Calculate margin (shared for both loss types)
-            # batch_scores越小越好，所以用升序排序
-            sorted_indices = torch.argsort(batch_scores, dim=1, descending=False)
-            good_idx = sorted_indices[:, 0]  # score最小的（最好的）
-            bad_idx = sorted_indices[:, -1]  # score最大的（最差的）
-            batch_range = torch.arange(set_log_probs.shape[0], device=set_log_probs.device)
-            sum_good = set_log_probs[batch_range, good_idx]
-            sum_bad = set_log_probs[batch_range, bad_idx]
-            margin_value = (sum_good - sum_bad).mean().item()
-            
-            # Calculate loss based on loss_type
-            if loss_type == "adaptive":
-                loss = adaptive_ranking_loss_simple(set_log_probs, batch_scores)
-            else:  # margin ranking loss
-                loss = torch.clamp(gamma - (sum_good - sum_bad), min=0.0).mean()
-            
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            num_batches += 1
-            global_step += 1
-
-            margin_value = (sum_good - sum_bad).mean().item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'margin': f'{margin_value:.4f}'})
-            
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/avg_loss": total_loss / num_batches,
-                "train/margin": margin_value,
-                "train/good_score": sum_good.mean().item(),
-                "train/bad_score": sum_bad.mean().item(),
-                "epoch": epoch + 1,
-                "global_step": global_step
-            })
+        # Train one epoch
+        avg_train_loss, avg_train_acc, global_step = train_one_epoch(
+            model, train_loader, optimizer, device, epoch, global_step
+        )
         
-        avg_train_loss = total_loss / num_batches
+        # Evaluate
+        avg_val_loss, avg_val_acc = evaluate(model, val_loader, device)
         
-        policy.eval()
-        val_total_loss = 0
-        val_num_batches = 0
-        val_total_good_sum = 0
-        val_total_bad_sum = 0
-        
-        with torch.no_grad():
-            val_pbar = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
-            for batch in val_pbar:
-                batch_scores = batch['score']
-                
-                set_log_probs = policy(
-                    batch['nodes'], batch['demands'], batch['current_sol'], 
-                    batch['candidates'], batch['selected']
-                )
-                
-                # Calculate margin (shared for both loss types)
-                # batch_scores越小越好，所以用升序排序
-                sorted_indices = torch.argsort(batch_scores, dim=1, descending=False)
-                good_idx = sorted_indices[:, 0]  # score最小的（最好的）
-                bad_idx = sorted_indices[:, -1]  # score最大的（最差的）
-                batch_range = torch.arange(set_log_probs.shape[0], device=set_log_probs.device)
-                sum_good = set_log_probs[batch_range, good_idx]
-                sum_bad = set_log_probs[batch_range, bad_idx]
-                
-                # Calculate loss based on loss_type
-                if loss_type == "adaptive":
-                    loss = adaptive_ranking_loss_simple(set_log_probs, batch_scores)
-                else:  # margin ranking loss
-                    loss = torch.clamp(gamma - (sum_good - sum_bad), min=0.0).mean()
-                
-                val_total_loss += loss.item()
-                val_total_good_sum += sum_good.mean().item()
-                val_total_bad_sum += sum_bad.mean().item()
-                val_num_batches += 1
-                
-                margin_value = (sum_good - sum_bad).mean().item()
-                val_pbar.set_postfix({'loss': f'{loss.item():.4f}', 'margin': f'{margin_value:.4f}'})
-        
-        avg_val_loss = val_total_loss / val_num_batches
-        avg_val_margin = val_total_good_sum / val_num_batches - val_total_bad_sum / val_num_batches
-        
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, Val Margin: {avg_val_margin:.4f}")
-        
+        print(f"Epoch {epoch+1}: Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f} | Val Acc: {avg_val_acc:.4f}")
         wandb.log({
-            "train/epoch_loss": avg_train_loss,
-            "val/epoch_loss": avg_val_loss,
-            "val/margin": avg_val_margin,
-            "val/good_score": val_total_good_sum / val_num_batches,
-            "val/bad_score": val_total_bad_sum / val_num_batches,
-            "epoch": epoch + 1
+            "val/loss": avg_val_loss, 
+            "val/acc": avg_val_acc,
+            "epoch": epoch+1,
+            "global_step": global_step
         })
         
-        save_checkpoint(policy, optimizer, epoch, global_step, checkpoint_dir)
-
+        # Save checkpoint every 50 epochs or in the last 10 epochs
+        if (epoch + 1) % 5 == 0 or epoch + 1 > num_epochs - 10:
+            save_checkpoint(model, optimizer, epoch+1, global_step, checkpoint_dir)
+    
     wandb.finish()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--policy", required=True, choices=["NAR", "AR"], type=str)
-    parser.add_argument("--runname", type=str, default="", help="Prefix for run folder name")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
-    parser.add_argument("--eval", type=str, default=None, help="Checkpoint path for evaluation only mode")
-    parser.add_argument("--loss_type", type=str, default="adaptive", choices=["adaptive", "margin"], help="Loss type: 'adaptive' for adaptive_ranking_loss_simple, 'margin' for margin ranking loss")
+    parser.add_argument("--data", type=str, default="ml_data_large.pt")
+    parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--runname", type=str, default=None)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
-
-    if args.eval:
-        eval_only(args.eval, use_autoregressive_decoder=(args.policy == "AR"), loss_type=args.loss_type)
-    else:
-        train_transformer_policy(
-            use_autoregressive_decoder=(args.policy == "AR"),
-            runname_prefix=args.runname,
-            resume_checkpoint=args.resume,
-            loss_type=args.loss_type
-        )
-
+    args.runname = args.runname + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    checkpoint_dir = args.output or os.path.join("outputs", args.runname)
+    print(f"Checkpoint directory: {checkpoint_dir}")
+    train(args.data, checkpoint_dir, args.epochs, args.batch_size, args.lr, args.resume, args.runname)
