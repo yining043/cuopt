@@ -168,7 +168,7 @@ if __name__ == '__main__':
     pattern = os.path.join(dir_path, 'instance_*.txt')
     files = sorted(glob.glob(pattern), key=lambda x: int(re.search(r'instance_(\d+)\.txt', x).group(1)))
     
-    for file_path in tqdm(files[:50], desc="Parsing files"):
+    for file_path in tqdm(files, desc="Parsing files"):
         match = re.search(r'instance_(\d+)\.txt', file_path)
         index = int(match.group(1))
         
@@ -192,65 +192,94 @@ if __name__ == '__main__':
     max_candidates_length = max([r.n_nodes_w_dummy for r in results])
     dummy_depot_start = 1001
     
-    ml_data = {
-        'nodes_tensor': [],
-        'demands_tensor': [],
-        'current_sol': [],
-        'candidates': [],
-        'selected': [],
-        'score': []
-    }
+    # Process in batches to reduce memory usage
+    batch_size = 1000
+    batch_nodes = []
+    batch_demands = []
+    batch_current_sol = []
+    batch_candidates = []
+    batch_selected = []
+    batch_score = []
     
-    for search in results:
-        nodes_t, capacities_t, demands_t, costs_t, node_flags_t = search.instance_data
-        nodes = nodes_t[0]
-        demands = demands_t[0] / capacities_t[0]
+    for batch_idx in tqdm(range(0, len(results), batch_size), desc="Processing batches"):
+        batch_results = results[batch_idx:batch_idx + batch_size]
         
-        for iter_info in search.iterations:
-            if not iter_info.current_solution or not iter_info.trails:
-                continue
-
-            if len(iter_info.trails[0]['candidates']) == len(iter_info.trails[0]['selected']):
-                continue
+        ml_data = {
+            'nodes_tensor': [],
+            'demands_tensor': [],
+            'current_sol': [],
+            'candidates': [],
+            'selected': [],
+            'score': []
+        }
+        
+        for search in batch_results:
+            nodes_t, capacities_t, demands_t, costs_t, node_flags_t = search.instance_data
+            nodes = nodes_t[0]
+            demands = demands_t[0] / capacities_t[0]
             
-            current_sol_routes = iter_info.current_solution.get('routes', [])
-            flat_sol = []
-            for route_idx, route in enumerate(current_sol_routes):
-                if route_idx == 0:
-                    dummy_depot_nodes = list(range(dummy_depot_start, dummy_depot_start + 4))
-                else:
-                    dummy_depot_base = dummy_depot_start + 4 + (route_idx - 1) * 4
-                    dummy_depot_nodes = list(range(dummy_depot_base, dummy_depot_base + 4))
-                flat_sol.extend(dummy_depot_nodes)
-                flat_sol.extend(route[1:])
-            if len(flat_sol) < max_candidates_length:
-                flat_sol.extend([-1] * (max_candidates_length - len(flat_sol)))
-            
-            ml_data['nodes_tensor'].append(nodes)
-            ml_data['demands_tensor'].append(demands)
-            ml_data['current_sol'].append(flat_sol)
+            for iter_info in search.iterations:
+                if not iter_info.current_solution or not iter_info.trails:
+                    continue
 
-            for trail in iter_info.trails:
-                candidates = trail['candidates']
-                selected = trail['selected']
-                score = trail['score']
+                if len(iter_info.trails[0]['candidates']) == len(iter_info.trails[0]['selected']):
+                    continue
                 
-                candidates_bool = [False] * max_candidates_length
-                for idx in candidates: candidates_bool[idx] = True
+                current_sol_routes = iter_info.current_solution.get('routes', [])
+                flat_sol = []
+                for route_idx, route in enumerate(current_sol_routes):
+                    if route_idx == 0:
+                        dummy_depot_nodes = list(range(dummy_depot_start, dummy_depot_start + 4))
+                    else:
+                        dummy_depot_base = dummy_depot_start + 4 + (route_idx - 1) * 4
+                        dummy_depot_nodes = list(range(dummy_depot_base, dummy_depot_base + 4))
+                    flat_sol.extend(dummy_depot_nodes)
+                    flat_sol.extend(route[1:])
+                if len(flat_sol) < max_candidates_length:
+                    flat_sol.extend([-1] * (max_candidates_length - len(flat_sol)))
                 
-                selected_bool = [False] * max_candidates_length
-                for idx in selected: selected_bool[idx] = True
-                
-                ml_data['candidates'].append(candidates_bool)
-                ml_data['selected'].append(selected_bool)
-                ml_data['score'].append(score)
+                ml_data['nodes_tensor'].append(nodes)
+                ml_data['demands_tensor'].append(demands)
+                ml_data['current_sol'].append(flat_sol)
+
+                for trail in iter_info.trails:
+                    candidates = trail['candidates']
+                    selected = trail['selected']
+                    score = trail['score']
+                    
+                    candidates_bool = [False] * max_candidates_length
+                    for idx in candidates: candidates_bool[idx] = True
+                    
+                    selected_bool = [False] * max_candidates_length
+                    for idx in selected: selected_bool[idx] = True
+                    
+                    ml_data['candidates'].append(candidates_bool)
+                    ml_data['selected'].append(selected_bool)
+                    ml_data['score'].append(score)
+        
+        batch_nodes.append(torch.stack(ml_data['nodes_tensor']).view(-1, 1001, 2))
+        batch_demands.append(torch.stack(ml_data['demands_tensor']).view(-1, 1001, 1))
+        batch_current_sol.append(torch.tensor(ml_data['current_sol'], dtype=torch.int32).view(-1, max_candidates_length))
+        batch_candidates.append(torch.tensor(ml_data['candidates'], dtype=torch.bool).view(-1, 10, max_candidates_length))
+        batch_selected.append(torch.tensor(ml_data['selected'], dtype=torch.bool).view(-1, 10, max_candidates_length))
+        batch_score.append(torch.tensor(ml_data['score']).view(-1, 10))
     
-    nodes_tensor = torch.stack(ml_data['nodes_tensor']).view(-1, 1001, 2)
-    demands_tensor = torch.stack(ml_data['demands_tensor']).view(-1, 1001, 1)
-    current_sol_tensor = torch.tensor(ml_data['current_sol'], dtype=torch.int32).view(-1, max_candidates_length)
-    candidates_tensor = torch.tensor(ml_data['candidates'], dtype=torch.bool).view(-1, 10, max_candidates_length)
-    selected_tensor = torch.tensor(ml_data['selected'], dtype=torch.bool).view(-1, 10, max_candidates_length)
-    score_tensor = torch.tensor(ml_data['score']).view(-1, 10)
+    nodes_tensor = torch.cat(batch_nodes, dim=0)
+    demands_tensor = torch.cat(batch_demands, dim=0)
+    current_sol_tensor = torch.cat(batch_current_sol, dim=0)
+    candidates_tensor = torch.cat(batch_candidates, dim=0)
+    selected_tensor = torch.cat(batch_selected, dim=0)
+    score_tensor = torch.cat(batch_score, dim=0)
+
+    # filter out useful datasets
+    candidates_tensor = candidates_tensor[:, :1, :]
+    index = score_tensor.std(1) > 1
+    nodes_tensor = nodes_tensor[index]
+    demands_tensor = demands_tensor[index]
+    current_sol_tensor = current_sol_tensor[index]
+    candidates_tensor = candidates_tensor[index]
+    selected_tensor = selected_tensor[index]
+    score_tensor = score_tensor[index]
     
     print(f"ML Data shapes:")
     print(f"  nodes_tensor: {nodes_tensor.shape}")
