@@ -144,7 +144,7 @@ def evaluate(model, val_loader, device):
 def train(data_path, checkpoint_dir, num_epochs=1000, batch_size=64, lr=5e-5, resume_checkpoint=None, runname=None):
     ###########################################################################
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Policy().to(device)
+    model = Policy(device=device)
     ###########################################################################
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -189,7 +189,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, default="ml_data_large.pt")
     parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--runname", type=str, default=None)
+    parser.add_argument("--runname", type=str, default='default')
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-4)

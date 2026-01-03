@@ -93,7 +93,7 @@ class Policy(nn.Module):
                  max_vehicles=21,
                  N=1001,
                  use_autoregressive_decoder=True,
-                 device='cuda'):
+                 device='cpu'):
         super().__init__()
         
         self.d_model = d_model
@@ -175,7 +175,7 @@ class Policy(nn.Module):
 
 def main():
     model = Policy()
-    data = torch.load('ml_data_large_temp.pt')
+    data = torch.load('ml_data_large.pt')
     nodes_tensor = data['nodes_tensor'][:128]
     demands_tensor = data['demands_tensor'][:128]
     current_sol_tensor = data['current_sol_tensor'][:128]
