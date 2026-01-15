@@ -158,42 +158,34 @@ def to_dict(search):
         ]
     }
 
-
 if __name__ == '__main__':
     dir_path = sys.argv[1]
     instance_file = sys.argv[2]
     
+    # 1. 解析文件 (这一步本身很快，不需要改)
     all_results = []
-    
     pattern = os.path.join(dir_path, 'instance_*.txt')
     files = sorted(glob.glob(pattern), key=lambda x: int(re.search(r'instance_(\d+)\.txt', x).group(1)))
     
     for file_path in tqdm(files, desc="Parsing files"):
         match = re.search(r'instance_(\d+)\.txt', file_path)
         index = int(match.group(1))
-        
         results = parse_output_file(file_path)
         instance_data = load_raw_data(instance_file, episode=1, begin_index=index)
-        
         for search in results:
             search.instance_index = index
             search.instance_data = instance_data
-        
         all_results.extend(results)
     
     results = all_results
-    total = 0
-    for result in results:
-        total += len(result.iterations)
+    total = sum(len(r.iterations) for r in results)
     print(f"Total searches loaded: {len(results)}")
     print(f"Total data point loaded: {total}")
 
-    # make for ML
     max_candidates_length = max([r.n_nodes_w_dummy for r in results])
     dummy_depot_start = 1001
     
-    # Process in batches to reduce memory usage
-    batch_size = 1000
+    # 2. 准备容器
     batch_nodes = []
     batch_demands = []
     batch_current_sol = []
@@ -201,8 +193,16 @@ if __name__ == '__main__':
     batch_selected = []
     batch_score = []
     
-    for batch_idx in tqdm(range(0, len(results), batch_size), desc="Processing batches"):
-        batch_results = results[batch_idx:batch_idx + batch_size]
+    # 适当调大 batch_size 以利用向量化优势
+    batch_size = 2000 
+    
+    import gc
+    pbar = tqdm(total=len(results), desc="Processing batches (Vectorized)")
+    
+    while len(results) > 0:
+        current_batch_size = min(batch_size, len(results))
+        batch_results = results[:current_batch_size]
+        del results[:current_batch_size] # 内存优化：处理完即删
         
         ml_data = {
             'nodes_tensor': [],
@@ -221,10 +221,10 @@ if __name__ == '__main__':
             for iter_info in search.iterations:
                 if not iter_info.current_solution or not iter_info.trails:
                     continue
-
                 if len(iter_info.trails[0]['candidates']) == len(iter_info.trails[0]['selected']):
                     continue
                 
+                # --- 优化点：Solution 构建逻辑不变 ---
                 current_sol_routes = iter_info.current_solution.get('routes', [])
                 flat_sol = []
                 for route_idx, route in enumerate(current_sol_routes):
@@ -242,38 +242,87 @@ if __name__ == '__main__':
                 ml_data['demands_tensor'].append(demands)
                 ml_data['current_sol'].append(flat_sol)
 
+                # --- 核心提速改动开始 (Vectorized) ---
                 for trail in iter_info.trails:
                     candidates = trail['candidates']
                     selected = trail['selected']
                     score = trail['score']
                     
-                    candidates_bool = [False] * max_candidates_length
-                    for idx in candidates: candidates_bool[idx] = True
+                    # 极速优化：直接用 Tensor 操作代替 Python List 循环
+                    # 原代码：candidates_bool = [False]... for loop...
                     
-                    selected_bool = [False] * max_candidates_length
-                    for idx in selected: selected_bool[idx] = True
+                    # 新代码：
+                    c_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
+                    if candidates:
+                        c_tensor[candidates] = True # 瞬间完成赋值
                     
-                    ml_data['candidates'].append(candidates_bool)
-                    ml_data['selected'].append(selected_bool)
+                    s_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
+                    if selected:
+                        s_tensor[selected] = True   # 瞬间完成赋值
+                    
+                    ml_data['candidates'].append(c_tensor)
+                    ml_data['selected'].append(s_tensor)
                     ml_data['score'].append(score)
+                # --- 核心提速改动结束 ---
         
-        batch_nodes.append(torch.stack(ml_data['nodes_tensor']).view(-1, 1001, 2))
-        batch_demands.append(torch.stack(ml_data['demands_tensor']).view(-1, 1001, 1))
-        batch_current_sol.append(torch.tensor(ml_data['current_sol'], dtype=torch.int32).view(-1, max_candidates_length))
-        batch_candidates.append(torch.tensor(ml_data['candidates'], dtype=torch.bool).view(-1, 10, max_candidates_length))
-        batch_selected.append(torch.tensor(ml_data['selected'], dtype=torch.bool).view(-1, 10, max_candidates_length))
-        batch_score.append(torch.tensor(ml_data['score']).view(-1, 10))
-    
-    nodes_tensor = torch.cat(batch_nodes, dim=0)
-    demands_tensor = torch.cat(batch_demands, dim=0)
-    current_sol_tensor = torch.cat(batch_current_sol, dim=0)
-    candidates_tensor = torch.cat(batch_candidates, dim=0)
-    selected_tensor = torch.cat(batch_selected, dim=0)
-    score_tensor = torch.cat(batch_score, dim=0)
+        del batch_results
+        
+        if len(ml_data['nodes_tensor']) > 0:
+            batch_nodes.append(torch.stack(ml_data['nodes_tensor']).view(-1, 1001, 2))
+            batch_demands.append(torch.stack(ml_data['demands_tensor']).view(-1, 1001, 1))
+            batch_current_sol.append(torch.tensor(ml_data['current_sol']).view(-1, max_candidates_length))
+            
+            # 由于 ml_data 里已经是 tensor 了，这里直接 stack
+            batch_candidates.append(torch.stack(ml_data['candidates']).view(-1, 10, max_candidates_length))
+            batch_selected.append(torch.stack(ml_data['selected']).view(-1, 10, max_candidates_length))
+            batch_score.append(torch.tensor(ml_data['score']).view(-1, 10))
+            
+        pbar.update(current_batch_size)
+        gc.collect()
 
-    # filter out useful datasets
+    pbar.close()
+    del results
+    gc.collect()
+
+    # 内存优化：Smart Cat
+    def smart_cat(tensor_list, dtype=None):
+        if not tensor_list: return torch.empty(0)
+        total_rows = sum(t.shape[0] for t in tensor_list)
+        shape = (total_rows,) + tensor_list[0].shape[1:]
+        if dtype is None: dtype = tensor_list[0].dtype
+        final_tensor = torch.empty(shape, dtype=dtype)
+        start = 0
+        for i in range(len(tensor_list)):
+            t = tensor_list[i]
+            end = start + t.shape[0]
+            final_tensor[start:end] = t
+            start = end
+            tensor_list[i] = None 
+        return final_tensor
+
+    print("Concatenating tensors safely...")
+    nodes_tensor = smart_cat(batch_nodes)
+    del batch_nodes; gc.collect()
+    
+    demands_tensor = smart_cat(batch_demands)
+    del batch_demands; gc.collect()
+    
+    current_sol_tensor = smart_cat(batch_current_sol, dtype=torch.int16)
+    del batch_current_sol; gc.collect()
+    
+    candidates_tensor = smart_cat(batch_candidates)
+    del batch_candidates; gc.collect()
+    
+    selected_tensor = smart_cat(batch_selected)
+    del batch_selected; gc.collect()
+    
+    score_tensor = smart_cat(batch_score)
+    del batch_score; gc.collect()
+
+    # filter
     candidates_tensor = candidates_tensor[:, :1, :]
     index = score_tensor.std(1) > 1
+    
     nodes_tensor = nodes_tensor[index]
     demands_tensor = demands_tensor[index]
     current_sol_tensor = current_sol_tensor[index]
@@ -290,7 +339,6 @@ if __name__ == '__main__':
     print(f"  score_tensor: {score_tensor.shape}")
     print(f"  max_candidates_length: {max_candidates_length}")
 
-    # store ML data
     output_file = sys.argv[3] if len(sys.argv) > 3 else 'ml_data.pt'
     ml_data_dict = {
         'nodes_tensor': nodes_tensor,

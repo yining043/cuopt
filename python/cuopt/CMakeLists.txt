@@ -37,3 +37,4 @@ rapids_cython_init()
 
 add_subdirectory(cuopt)
 add_subdirectory(cuopt/linear_programming/internals/)
+add_subdirectory(cuopt/routing/internals/)

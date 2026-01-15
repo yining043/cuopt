@@ -34,6 +34,9 @@
 #include <vector>
 #include <algorithm>
 #include <random>
+#include <unordered_map>
+
+#include <cuopt/routing/utilities/internals.hpp>
 
 namespace cuopt {
 namespace routing {
@@ -259,6 +262,67 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
   return true;
 }
 
+template <typename i_t, typename f_t, request_t REQUEST>
+template <request_t r_t>
+std::vector<i_t> 
+local_search_t<i_t, f_t, REQUEST>::build_solution_flat(solution_t<i_t, f_t, r_t>& sol) const
+{
+  size_t n_nodes = sol.get_num_orders();
+  i_t total_nodes = n_nodes + sol.n_routes * 4;
+  
+  // Copy data from GPU to CPU
+  std::vector<i_t> h_route_ids(n_nodes);
+  std::vector<i_t> h_intra_idx(n_nodes);
+  raft::copy(h_route_ids.data(), 
+            sol.route_node_map.route_id_per_node.data(), 
+            n_nodes, 
+            sol.sol_handle->get_stream());
+  raft::copy(h_intra_idx.data(), 
+            sol.route_node_map.intra_route_idx_per_node.data(), 
+            n_nodes, 
+            sol.sol_handle->get_stream());
+  
+  // Initialize solution_flat
+  std::vector<i_t> solution_flat;
+  solution_flat.reserve(total_nodes);
+  
+  // Initialize temporary route storage
+  std::vector<std::vector<i_t>> routes_temp(sol.n_routes);
+  std::vector<i_t> max_route_length(sol.n_routes, 0);
+  for (i_t r = 0; r < sol.n_routes; ++r) {
+    routes_temp[r].resize(n_nodes, -1);
+  }
+  
+  // Rebuild route structure from node mappings
+  sol.sol_handle->sync_stream();
+  for (i_t node_id = 0; node_id < (i_t)n_nodes; ++node_id) {
+    i_t route_id = h_route_ids[node_id];
+    i_t intra_idx = h_intra_idx[node_id];
+    if (route_id != -1) {
+      routes_temp[route_id][intra_idx] = node_id;
+      max_route_length[route_id] = std::max(max_route_length[route_id], intra_idx);
+    }
+  }
+  
+  // Build flattened solution: for each route, add 4 dummy depot nodes + real nodes
+  for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
+    // Add 4 dummy depot nodes
+    for (i_t batch = 0; batch < 4; ++batch) {
+      i_t dummy_id = n_nodes + route_id * 4 + batch;
+      solution_flat.push_back(dummy_id);
+    }
+    // Add real nodes (only iterate to actual max, skip position 0 depot)
+    for (i_t i = 1; i <= max_route_length[route_id]; ++i) {
+      i_t node_id = routes_temp[route_id][i];
+      if (node_id != -1) {
+        solution_flat.push_back(node_id);
+      }
+    }
+  }
+  
+  return solution_flat;
+}
+
 template <typename i_t>
 i_t get_sample_size_vrp(i_t n_of_changed_nodes)
 {
@@ -314,6 +378,18 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
   std::mt19937_64 rng(std::random_device{}());
   double best_score = 1000000000.0;
   int best_p = 0;
+  bool pred_with_NN = false;
+  // Get customize nodes callback
+  callbacks::customize_nodes_callback_t<i_t, f_t>* obs_callback = nullptr;
+  if (sol.problem_ptr->solver_settings_ptr) {
+    for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
+      if (callback->get_type() == callbacks::callback_type_t::CUSTOMIZE_NODES) {
+        obs_callback = static_cast<callbacks::customize_nodes_callback_t<i_t, f_t>*>(callback);
+        pred_with_NN = true;
+        break;
+      }
+    }
+  }
 
   auto load_to_device_both = [&](std::vector<NodeInfo<int>> nodes_to_search) {
     move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
@@ -337,7 +413,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
           for (int i = 0; i < N_nodes_w_dummy; ++i) {
             global_orders[p][i] = i;
           }
-          std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
+          // std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
         }
       }
       base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
@@ -348,102 +424,163 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       best_node_to_search = base_node_to_search;
       i_t best_node_size = static_cast<i_t>(best_node_to_search.size());
       i_t sample_size = get_sample_size_vrp(best_node_to_search.size());
-      printf("[iter #%d] best_node_size: %d, sample_size: %d\n", iter - 2, best_node_size, sample_size);
-      //print solution info
-      sol.sol_handle->sync_stream();
-      printf("[current_solution] number_of_routes: %d, ", sol.get_n_routes());
-      for (i_t i = 0; i < sol.get_n_routes(); ++i) {
-        auto& route = sol.get_route(i);
-        auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
-        i_t n_nodes = route.n_nodes.value(sol.sol_handle->get_stream());
-        printf("[");
-        for (i_t j = 0; j < n_nodes; ++j) {
-          printf("%d", node_infos[j].node());
-          if (j < n_nodes - 1) {
-            printf(",");
-          }
-        }
-        printf("] ");
-      }
-      printf("\n");
-
-      for (int p = 0; p < max_p_size; ++p) {
-        for (int t = 0; t < 10; ++t) {
-          work_node_to_search = base_node_to_search;
-          if (t == 0) {
-            std::sort(work_node_to_search.begin(), 
-              work_node_to_search.begin() + work_node_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
-              return global_orders[p][a.node()] < global_orders[p][b.node()];
-            });
-          }
-          else {
-            std::shuffle(work_node_to_search.begin(), work_node_to_search.begin() + nodes_to_search_size, rng);
-          }
-          load_to_device_both(work_node_to_search);
-
-          //get the sample size 
-          i_t sample_size = get_sample_size_vrp(best_node_to_search.size());
-          // randomly sample only 10% of the first sample_size nodes and replace them with the remaining nodes
-          i_t best_node_size = static_cast<i_t>(best_node_to_search.size());
-          printf("[trail #%d] candidates: [", t);
-          for (size_t i = 0; i < base_node_to_search.size(); ++i) {
-            printf("%d", base_node_to_search[i].node());
-            if (i < base_node_to_search.size() - 1) {
-              printf(",");
-            }
-          }
-          printf("] selected: [");
-          for (int i = 0; i < sample_size; ++i) {
-            printf("%d", work_node_to_search[i].node());
-            if (i < sample_size - 1) {
+      if (pred_with_NN == false) {
+        printf("[iter #%d] best_node_size: %d, sample_size: %d\n", iter - 2, best_node_size, sample_size);
+        //print solution info
+        sol.sol_handle->sync_stream();
+        printf("[current_solution] number_of_routes: %d, ", sol.get_n_routes());
+        for (i_t i = 0; i < sol.get_n_routes(); ++i) {
+          auto& route = sol.get_route(i);
+          auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
+          i_t n_nodes = route.n_nodes.value(sol.sol_handle->get_stream());
+          printf("[");
+          for (i_t j = 0; j < n_nodes; ++j) {
+            printf("%d", node_infos[j].node());
+            if (j < n_nodes - 1) {
               printf(",");
             }
           }
           printf("] ");
+        }
+        printf("\n");
 
-          Sol trail_routes(sol);
-          bool move = true;
-          int horizon_count = 0;
-          while (move) {
-            move = run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96, false);
-            std::sort(move_candidates.nodes_to_search.h_nodes_to_search.begin(), 
-                      move_candidates.nodes_to_search.h_nodes_to_search.begin() + move_candidates.nodes_to_search.h_nodes_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
-              return global_orders[p][a.node()] < global_orders[p][b.node()];
-            });
-            horizon_count++;
-          }
-          auto s = trail_routes.get_cost(true, move_candidates.weights);
-          if (s < best_score) {
-            best_score = s;
-            best_node_to_search = work_node_to_search;  // 保存最佳配置
-            best_p = p;  // 保存最好的 global_order 索引
-          }
-          printf("score: %f best score: %f\n", s, best_score);
+        for (int p = 0; p < max_p_size; ++p) {
+          for (int t = 0; t < 10; ++t) {
+            work_node_to_search = base_node_to_search;
+            if (false &&t == 0) {
+              std::sort(work_node_to_search.begin(), 
+                work_node_to_search.begin() + work_node_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
+                return global_orders[p][a.node()] < global_orders[p][b.node()];
+              });
+            }
+            else {
+              std::shuffle(work_node_to_search.begin(), work_node_to_search.begin() + nodes_to_search_size, rng);
+            }
+            load_to_device_both(work_node_to_search);
 
-          //print solution info
-          trail_routes.sol_handle->sync_stream();
-          printf("[basin_solution #%d] number_of_routes: %d, ", t, trail_routes.get_n_routes());
-          for (i_t i = 0; i < trail_routes.get_n_routes(); ++i) {
-            auto& route = trail_routes.get_route(i);
-            auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
-            i_t n_nodes = route.n_nodes.value(trail_routes.sol_handle->get_stream());
-            printf("[");
-            for (i_t j = 0; j < n_nodes; ++j) {
-              printf("%d", node_infos[j].node());
-              if (j < n_nodes - 1) {
+            //get the sample size 
+            i_t sample_size = get_sample_size_vrp(best_node_to_search.size());
+            // randomly sample only 10% of the first sample_size nodes and replace them with the remaining nodes
+            i_t best_node_size = static_cast<i_t>(best_node_to_search.size());
+            printf("[trail #%d] candidates: [", t);
+            for (size_t i = 0; i < base_node_to_search.size(); ++i) {
+              printf("%d", base_node_to_search[i].node());
+              if (i < base_node_to_search.size() - 1) {
+                printf(",");
+              }
+            }
+            printf("] selected: [");
+            for (int i = 0; i < sample_size; ++i) {
+              printf("%d", work_node_to_search[i].node());
+              if (i < sample_size - 1) {
                 printf(",");
               }
             }
             printf("] ");
+
+            Sol trail_routes(sol);
+            bool move = true;
+            int horizon_count = 0;
+            for (int ii = 0; ii < 10 && move; ++ii)  {
+              move = run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96, false);
+              std::sort(move_candidates.nodes_to_search.h_nodes_to_search.begin(), 
+                        move_candidates.nodes_to_search.h_nodes_to_search.begin() + move_candidates.nodes_to_search.h_nodes_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
+                return global_orders[p][a.node()] < global_orders[p][b.node()];
+              });
+              horizon_count++;
+            }
+            auto s = trail_routes.get_cost(true, move_candidates.weights);
+            if (s < best_score) {
+              best_score = s;
+              best_node_to_search = work_node_to_search;  // 保存最佳配置
+              best_p = p;  // 保存最好的 global_order 索引
+            }
+            printf("score: %f best score: %f\n", s, best_score);
+
+            //print solution info
+            trail_routes.sol_handle->sync_stream();
+            printf("[basin_solution #%d] number_of_routes: %d, ", t, trail_routes.get_n_routes());
+            for (i_t i = 0; i < trail_routes.get_n_routes(); ++i) {
+              auto& route = trail_routes.get_route(i);
+              auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
+              i_t n_nodes = route.n_nodes.value(trail_routes.sol_handle->get_stream());
+              printf("[");
+              for (i_t j = 0; j < n_nodes; ++j) {
+                printf("%d", node_infos[j].node());
+                if (j < n_nodes - 1) {
+                  printf(",");
+                }
+              }
+              printf("] ");
+            }
+            printf("\n");
           }
-          printf("\n");
         }
       }
 
       // 更新没有被选中的 global_order 为全新的随机顺序
       for (int p = 0; p < max_p_size; ++p) {
         if (p != best_p) {
-          std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
+          // std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
+        }
+      }
+
+      // use callback and get best_node_to_search
+      if (pred_with_NN == true) {
+        
+        if (obs_callback) {
+          // Sync stream before building solution_flat
+          sol.sol_handle->sync_stream();
+          
+          // Build solution_flat
+          std::vector<i_t> solution_flat = this->build_solution_flat(sol);
+          f_t objective = sol.get_cost(true, move_candidates.weights);
+          
+          // Build candidate_mask from base_node_to_search
+          std::vector<i_t> candidate_mask(N_nodes_w_dummy, 0);
+          std::unordered_map<i_t, size_t> node_id_to_h_idx;
+          node_id_to_h_idx.reserve(base_node_to_search.size());
+          for (size_t i = 0; i < base_node_to_search.size(); ++i) {
+            i_t node_id = base_node_to_search[i].node();
+            candidate_mask[node_id] = 1;
+            node_id_to_h_idx[node_id] = i;  // Store index in base_node_to_search
+          }
+
+          std::vector<i_t> selection_mask;
+          obs_callback->customize_nodes_to_search(
+              &solution_flat,
+              sol.n_routes,
+              objective,
+              &candidate_mask,
+              &selection_mask,
+              iter
+          );
+
+          if (selection_mask.size() != (size_t)N_nodes_w_dummy) { 
+            printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)N_nodes_w_dummy);
+            exit(1); 
+          }
+
+           // Extract selected nodes from mask and build sampled lists (single pass)
+          best_node_to_search.clear();
+          for (i_t node_id = 0; node_id < N_nodes_w_dummy; ++node_id) {
+            auto it = node_id_to_h_idx.find(node_id);
+            if (it != node_id_to_h_idx.end()) {
+              size_t h_idx = it->second;
+              if (selection_mask[node_id] == 1) {
+                best_node_to_search.insert(best_node_to_search.begin(), base_node_to_search[h_idx]);
+              }
+              else {
+                best_node_to_search.push_back(base_node_to_search[h_idx]);
+              }
+            }
+          }
+        
+        } else {
+          // No callback available, fall back to base_node_to_search
+          best_node_to_search = base_node_to_search;
+          printf("No callback available, fall back to base_node_to_search\n");
+          exit(1);
         }
       }
 
@@ -451,6 +588,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       load_to_device_both(best_node_to_search);
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
+      printf("offset: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
       local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
       // #########
 
@@ -474,7 +612,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
     //########################################################
     sol.global_runtime_checks(
       should_all_nodes_be_served, false, "run_best_local_search_after_fast_search");
-    // printf("run cycle finder\n");
+    printf("[iter #%d] run cycle finder\n", iter);
     if (!run_cycle_finder || (sol.n_routes > 1023)) { break; }
     // cycle finder is needed even for single route in PDP cases
     if (REQUEST == request_t::VRP && sol.n_routes < 2) { break; }

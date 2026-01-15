@@ -137,6 +137,7 @@ cdef extern from "cuopt/routing/solve.hpp" namespace "cuopt::routing":
         void set_verbose_mode(bool verbose) except+
         void set_error_logging_mode(bool logging) except+
         void dump_best_results(const string &file_path, i_t interval) except+
+        void set_routing_callback(void* callback) except+
 
         f_t get_time_limit() except+
 
