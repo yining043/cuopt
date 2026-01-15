@@ -72,6 +72,24 @@ std::tuple<i_t, bool, std::string> solver_settings_t<i_t, f_t>::get_dump_best_re
   return std::make_tuple(dump_interval_, dump_best_results_, best_result_file_name_);
 }
 
+template <typename i_t, typename f_t>
+void solver_settings_t<i_t, f_t>::set_routing_callback(callbacks::base_routing_callback_t* callback)
+{
+  routing_callbacks_.push_back(callback);
+}
+
+template <typename i_t, typename f_t>
+void solver_settings_t<i_t, f_t>::set_routing_callback(void* callback)
+{
+  routing_callbacks_.push_back(static_cast<callbacks::base_routing_callback_t*>(callback));
+}
+
+template <typename i_t, typename f_t>
+const std::vector<callbacks::base_routing_callback_t*> solver_settings_t<i_t, f_t>::get_routing_callbacks() const
+{
+  return routing_callbacks_;
+}
+
 template class solver_settings_t<int, float>;
 }  // namespace routing
 }  // namespace cuopt

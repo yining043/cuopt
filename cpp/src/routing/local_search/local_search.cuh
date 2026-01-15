@@ -212,6 +212,9 @@ class local_search_t {
   void fill_pdp_considered_nodes(solution_t<i_t, f_t, REQUEST>& solution,
                                  move_candidates_t<i_t, f_t>& move_candidates);
 
+  template <request_t r_t>
+  std::vector<i_t> build_solution_flat(solution_t<i_t, f_t, r_t>& sol) const;
+
   static inline f_t time_limit;
   static inline std::chrono::time_point<std::chrono::steady_clock> start;
   static inline std::chrono::steady_clock::duration total_offset;
