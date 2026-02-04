@@ -57,6 +57,20 @@ version_cache.json
 # Local Server Error Log
 error_log.txt
 
+# Generated data and logs (from experiments)
+*.log
+basin_datasets/
+basin_datasets*/
+basin_stat/
+basin_stat*/
+plot/
+plots_*/
+wandb/
+.idea/
+*.backup
+*.csv
+trajectory_*.csv
+
 # docs
 docs/cuopt/source/cuopt-c/lp-milp/cuopt-cli-help.txt
 docs/cuopt/source/cuopt-server/client-api/sh-cli-help.txt

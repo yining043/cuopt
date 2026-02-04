@@ -1,0 +1,10 @@
+---
+description: Reply in Chinese; code and comments in English, concise
+alwaysApply: true
+---
+
+# Language and style
+
+- **Reply to the user in Chinese** (简体中文).
+- Write all code and comments in **English**.
+- Keep comments and docstrings **concise**.

@@ -32,6 +32,17 @@ class TestOption(Enum):
 
 
 def get_initial_solutions(routing_solution, n_initial_sols=5):
+    """
+    Generate multiple initial solutions by duplicating the same solution.
+    
+    Args:
+        routing_solution: The routing solution to duplicate
+        n_initial_sols: Number of initial solutions to generate (default: 5)
+    
+    Returns:
+        tuple: (vehicle_ids, routes, types, sol_offsets)
+        The number of initial solutions can be determined by: len(sol_offsets) - 1
+    """
     initial_sol = routing_solution.get_route()
     sol_offsets = [0]
     vehicle_ids = cudf.Series()
@@ -45,6 +56,19 @@ def get_initial_solutions(routing_solution, n_initial_sols=5):
         sol_offsets.append(sol_offsets[i] + initial_sol["route"].shape[0])
     sol_offsets = cudf.Series(sol_offsets)
     return vehicle_ids, routes, types, sol_offsets
+
+
+def get_num_initial_solutions(sol_offsets):
+    """
+    Get the number of initial solutions from sol_offsets.
+    
+    Args:
+        sol_offsets: Series or list of solution offsets (first element is 0)
+    
+    Returns:
+        int: Number of initial solutions
+    """
+    return len(sol_offsets) - 1
 
 
 @pytest.mark.parametrize(
@@ -126,6 +150,13 @@ def test_initial_solutions(flag):
     vehicle_ids, routes, types, sol_offsets = get_initial_solutions(
         routing_solution
     )
+    # Check the number of initial solutions
+    n_initial_sols = get_num_initial_solutions(sol_offsets)
+    print(f"Number of initial solutions: {n_initial_sols}")
+    print(f"vehicle_ids: {vehicle_ids}")
+    print(f"routes: {routes}")
+    print(f"types: {types}")
+    print(f"sol_offsets: {sol_offsets}")
     if flag == TestOption.PRIZE:
         vehicle_ids = cudf.Series([0, 0, 0, 0])
         routes = cudf.Series([0, 1, 2, 0])

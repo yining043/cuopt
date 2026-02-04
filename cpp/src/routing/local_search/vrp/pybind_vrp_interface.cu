@@ -305,8 +305,9 @@ void VrpLS::set_move_candidates_impl(const std::vector<std::vector<int>>& modifi
     }
     
     // Update nodes_to_search
-    printf("Setting nodes_to_search size to %zu\n", nodes_to_search.size());
+    // printf("Setting nodes_to_search size to %zu\n", nodes_to_search.size());
     local_search_obj->move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
+    local_search_obj->move_candidates.nodes_to_search.n_sampled_nodes = nodes_to_search.size();
 }
 
 std::vector<std::vector<int>> VrpLS::get_sampled_nodes_impl() const {
@@ -660,6 +661,7 @@ void VrpLS::reset_move_candidates() {
     auto* local_search_obj = static_cast<LocalSearch*>(local_search_ptr_);
     auto* solution_obj = static_cast<Solution*>(solution_ptr_);
     local_search_obj->move_candidates.reset(solution_obj->sol_handle);
+    local_search_obj->move_candidates.selection_weights = local_search_obj->move_candidates.weights;
 }
 
 bool VrpLS::perform_vrp_search() {

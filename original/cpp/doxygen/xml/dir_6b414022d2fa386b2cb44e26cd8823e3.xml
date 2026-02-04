@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='UTF-8' standalone='no'?>
+<doxygen xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="compound.xsd" version="1.9.1" xml:lang="en-US">
+  <compounddef id="dir_6b414022d2fa386b2cb44e26cd8823e3" kind="dir">
+    <compoundname>linear_programming</compoundname>
+    <innerfile refid="constants_8h">constants.h</innerfile>
+    <innerfile refid="cuopt__c_8h">cuopt_c.h</innerfile>
+    <briefdescription>
+    </briefdescription>
+    <detaileddescription>
+    </detaileddescription>
+    <location file="/home/jieyi/cuopt/original/cuopt/cpp/include/cuopt/linear_programming/"/>
+  </compounddef>
+</doxygen>

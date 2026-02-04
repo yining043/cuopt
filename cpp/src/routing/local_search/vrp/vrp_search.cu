@@ -720,6 +720,55 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
     move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
     move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
   }
+  // printf(">>> is_feasible: %d\n", (int)sol.is_feasible());
+  // printf("[current_solution] number_of_routes: %d, ", sol.get_n_routes());
+  // for (i_t i = 0; i < sol.get_n_routes(); ++i) {
+  //   auto& route = sol.get_route(i);
+  //   auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
+  //   i_t n_nodes = route.n_nodes.value(sol.sol_handle->get_stream());
+  //   printf("[");
+  //   for (i_t j = 0; j < n_nodes; ++j) {
+  //     printf("%d", node_infos[j].node());
+  //     if (j < n_nodes - 1) {
+  //       printf(",");
+  //     }
+  //   }
+  //   printf("] ");
+  // }
+  // printf("\n");
+  // // printf(">>> weights:", move_candidates.weights);
+  // // printf(">>> selection_weights:", move_candidates.selection_weights);
+  // // printf(">>> include_objective: %d\n", move_candidates.include_objective);
+  // // printf("\n");
+  // printf(">>> cost: %f\n", sol.get_cost(move_candidates.include_objective, move_candidates.weights));
+  // // Print cumulative demand for each route
+  // sol.sol_handle->sync_stream();
+  // if (sol.problem_ptr->dimensions_info.has_dimension(dim_t::CAP)) {
+  //   for (i_t route_id = 0; route_id < sol.n_routes; ++route_id) {
+  //     auto& route = sol.get_route(route_id);
+  //     i_t n_nodes = route.n_nodes.value(sol.sol_handle->get_stream());
+  //     if (n_nodes <= 0) continue;
+      
+  //     auto& cap_dim = route.dimensions.capacity_dim;
+  //     auto& cap_dim_info = cap_dim.dim_info;
+      
+  //     // Get gathered array (copy from device to host)
+  //     i_t stride = static_cast<i_t>(cap_dim.gathered.size() / cap_dim_info.n_capacity_dimensions);
+  //     i_t last_node_idx = n_nodes; // Last node (end depot) contains total cumulative demand
+      
+  //     printf("Route %d cumulative demand: ", (int)route_id);
+  //     for (int dim = 0; dim < cap_dim_info.n_capacity_dimensions; ++dim) {
+  //       i_t gathered_val;
+  //       i_t idx = dim * stride + last_node_idx;
+  //       raft::copy(&gathered_val, cap_dim.gathered.data() + idx, 1, sol.sol_handle->get_stream());
+  //       sol.sol_handle->sync_stream();
+  //       printf("%d ", (int)gathered_val);
+  //     }
+  //     printf("\n");
+  //   }
+  // }
+  // size_t n_nodes = sol.get_num_orders();
+  // printf(">>> n_nodes: %zu\n", n_nodes);
   return move_found;
 }
 

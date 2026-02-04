@@ -417,11 +417,11 @@ if buildAll || hasArg cuopt_sh_client; then
 fi
 
 # Build the docs
-if buildAll || hasArg docs; then
-    cd "${REPODIR}"/cpp/doxygen
-    doxygen Doxyfile
-
-    cd "${REPODIR}"/docs/cuopt
-    make clean
-    make html linkcheck
-fi
+#if buildAll || hasArg docs; then
+#    cd "${REPODIR}"/cpp/doxygen
+#    doxygen Doxyfile
+#
+#    cd "${REPODIR}"/docs/cuopt
+#    make clean
+#    make html linkcheck
+#fi
