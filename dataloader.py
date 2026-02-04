@@ -17,16 +17,9 @@ def _load_basin_info(path: str) -> Dict[str, dict]:
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             rec = json.loads(line)
-            # Prefer legacy NeuOpt-style `solution_flat` if present; otherwise use `solution` as-is.
             if "solution_flat" in rec:
                 rec["solution"] = solution_flat_to_solution(rec["solution_flat"])
                 rec.pop("solution_flat", None)
-            elif "solution" in rec:
-                # Assume already route-like with depot=0.
-                pass
-            else:
-                # Fallback: no solution info available.
-                rec["solution"] = [0, 0]
             info[rec["hash"]] = rec
     return info
 
@@ -335,4 +328,30 @@ def build_loader_from_args(args: Any, device: torch.device) -> Tuple[DataLoader,
         instance_data_by_idx=instance_data_by_idx,
     )
     print(f"Loaded {len(instance_data_list)} instances, {len(basin_data.basin_pairs)} pairs")
+
+    # Per-instance stats
+    basin_counts: Dict[int, int] = {}
+    for rec in basin_data.basin_info.values():
+        idx = rec.get("instance_idx", 0)
+        basin_counts[idx] = basin_counts.get(idx, 0) + 1
+
+    pair_counts: Dict[int, int] = {}
+    for p in basin_data.basin_pairs:
+        idx = p.get("instance_idx", 0)
+        pair_counts[idx] = pair_counts.get(idx, 0) + 1
+
+    print("Per-instance stats (basins / pairs):")
+    for idx in sorted(basin_counts.keys()):
+        bc = basin_counts.get(idx, 0)
+        pc = pair_counts.get(idx, 0)
+        print(f"  instance {idx}: {bc} basins, {pc} pairs")
+
+    if args.neg_mode == "masked_in_batch":
+        print(
+            "neg_mode=masked_in_batch: distant_basins.jsonl is used only to build sign_mask; "
+            "explicit distant negatives are not sampled (negatives are in-batch with masking)."
+        )
+    else:
+        print(f"neg_mode=distant: anchors_with_distant = {len(basin_data.anchor_to_distant)}")
+
     return loader, basin_data

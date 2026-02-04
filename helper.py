@@ -6,6 +6,16 @@ import sys
 import shutil
 from pathlib import Path
 from typing import Set
+import random
+
+def seed_everything(seed=2026):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.cuda.manual_seed_all(seed)
 
 def get_solution_with_dummy_depot(solution, problem_size):
     # solution.size: (batch, solution)

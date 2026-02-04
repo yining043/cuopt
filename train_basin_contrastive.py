@@ -14,12 +14,9 @@ embedding. Training objective is weighted InfoNCE:
 """
 
 import argparse
-import json
 import os
 from datetime import datetime
-from typing import Dict, List, Optional
-
-import numpy as np
+from typing import Optional
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -28,7 +25,7 @@ import wandb
 from dataloader import TrainBatch, build_loader_from_args
 from CVRPEnv import CVRPEnv
 from net import SolutionEmbedder
-from helper import copy_all_src
+from helper import copy_all_src, seed_everything
 
 
 def weighted_infonce_loss(
@@ -51,13 +48,23 @@ def weighted_infonce_loss(
     positives = pair_indices[:, 1]
 
     if include_mask is not None:
-        # include_mask: (n_pairs, N), mask out co-occurred (invalid negatives)
+        # include_mask: (n_pairs, N), mask out co-occurred (invalid negatives).
+        # We additionally drop self-similarity from the denominator.
         sim_for_anchors = sim.index_select(0, anchors)  # (n_pairs, N)
-        log_exp_sim = sim_for_anchors.clone()
-        log_exp_sim[include_mask == 0] = float("-inf")
+        n_pairs, n_emb = sim_for_anchors.size()
+
+        # Start from include_mask, then zero-out self positions (k == anchor)
+        mask = include_mask.clone()
+        row_idx = torch.arange(n_pairs, device=mask.device)
+        mask[row_idx, anchors] = 0.0  # remove self from denominator
+
+        log_exp_sim = sim_for_anchors.masked_fill(mask == 0, float("-inf"))
         log_denom = torch.logsumexp(log_exp_sim, dim=1)
     else:
-        log_denom = torch.logsumexp(sim, dim=1).index_select(0, anchors)
+        # Standard InfoNCE: exclude self-similarity from denominator.
+        sim_no_self = sim.clone()
+        sim_no_self.fill_diagonal_(float("-inf"))
+        log_denom = torch.logsumexp(sim_no_self, dim=1).index_select(0, anchors)
 
     log_num = sim[anchors, positives]
     loss = -(weights * (log_num - log_denom)).sum() / weights.sum()
@@ -79,9 +86,9 @@ def train_one_batch(
     optimizer.zero_grad()
     emb = embedder(context, env)
 
-    pair_idx = torch.tensor(batch.pair_indices, dtype=torch.long, device=device)
-    w = torch.tensor(batch.weights, dtype=torch.float32, device=device)
-    include_mask = batch.include_mask.to(device) if batch.include_mask is not None else None
+    pair_idx = torch.tensor(batch.pair_indices, dtype=torch.long, device=args.device)
+    w = torch.tensor(batch.weights, dtype=torch.float32, device=args.device)
+    include_mask = batch.include_mask.to(args.device) if batch.include_mask is not None else None
     loss = weighted_infonce_loss(emb, pair_idx, w, temperature, include_mask=include_mask)
 
     loss.backward()
@@ -90,8 +97,6 @@ def train_one_batch(
 
 
 def trainer(args: argparse.Namespace) -> None:
-    device = torch.device(args.device)
-
     # Run name & save dir
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{time_str}_{args.instance_indices}" if args.instance_indices else time_str
@@ -137,12 +142,13 @@ def trainer(args: argparse.Namespace) -> None:
         "qkv_dim": args.embedding_dim // args.n_heads,
         "hidden_dim": args.hidden_dim,
     }
-    embedder = SolutionEmbedder(model_params).to(device)
+    embedder = SolutionEmbedder(model_params).to(args.device)
     optimizer = torch.optim.Adam(embedder.parameters(), lr=args.lr)
 
     # Data loader
-    loader, basin_data = build_loader_from_args(args, device)
-    env = CVRPEnv(problem_size=args.problem_size, device=device)
+    loader, basin_data = build_loader_from_args(args, args.device)
+
+    env = CVRPEnv(problem_size=args.problem_size, device=args.device)
 
     # Train loop
     global_step = 0
@@ -156,7 +162,7 @@ def trainer(args: argparse.Namespace) -> None:
             
             env.load(batch.depot_xy, batch.node_xy_demand, basin_data.basin_info)
 
-            loss = train_one_batch(embedder, optimizer, batch, env, device, args.temperature)
+            loss = train_one_batch(embedder, optimizer, batch, env, args.device, args.temperature)
 
             total_loss += loss
             n_batches += 1
@@ -218,6 +224,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID.")
+    parser.add_argument("--seed", type=int, default=2026, help="Random seed.")
 
     # save related
     parser.add_argument("--save", type=str, default="out", help="Root dir for checkpoints; a subdir named like run name will be created (default: out).")
@@ -229,5 +237,18 @@ if __name__ == "__main__":
     parser.add_argument("--disable_wandb", dest="disable_wandb", action="store_true", help="Disable wandb logging when set.")
 
     args = parser.parse_args()
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    if torch.cuda.is_available():
+        args.device = torch.device('cuda')
+        torch.cuda.set_device(0)
+        torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    else:
+        args.device = torch.device('cpu')
+    print(">> USE_CUDA: {}, CUDA_DEVICE_NUM: {}".format(torch.cuda.is_available(), args.gpu_id))
+
+    torch.set_printoptions(threshold=1000000)
+    seed_everything(args.seed)
+
     trainer(args)
 

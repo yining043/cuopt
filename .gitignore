@@ -70,6 +70,11 @@ wandb/
 *.backup
 *.csv
 trajectory_*.csv
+out/
+perturb_k1_collect/
+*.txt
+*.xlsx
+*.jsonl
 
 # docs
 docs/cuopt/source/cuopt-c/lp-milp/cuopt-cli-help.txt
