@@ -244,12 +244,15 @@ def run_stage1(
                 )
 
             if val_list_d_ap and val_list_d_an:
+                hist_path = os.path.join(plot_dir, f"distance_hist_s1_epoch{epoch+1}.png")
                 plot_distance_histogram(
                     val_list_d_ap,
                     val_list_d_an,
-                    save_path=os.path.join(plot_dir, f"distance_hist_s1_epoch{epoch+1}.png"),
+                    save_path=hist_path,
                 )
-                print(f"[S1] Saved plot (val) to {plot_dir}/distance_hist_s1_epoch{epoch+1}.png")
+                print(f"[S1] Saved plot (val) to {hist_path}")
+                if wb_run is not None:
+                    wandb.log({"plot_s1/distance_hist": wandb.Image(hist_path)}, step=global_step)
 
             if first_triplet is not None:
                 inst_idx, rec, inst = first_triplet
@@ -267,15 +270,18 @@ def run_stage1(
                         emb = torch.cat([emb_a, emb_p], dim=0)
                         group_labels = [0, 1]
                     instance_ids = [inst_idx] * len(group_labels)
+                    emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.png")
                     plot_embedding_2d(
                         emb,
                         instance_ids=instance_ids,
                         group_labels=group_labels,
                         method="pca",
-                        save_path=os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.png"),
+                        save_path=emb_path,
                     )
                 embedder.train()
-                print(f"[S1] Saved plot (val) to {plot_dir}/embedding_2d_s1_epoch{epoch+1}.png")
+                print(f"[S1] Saved plot (val) to {emb_path}")
+                if wb_run is not None:
+                    wandb.log({"plot_s1/embedding_2d": wandb.Image(emb_path)}, step=global_step)
 
         avg_loss = total_loss / max(n_batches, 1)
         print(f"[S1] Epoch {epoch+1}/{args.epochs1} loss={avg_loss:.6f}")
@@ -441,11 +447,15 @@ def run_stage2(
 
             # Plots from same fixed val set
             if val_list_d_ap and val_list_d_an:
+                hist_path = os.path.join(plot_dir, f"distance_hist_epoch{epoch+1}.png")
                 plot_distance_histogram(
-                    val_list_d_ap, val_list_d_an,
-                    save_path=os.path.join(plot_dir, f"distance_hist_epoch{epoch+1}.png"),
+                    val_list_d_ap,
+                    val_list_d_an,
+                    save_path=hist_path,
                 )
-                print(f"[S2] Saved plot (val) to {plot_dir}/distance_hist_epoch{epoch+1}.png")
+                print(f"[S2] Saved plot (val) to {hist_path}")
+                if wb_run is not None:
+                    wandb.log({"plot_s2/distance_hist": wandb.Image(hist_path)}, step=global_step)
             if val_first_batch is not None:
                 embedder.eval()
                 with torch.no_grad():
@@ -457,15 +467,18 @@ def run_stage2(
                     B = emb_a.size(0)
                     group_labels = [0] * B + [1] * B + [2] * B
                     instance_ids = [val_first_batch.instance_idx] * (3 * B)
+                    emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.png")
                     plot_embedding_2d(
                         emb,
                         instance_ids=instance_ids,
                         group_labels=group_labels,
                         method="pca",
-                        save_path=os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.png"),
+                        save_path=emb_path,
                     )
                 embedder.train()
-                print(f"[S2] Saved plot (val) to {plot_dir}/embedding_2d_s2_epoch{epoch+1}.png")
+                print(f"[S2] Saved plot (val) to {emb_path}")
+                if wb_run is not None:
+                    wandb.log({"plot_s2/embedding_2d": wandb.Image(emb_path)}, step=global_step)
 
         if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs2:
             ckpt_path = os.path.join(save_dir, f"s2_epoch{epoch+1}.pt")
@@ -545,11 +558,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--n_layers", type=int, default=3)
     parser.add_argument("--supplement_feature_dim", type=int, default=5, help="Extra feature dim for encoder (from CVRPEnv.get_dynamic_feature).")
-    parser.add_argument(
-        "--use_l2_normalize",
-        action="store_true",
-        help="If set, L2-normalize pooled embeddings in SolutionEmbedder.forward (default off; triplet loss sees raw vectors).",
-    )
+    parser.add_argument("--use_l2_normalize", action="store_true", default=True, help="L2-normalize pooled embeddings in SolutionEmbedder.forward (default: True).")
 
     # stage selection
     parser.add_argument("--stage", type=str, choices=["1", "2", "both"], default="both", help="Training stage: 1=InfoNCE only, 2=Triplet only, both=run stage1 then stage2.")
@@ -570,12 +579,7 @@ if __name__ == "__main__":
     parser.add_argument("--margin", type=float, default=0.1, help="Triplet margin (stage 2).")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW (both stages).")
     parser.add_argument("--perturb_root", type=str, default="perturb_k1_collect", help="Root dir for perturb_data.jsonl files (stage 2).")
-    parser.add_argument(
-        "--val_data_1a1n10d",
-        type=str,
-        default="/home/jieyi/cuopt/basin_datasets0_analyze/val_data_1a1n10d.jsonl",
-        help="Stage-1 fixed validation set (anchor, neighbour, 10 distant basins).",
-    )
+    parser.add_argument("--val_data_1a1n10d", type=str, default="/home/jieyi/cuopt/basin_datasets0_analyze/val_data_1a1n10d.jsonl", help="Stage-1 fixed validation set (anchor, neighbour, 10 distant basins).")
     parser.add_argument("--val_data_1p1n", type=str, default="/home/jieyi/cuopt/perturb_k1_collect/val_data_1p1n.jsonl", help="Fixed validation set for stage 2 (1 anchor, 1 positive, 1 negative per line); instance_index maps to pkl.")
 
     # common

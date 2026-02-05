@@ -60,17 +60,42 @@ def embed_solutions(
     return emb
 
 
-def build_model(args: argparse.Namespace, device: torch.device) -> SolutionEmbedder:
+def build_model(
+    args: argparse.Namespace,
+    device: torch.device,
+    encoder_state: Optional[Dict[str, torch.Tensor]] = None,
+) -> SolutionEmbedder:
+    """Build SolutionEmbedder, optionally inferring dims from a checkpoint encoder_state.
+
+    This makes analysis robust even if supplement_feature_dim / embedding_dim changed in training.
+    """
+    # Defaults from args (used when no checkpoint info)
+    embedding_dim = args.embedding_dim
+    supplement_feature_dim = args.supplement_feature_dim
+    hidden_dim = args.hidden_dim
+
+    if encoder_state is not None:
+        # Infer embedding_dim and supplement_feature_dim from embedding_depot.weight
+        w_depot = encoder_state.get("embedding_depot.weight")
+        if w_depot is not None:
+            embedding_dim = int(w_depot.shape[0])
+            in_dim = int(w_depot.shape[1])
+            supplement_feature_dim = max(in_dim - 2, 0)
+        # Infer hidden_dim from first FF layer if available
+        w_ff1 = encoder_state.get("layers.0.ff.W1.weight")
+        if w_ff1 is not None:
+            hidden_dim = int(w_ff1.shape[0])
+
     model_params = {
         "problem": "CVRP",
-        "embedding_dim": args.embedding_dim,
+        "embedding_dim": embedding_dim,
         "encoder_layer_num": args.n_layers,
-        "supplement_feature_dim": args.supplement_feature_dim,
+        "supplement_feature_dim": supplement_feature_dim,
         "depot_feature_dim": 5,
         "node_feature_dim": 6,
         "head_num": args.n_heads,
         "qkv_dim": args.embedding_dim // args.n_heads,
-        "hidden_dim": args.hidden_dim,
+        "hidden_dim": hidden_dim,
         # For analysis we default to raw (unnormalized) embeddings unless user explicitly enables it.
         "use_l2_normalize": args.use_l2_normalize,
     }
@@ -184,10 +209,10 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
     plot_dir = os.path.join(args.checkpoint_dir, "analysis_s1")
     os.makedirs(plot_dir, exist_ok=True)
 
-    # Find S1 checkpoints
-    ckpts = sorted(glob.glob(os.path.join(args.checkpoint_dir, "s1_epoch*.pt")))
+    # Find checkpoints (any *.pt)
+    ckpts = sorted(glob.glob(os.path.join(args.checkpoint_dir, "*.pt")))
     if not ckpts:
-        print(f"[S1] No s1_epoch*.pt checkpoints found in {args.checkpoint_dir}")
+        print(f"[S1] No *.pt checkpoints found in {args.checkpoint_dir}")
         return
 
     print(f"[S1] Found {len(ckpts)} checkpoints.")
@@ -195,13 +220,14 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
     for ckpt_path in ckpts:
         print(f"[S1] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device)
+        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
         embedder.encoder.load_state_dict(ckpt["encoder_state"])
 
         mean_d_ap, mean_d_ad, ratio, d_ap_list, d_ad_list, first_triplet = eval_stage1_on_val(
             embedder, env, val_records, val_instance_data_by_idx, device
         )
         epoch = ckpt.get("epoch", "?")
+        base = os.path.splitext(os.path.basename(ckpt_path))[0]
         print(
             f"[S1] Epoch {epoch} val: d(A,neighbour)={mean_d_ap:.4f}, "
             f"d(A,distant)={mean_d_ad:.4f}, ratio={ratio:.4f}"
@@ -209,7 +235,7 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
 
         # Distance histogram
         if d_ap_list and d_ad_list:
-            hist_path = os.path.join(plot_dir, f"distance_hist_s1_epoch{epoch}.png")
+            hist_path = os.path.join(plot_dir, f"distance_hist_s1_{base}.png")
             plot_distance_histogram(d_ap_list, d_ad_list, save_path=hist_path)
             print(f"[S1] Saved {hist_path}")
 
@@ -234,7 +260,7 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
                     emb = torch.cat([emb_a, emb_p], dim=0)
                     group_labels = [0, 1]
                 instance_ids = [inst_idx] * len(group_labels)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch}.png")
+                emb_path = os.path.join(plot_dir, f"embedding_2d_s1_{base}.png")
                 plot_embedding_2d(
                     emb,
                     instance_ids=instance_ids,
@@ -259,9 +285,9 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
     plot_dir = os.path.join(args.checkpoint_dir, "analysis_s2")
     os.makedirs(plot_dir, exist_ok=True)
 
-    ckpts = sorted(glob.glob(os.path.join(args.checkpoint_dir, "s2_epoch*.pt")))
+    ckpts = sorted(glob.glob(os.path.join(args.checkpoint_dir, "*.pt")))
     if not ckpts:
-        print(f"[S2] No s2_epoch*.pt checkpoints found in {args.checkpoint_dir}")
+        print(f"[S2] No *.pt checkpoints found in {args.checkpoint_dir}")
         return
 
     print(f"[S2] Found {len(ckpts)} checkpoints.")
@@ -269,20 +295,21 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
     for ckpt_path in ckpts:
         print(f"[S2] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device)
+        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
         embedder.encoder.load_state_dict(ckpt["encoder_state"])
 
         mean_d_ap, mean_d_an, ratio, d_ap_list, d_an_list, first_batch = eval_stage2_on_val(
             embedder, env, val_triplets, val_instance_data_by_idx, device, args.batch_size2
         )
         epoch = ckpt.get("epoch", "?")
+        base = os.path.splitext(os.path.basename(ckpt_path))[0]
         print(
             f"[S2] Epoch {epoch} val: d(A,P)={mean_d_ap:.4f}, "
             f"d(A,N)={mean_d_an:.4f}, ratio={ratio:.4f}"
         )
 
         if d_ap_list and d_an_list:
-            hist_path = os.path.join(plot_dir, f"distance_hist_s2_epoch{epoch}.png")
+            hist_path = os.path.join(plot_dir, f"distance_hist_s2_{base}.png")
             plot_distance_histogram(d_ap_list, d_an_list, save_path=hist_path)
             print(f"[S2] Saved {hist_path}")
 
@@ -298,7 +325,7 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
                 B = emb_a.size(0)
                 group_labels = [0] * B + [1] * B + [2] * B
                 instance_ids = [first_batch.instance_idx] * (3 * B)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch}.png")
+                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_{base}.png")
                 plot_embedding_2d(
                     emb,
                     instance_ids=instance_ids,
@@ -333,11 +360,7 @@ def main() -> None:
     parser.add_argument("--n_heads", type=int, default=8)
     parser.add_argument("--n_layers", type=int, default=3)
     parser.add_argument("--supplement_feature_dim", type=int, default=5)
-    parser.add_argument(
-        "--use_l2_normalize",
-        action="store_true",
-        help="If set, L2-normalize pooled embeddings in SolutionEmbedder.forward during analysis (default off).",
-    )
+    parser.add_argument("--use_l2_normalize", action="store_true", help="L2-normalize pooled embeddings in SolutionEmbedder.forward during analysis (default off).")
 
     # Validation files
     parser.add_argument(
