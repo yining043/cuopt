@@ -1,20 +1,14 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Any, Optional, Tuple
 import numpy as np
-
-# --- Attention reshape util ---
-
 
 def reshape_by_heads(qkv: torch.Tensor, head_num: int) -> torch.Tensor:
     """Reshape (B, N, H*D) -> (B, H, N, D)."""
     B, N, _ = qkv.size()
     q_reshaped = qkv.view(B, N, head_num, -1)
     return q_reshaped.permute(0, 2, 1, 3)
-
-
-# --- Residual + LayerNorm / FFN ---
-
 
 class AddAndNormalizationModule(nn.Module):
     """Simple residual + LayerNorm."""
@@ -85,8 +79,6 @@ class EncoderLayer(nn.Module):
         return self.add_norm2(y, y2)
 
 
-# --- Encoder (depot + node embed, stacked layers) ---
-
 class Encoder(nn.Module):
     """
     - Embeds depot (x,y) and node (x,y,demand + supplement_feature).
@@ -99,11 +91,9 @@ class Encoder(nn.Module):
         self.problem = model_params["problem"]
         embedding_dim = model_params["embedding_dim"]
         encoder_layer_num = model_params["encoder_layer_num"]
-        supplement_feature_dim = model_params.get("supplement_feature_dim", 0)
-        depot_in = model_params.get("depot_feature_dim", 2 + supplement_feature_dim)
-        node_in = model_params.get("node_feature_dim", 3 + supplement_feature_dim)
-        self.embedding_depot = nn.Linear(depot_in, embedding_dim)
-        self.embedding_node = nn.Linear(node_in, embedding_dim)
+        supplement_feature_dim = model_params["supplement_feature_dim"]
+        self.embedding_depot = nn.Linear( 2 + supplement_feature_dim, embedding_dim)
+        self.embedding_node = nn.Linear(3 + supplement_feature_dim, embedding_dim)
 
         self.layers = nn.ModuleList([EncoderLayer(**model_params) for _ in range(encoder_layer_num)])
 
@@ -153,18 +143,17 @@ class SolutionEmbedder(nn.Module):
         self.head_num = model_params["head_num"]
         qkv_dim = model_params["qkv_dim"]
         self.pos_encoder = MultiHeadPosCompat(self.embedding_dim, self.head_num, qkv_dim)
+        # Whether to L2-normalize pooled embeddings
+        self.use_l2_normalize: bool = bool(model_params.get("use_l2_normalize", False))
 
-    @staticmethod
-    def basesin(x: np.ndarray, Td: int, fai: float) -> np.ndarray:
-        """Base sine wave with period Td and phase fai."""
-        return np.sin((2 * np.pi / float(Td)) * x + fai)
+    def basesin(self, x, T, fai=0):
+        return np.sin(2 * np.pi / T * np.abs(np.mod(x, 2 * T) - T) + fai)
 
-    @staticmethod
-    def basecos(x: np.ndarray, Td: int, fai: float) -> np.ndarray:
-        """Base cosine wave with period Td and phase fai."""
-        return np.cos((2 * np.pi / float(Td)) * x + fai)
+    def basecos(self, x, T, fai=0):
+        return np.cos(2 * np.pi / T * np.abs(np.mod(x, 2 * T) - T) + fai)
 
     def cyclic_position_encoding_pattern(self, n_position, emb_dim, mean_pooling=True):
+
         Td_set = np.linspace(np.power(n_position, 1 / (emb_dim // 2)), n_position, emb_dim // 2, dtype='int')
         x = np.zeros((n_position, emb_dim))
 
@@ -178,6 +167,7 @@ class SolutionEmbedder(nn.Module):
             else:
                 x[:, i] = self.basesin(longer_pattern, Td, fai)[
                     np.linspace(0, len(longer_pattern), n_position, dtype='int', endpoint=False)]
+
         pattern = torch.from_numpy(x).type(torch.FloatTensor)
         pattern_sum = torch.zeros_like(pattern).cpu()
 
@@ -209,7 +199,10 @@ class SolutionEmbedder(nn.Module):
         aux_scores = self.pos_encoder(h_pos) # (B, N+dummy, E)
 
         # encoder
-        h_em_final = self.encoder(depot_feature, node_feature, route_attn=aux_scores)
+        h = self.encoder(depot_feature, node_feature, route_attn=aux_scores)
 
-        # mean pooling
-        return h_em_final.mean(dim=1) # (B, E)
+        # mean pooling; optional L2 normalization controlled by model_params["use_l2_normalize"]
+        pooled = h.mean(dim=1)  # (B, E)
+        if self.use_l2_normalize:
+            return F.normalize(pooled, p=2, dim=-1)
+        return pooled

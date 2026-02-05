@@ -80,6 +80,92 @@ class TrainBatch:
 
 
 @dataclass
+class TripletBatch:
+    """One batch of triplets (anchor, positive, negative solutions)."""
+    anchor_solutions: List[List[int]]
+    positive_solutions: List[List[int]]
+    negative_solutions: List[List[int]]
+    instance_idx: int
+    depot_xy: torch.Tensor
+    node_xy_demand: torch.Tensor
+
+
+def load_perturb_data(path: str) -> List[dict]:
+    """Load perturb_data.jsonl: each line has anchor, positive_sample, negative_sample."""
+    data: List[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            data.append({
+                "anchor_solution": solution_flat_to_solution(rec["anchor"]["solution_flat"]),
+                "positive_solution": solution_flat_to_solution(rec["positive_sample"]["solution_flat"]),
+                "negative_solution": solution_flat_to_solution(rec["negative_sample"]["solution_flat"]),
+            })
+    return data
+
+
+def load_val_data_1a1n10d(path: str) -> List[Tuple[int, dict]]:
+    """Load val_data_1a1n10d.jsonl for Stage 1 validation.
+
+    Each line has:
+      - instance_index
+      - anchor: {hash, solution_flat, cost}
+      - neighbor: {hash, solution_flat, cost}
+      - distant_basins: list of {hash, solution_flat, cost}
+
+    Returns:
+      List of (instance_index, triplet_dict) where triplet_dict has:
+        - anchor_solution
+        - neighbor_solution
+        - distant_solutions: List[solution]
+    """
+    data: List[Tuple[int, dict]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            idx = int(rec["instance_index"])
+            anchor_sol = solution_flat_to_solution(rec["anchor"]["solution_flat"])
+            neighbor_sol = solution_flat_to_solution(rec["neighbor"]["solution_flat"])
+            distant_solutions = [
+                solution_flat_to_solution(d["solution_flat"]) for d in rec.get("distant_basins", [])
+            ]
+            data.append(
+                (
+                    idx,
+                    {
+                        "anchor_solution": anchor_sol,
+                        "neighbor_solution": neighbor_sol,
+                        "distant_solutions": distant_solutions,
+                    },
+                )
+            )
+    return data
+
+
+def load_val_data_1p1n(path: str) -> List[Tuple[int, dict]]:
+    """Load val_data_1p1n.jsonl: each line has instance_index, anchor, positive_sample, negative_sample.
+    Returns list of (instance_index, triplet_dict) for fixed validation set.
+    """
+    data: List[Tuple[int, dict]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            idx = int(rec["instance_index"])
+            data.append((idx, {
+                "anchor_solution": solution_flat_to_solution(rec["anchor"]["solution_flat"]),
+                "positive_solution": solution_flat_to_solution(rec["positive_sample"]["solution_flat"]),
+                "negative_solution": solution_flat_to_solution(rec["negative_sample"]["solution_flat"]),
+            }))
+    return data
+
+
+@dataclass
 class BasinData:
     """Result of load_basin_data: basin info, pairs, distant anchors, optional sign_mask for masked_in_batch."""
     indices: List[int]
