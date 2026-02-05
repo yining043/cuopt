@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import imageio.v2 as imageio
 import sys
 import shutil
 from pathlib import Path
@@ -52,6 +53,15 @@ def solution_flat_to_solution(solution_flat: List[int]) -> List[int]:
             continue
         out.append(x)
     return out
+
+
+def hamming_distance(solution_a: List[int], solution_b: List[int]) -> int:
+    """Hamming distance between two route-like solutions (pad with 0)."""
+    la, lb = len(solution_a), len(solution_b)
+    L = max(la, lb)
+    a = solution_a + [0] * (L - la)
+    b = solution_b + [0] * (L - lb)
+    return sum(int(x != y) for x, y in zip(a, b))
 
 
 def solution_to_routes(solution: List[int]) -> List[List[int]]:
@@ -478,3 +488,78 @@ def compute_recall_at_k(
             recalls.append(hit / len(pos_sets[i]))
         out[k] = sum(recalls) / len(recalls) if recalls else 0.0
     return out
+
+
+def make_triplet_gif(
+    coords: np.ndarray,
+    roles: np.ndarray,
+    triplet_ids: np.ndarray,
+    role_label_map: Dict[int, str],
+    role_color_map: Dict[int, str],
+    title_prefix: str,
+    gif_path: str,
+    duration: float = 2.0,
+) -> None:
+    """Generic GIF helper: each frame highlights a single triplet/record in 2D.
+
+    Args:
+        coords: (N, 2) 2D coordinates from plot_embedding_2d.
+        roles: (N,) int, group label per point (e.g. 0=anchor,1=pos,2=neg).
+        triplet_ids: (N,) int, which triplet / record each point belongs to.
+        role_label_map: mapping role -> legend label.
+        role_color_map: mapping role -> matplotlib color.
+        title_prefix: e.g. "S1 record" or "S2 triplet".
+        gif_path: output GIF path.
+        duration: seconds per frame.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[GIF] matplotlib not available, skip GIF.")
+        return
+
+    if coords.size == 0:
+        return
+
+    coords = np.asarray(coords)
+    roles = np.asarray(roles)
+    triplet_ids = np.asarray(triplet_ids)
+
+    frames: List[np.ndarray] = []
+    uniq_triplets = np.unique(triplet_ids)
+
+    for t_idx in uniq_triplets:
+        mask = triplet_ids == t_idx
+        trip_coords = coords[mask]
+        trip_roles = roles[mask]
+
+        fig, ax = plt.subplots(figsize=(4, 4))
+        for role in sorted(np.unique(trip_roles)):
+            role_mask = trip_roles == role
+            if not np.any(role_mask):
+                continue
+            color = role_color_map.get(int(role), "gray")
+            label = role_label_map.get(int(role), f"group {int(role)}")
+            ax.scatter(
+                trip_coords[role_mask, 0],
+                trip_coords[role_mask, 1],
+                s=40,
+                c=color,
+                label=label,
+            )
+
+        ax.set_title(f"{title_prefix} {int(t_idx)}")
+        ax.legend(loc="best", fontsize=8)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.tight_layout()
+
+        fig.canvas.draw()
+        buf = fig.canvas.buffer_rgba()
+        frame = np.asarray(buf, dtype=np.uint8)[..., :3].copy()
+        frames.append(frame)
+        plt.close(fig)
+
+    if frames:
+        os.makedirs(os.path.dirname(gif_path), exist_ok=True)
+        imageio.mimsave(gif_path, frames, duration=duration)

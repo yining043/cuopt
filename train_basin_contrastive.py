@@ -12,6 +12,7 @@ import random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -28,7 +29,14 @@ from dataloader import (
 )
 from CVRPEnv import CVRPEnv
 from net import SolutionEmbedder
-from helper import copy_all_src, load_instances_pkl, plot_distance_histogram, plot_embedding_2d, seed_everything
+from helper import (
+    copy_all_src,
+    load_instances_pkl,
+    plot_distance_histogram,
+    plot_embedding_2d,
+    seed_everything,
+    make_triplet_gif,
+)
 
 
 def embed_solutions(
@@ -207,6 +215,58 @@ def run_stage1(
         ratio = mean_d_an / (mean_d_ap + 1e-8) if list_d_ap and list_d_an else 0.0
         return mean_d_ap, mean_d_an, ratio, list_d_ap, list_d_an, first_triplet
 
+    # Optional: eval & plot once at random initialization (epoch 0)
+    if val_s1_records and args.plot_interval > 0:
+        embedder.eval()
+        with torch.no_grad():
+            val_d_ap, val_d_an, val_ratio, val_list_d_ap, val_list_d_an, first_triplet = eval_stage1_on_val()
+        embedder.train()
+        print(f"[S1] Epoch 0 (init) Val d(A,P)={val_d_ap:.4f} d(A,D)={val_d_an:.4f} d(A,D)/d(A,P)={val_ratio:.4f}")
+        if wb_run is not None:
+            wandb.log(
+                {"val_s1/d_ap": val_d_ap, "val_s1/d_an": val_d_an, "val_s1/d_an_over_d_ap": val_ratio},
+                step=global_step,
+            )
+        # plots at init
+        if val_list_d_ap and val_list_d_an:
+            hist_path = os.path.join(plot_dir, f"distance_hist_s1_epoch0.png")
+            plot_distance_histogram(val_list_d_ap, val_list_d_an, save_path=hist_path)
+            print(f"[S1] Saved plot (val, init) to {hist_path}")
+            if wb_run is not None:
+                wandb.log({"plot_s1/distance_hist": wandb.Image(hist_path)}, step=global_step)
+        if first_triplet is not None:
+            inst_idx, rec, inst = first_triplet
+            basin_cache: Dict[str, dict] = {}
+            embedder.eval()
+            with torch.no_grad():
+                env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
+                emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
+                emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
+                emb_d = (
+                    embed_solutions(embedder, rec["distant_solutions"], env, basin_cache)
+                    if rec["distant_solutions"]
+                    else None
+                )
+                if emb_d is not None:
+                    emb = torch.cat([emb_a, emb_p, emb_d], dim=0)
+                    group_labels = [0, 1] + [2] * emb_d.size(0)
+                else:
+                    emb = torch.cat([emb_a, emb_p], dim=0)
+                    group_labels = [0, 1]
+                instance_ids = [inst_idx] * len(group_labels)
+                emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch0.png")
+                plot_embedding_2d(
+                    emb,
+                    instance_ids=instance_ids,
+                    group_labels=group_labels,
+                    method="pca",
+                    save_path=emb_path,
+                )
+            embedder.train()
+            print(f"[S1] Saved plot (val, init) to {emb_path}")
+            if wb_run is not None:
+                wandb.log({"plot_s1/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+
     for epoch in range(args.epochs1):
         total_loss = 0.0
         n_batches = 0
@@ -254,34 +314,64 @@ def run_stage1(
                 if wb_run is not None:
                     wandb.log({"plot_s1/distance_hist": wandb.Image(hist_path)}, step=global_step)
 
-            if first_triplet is not None:
-                inst_idx, rec, inst = first_triplet
+            # Embedding 2D: use entire Stage-1 val set (all instances, all anchors/neighbours/distant)
+            if val_s1_records:
                 basin_cache: Dict[str, dict] = {}
+                all_emb: List[torch.Tensor] = []
+                all_inst_ids: List[int] = []
+                all_groups: List[int] = []
+                all_triplet_ids: List[int] = []
                 embedder.eval()
                 with torch.no_grad():
-                    env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
-                    emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
-                    emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
-                    emb_d = embed_solutions(embedder, rec["distant_solutions"], env, basin_cache) if rec["distant_solutions"] else None
-                    if emb_d is not None:
-                        emb = torch.cat([emb_a, emb_p, emb_d], dim=0)
-                        group_labels = [0, 1] + [2] * emb_d.size(0)
-                    else:
-                        emb = torch.cat([emb_a, emb_p], dim=0)
-                        group_labels = [0, 1]
-                    instance_ids = [inst_idx] * len(group_labels)
-                    emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.png")
-                    plot_embedding_2d(
-                        emb,
-                        instance_ids=instance_ids,
-                        group_labels=group_labels,
-                        method="pca",
-                        save_path=emb_path,
-                    )
-                embedder.train()
-                print(f"[S1] Saved plot (val) to {emb_path}")
-                if wb_run is not None:
-                    wandb.log({"plot_s1/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+                    for t_idx, (inst_idx, rec) in enumerate(val_s1_records):
+                        inst = val_s1_instance_data_by_idx[inst_idx]
+                        env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
+                        # anchor
+                        emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
+                        all_emb.append(emb_a.squeeze(0))
+                        all_inst_ids.append(inst_idx)
+                        all_groups.append(0)
+                        all_triplet_ids.append(t_idx)
+                        # neighbour
+                        emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
+                        all_emb.append(emb_p.squeeze(0))
+                        all_inst_ids.append(inst_idx)
+                        all_groups.append(1)
+                        all_triplet_ids.append(t_idx)
+                        # distant (may be many)
+                        if rec["distant_solutions"]:
+                            emb_d = embed_solutions(embedder, rec["distant_solutions"], env, basin_cache)
+                            for j in range(emb_d.size(0)):
+                                all_emb.append(emb_d[j])
+                                all_inst_ids.append(inst_idx)
+                                all_groups.append(2)
+                                all_triplet_ids.append(t_idx)
+                    if all_emb:
+                        emb = torch.stack(all_emb, dim=0)
+                        emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.png")
+                        coords = plot_embedding_2d(
+                            emb,
+                            instance_ids=all_inst_ids,
+                            group_labels=all_groups,
+                            method="pca",
+                            save_path=emb_path,
+                        )
+                        print(f"[S1] Saved plot (val, full S1 val set) to {emb_path}")
+                        if wb_run is not None:
+                            wandb.log({"plot_s1/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+
+                        # GIF: 每一帧高亮一条 (anchor, neighbour, distant) 记录
+                        gif_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.gif")
+                        make_triplet_gif(
+                            coords=coords,
+                            roles=np.asarray(all_groups, dtype=np.int64),
+                            triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
+                            role_label_map={0: "anchor", 1: "neighbour", 2: "distant"},
+                            role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:red"},
+                            title_prefix="S1 record",
+                            gif_path=gif_path,
+                            duration=2.0,
+                        )
 
         avg_loss = total_loss / max(n_batches, 1)
         print(f"[S1] Epoch {epoch+1}/{args.epochs1} loss={avg_loss:.6f}")
@@ -381,6 +471,73 @@ def run_stage2(
         mean_ratio = sum_ratio / n if n else 0.0
         return mean_d_ap, mean_d_an, mean_ratio, list_d_ap, list_d_an, first_batch
 
+    # Optional: eval & plot once at random initialization (epoch 0)
+    if val_triplets and args.plot_interval > 0:
+        embedder.eval()
+        with torch.no_grad():
+            val_d_ap, val_d_an, val_ratio, val_list_d_ap, val_list_d_an, val_first_batch = eval_on_val()
+        embedder.train()
+        print(f"[S2] Epoch 0 (init) Val d(A,P)={val_d_ap:.4f} d(A,N)={val_d_an:.4f} d(A,N)/d(A,P)={val_ratio:.4f}")
+        if wb_run is not None:
+            wandb.log(
+                {"val_s2/d_ap": val_d_ap, "val_s2/d_an": val_d_an, "val_s2/d_an_over_d_ap": val_ratio},
+                step=global_step,
+            )
+        if val_list_d_ap and val_list_d_an:
+            hist_path = os.path.join(plot_dir, f"distance_hist_epoch0.png")
+            plot_distance_histogram(val_list_d_ap, val_list_d_an, save_path=hist_path)
+            print(f"[S2] Saved plot (val, init) to {hist_path}")
+            if wb_run is not None:
+                wandb.log({"plot_s2/distance_hist": wandb.Image(hist_path)}, step=global_step)
+        if val_triplets:
+            basin_cache: Dict[str, dict] = {}
+            all_emb: List[torch.Tensor] = []
+            all_inst_ids: List[int] = []
+            all_groups: List[int] = []
+            all_triplet_ids: List[int] = []
+            embedder.eval()
+            with torch.no_grad():
+                for t_idx, (inst_idx, rec) in enumerate(val_triplets):
+                    inst = val_instance_data_by_idx[inst_idx]
+                    env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
+                    sols = [
+                        rec["anchor_solution"],
+                        rec["positive_solution"],
+                        rec["negative_solution"],
+                    ]
+                    for role, sol in enumerate(sols):
+                        emb = embed_solutions(embedder, [sol], env, basin_info_cache)
+                        all_emb.append(emb.squeeze(0))
+                        all_inst_ids.append(inst_idx)
+                        all_groups.append(role)
+                        all_triplet_ids.append(t_idx)
+            if all_emb:
+                emb = torch.stack(all_emb, dim=0)
+                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch0.png")
+                coords = plot_embedding_2d(
+                    emb,
+                    instance_ids=all_inst_ids,
+                    group_labels=all_groups,
+                    method="pca",
+                    save_path=emb_path,
+                )
+                print(f"[S2] Saved plot (val, init, full S2 val set) to {emb_path}")
+                if wb_run is not None:
+                    wandb.log({"plot_s2/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+
+                gif_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch0.gif")
+                make_triplet_gif(
+                    coords=coords,
+                    roles=np.asarray(all_groups, dtype=np.int64),
+                    triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
+                    role_label_map={0: "anchor", 1: "positive", 2: "negative"},
+                    role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
+                    title_prefix="S2 triplet",
+                    gif_path=gif_path,
+                    duration=2.0,
+                )
+            embedder.train()
+
     for epoch in range(args.epochs2):
         random.shuffle(all_triplets)
         total_loss, total_d_ap, total_d_an, total_ratio = 0.0, 0.0, 0.0, 0.0
@@ -435,7 +592,7 @@ def run_stage2(
         if (epoch + 1) % args.plot_interval == 0 and val_triplets:
             embedder.eval()
             with torch.no_grad():
-                val_d_ap, val_d_an, val_ratio, val_list_d_ap, val_list_d_an, val_first_batch = eval_on_val()
+                val_d_ap, val_d_an, val_ratio, val_list_d_ap, val_list_d_an, _ = eval_on_val()
             embedder.train()
 
             print(f"[S2] Val (fixed) d(A,P)={val_d_ap:.4f} d(A,N)={val_d_an:.4f} d(A,N)/d(A,P)={val_ratio:.4f}")
@@ -445,7 +602,7 @@ def run_stage2(
                     step=global_step,
                 )
 
-            # Plots from same fixed val set
+            # Distance histogram from fixed val set
             if val_list_d_ap and val_list_d_an:
                 hist_path = os.path.join(plot_dir, f"distance_hist_epoch{epoch+1}.png")
                 plot_distance_histogram(
@@ -456,29 +613,54 @@ def run_stage2(
                 print(f"[S2] Saved plot (val) to {hist_path}")
                 if wb_run is not None:
                     wandb.log({"plot_s2/distance_hist": wandb.Image(hist_path)}, step=global_step)
-            if val_first_batch is not None:
-                embedder.eval()
-                with torch.no_grad():
-                    env.load(val_first_batch.depot_xy, val_first_batch.node_xy_demand, basin_info_cache)
-                    emb_a = embed_solutions(embedder, val_first_batch.anchor_solutions, env, basin_info_cache)
-                    emb_p = embed_solutions(embedder, val_first_batch.positive_solutions, env, basin_info_cache)
-                    emb_n = embed_solutions(embedder, val_first_batch.negative_solutions, env, basin_info_cache)
-                    emb = torch.cat([emb_a, emb_p, emb_n], dim=0)
-                    B = emb_a.size(0)
-                    group_labels = [0] * B + [1] * B + [2] * B
-                    instance_ids = [val_first_batch.instance_idx] * (3 * B)
-                    emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.png")
-                    plot_embedding_2d(
-                        emb,
-                        instance_ids=instance_ids,
-                        group_labels=group_labels,
-                        method="pca",
-                        save_path=emb_path,
-                    )
-                embedder.train()
-                print(f"[S2] Saved plot (val) to {emb_path}")
+
+            # Embedding 2D & GIF: entire Stage-2 val set (all instances, all anchor/pos/neg)
+            basin_cache: Dict[str, dict] = {}
+            all_emb: List[torch.Tensor] = []
+            all_inst_ids: List[int] = []
+            all_groups: List[int] = []
+            all_triplet_ids: List[int] = []
+            embedder.eval()
+            with torch.no_grad():
+                for t_idx, (inst_idx, rec) in enumerate(val_triplets):
+                    inst = val_instance_data_by_idx[inst_idx]
+                    env.load(inst["depot_xy"], inst["node_xy_demand"], basin_info_cache)
+                    sols = [
+                        rec["anchor_solution"],
+                        rec["positive_solution"],
+                        rec["negative_solution"],
+                    ]
+                    for role, sol in enumerate(sols):
+                        emb = embed_solutions(embedder, [sol], env, basin_info_cache)
+                        all_emb.append(emb.squeeze(0))
+                        all_inst_ids.append(inst_idx)
+                        all_groups.append(role)
+                        all_triplet_ids.append(t_idx)
+            if all_emb:
+                emb_all = torch.stack(all_emb, dim=0)
+                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.png")
+                coords = plot_embedding_2d(
+                    emb_all,
+                    instance_ids=all_inst_ids,
+                    group_labels=all_groups,
+                    method="pca",
+                    save_path=emb_path,
+                )
+                print(f"[S2] Saved plot (val, full S2 val set) to {emb_path}")
                 if wb_run is not None:
                     wandb.log({"plot_s2/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+
+                gif_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.gif")
+                make_triplet_gif(
+                    coords=coords,
+                    roles=np.asarray(all_groups, dtype=np.int64),
+                    triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
+                    role_label_map={0: "anchor", 1: "positive", 2: "negative"},
+                    role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
+                    title_prefix="S2 triplet",
+                    gif_path=gif_path,
+                    duration=2.0,
+                )
 
         if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs2:
             ckpt_path = os.path.join(save_dir, f"s2_epoch{epoch+1}.pt")
@@ -566,7 +748,7 @@ if __name__ == "__main__":
 
     # stage 1 specific
     parser.add_argument("--epochs1", type=int, default=50, help="Epochs for stage 1.")
-    parser.add_argument("--batch_size", type=int, default=256, help="Batch size for stage 1.")
+    parser.add_argument("--batch_size", type=int, default=512, help="Batch size for stage 1.")
     parser.add_argument("--lr1", type=float, default=5e-4, help="Learning rate for stage 1.")
     parser.add_argument("--neg_mode", type=str, choices=["distant", "masked_in_batch"], default="masked_in_batch", help="Negative sampling for stage 1.")
     parser.add_argument("--max_negatives", type=int, default=64, help="Max distant basins per anchor (stage 1).")

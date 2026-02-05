@@ -23,6 +23,7 @@ import glob
 import os
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -37,6 +38,7 @@ from helper import (
     load_instances_pkl,
     plot_distance_histogram,
     plot_embedding_2d,
+    make_triplet_gif,
 )
 from net import SolutionEmbedder
 
@@ -139,6 +141,69 @@ def eval_stage1_on_val(
     return mean_d_ap, mean_d_ad, ratio, list_d_ap, list_d_ad, first_triplet
 
 
+def compute_s1_val_embeddings(
+    embedder: SolutionEmbedder,
+    env: CVRPEnv,
+    val_records: List[Tuple[int, dict]],
+    val_instance_data_by_idx: Dict[int, dict],
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Embed all Stage 1 val records and collect instance_ids, roles, and triplet_ids.
+
+    roles: 0 = anchor, 1 = neighbour, 2 = distant.
+    triplet_ids: index of record for each row.
+    """
+    if not val_records:
+        return None, None, None, None
+
+    embedder.eval()
+    all_embs: List[torch.Tensor] = []
+    instance_ids: List[int] = []
+    roles: List[int] = []
+    triplet_ids: List[int] = []
+
+    basin_cache: Dict[str, dict] = {}
+    with torch.no_grad():
+        for t_idx, (idx, rec) in enumerate(val_records):
+            inst = val_instance_data_by_idx[idx]
+            env.load(inst["depot_xy"].to(device), inst["node_xy_demand"].to(device), basin_cache)
+
+            # Anchor
+            emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
+            all_embs.append(emb_a.squeeze(0))
+            instance_ids.append(idx)
+            roles.append(0)
+            triplet_ids.append(t_idx)
+
+            # Neighbour
+            emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
+            all_embs.append(emb_p.squeeze(0))
+            instance_ids.append(idx)
+            roles.append(1)
+            triplet_ids.append(t_idx)
+
+            # Distant solutions (may be empty)
+            distant_solutions = rec.get("distant_solutions") or []
+            if distant_solutions:
+                emb_d = embed_solutions(embedder, distant_solutions, env, basin_cache)
+                for j in range(emb_d.size(0)):
+                    all_embs.append(emb_d[j])
+                    instance_ids.append(idx)
+                    roles.append(2)
+                    triplet_ids.append(t_idx)
+
+    if not all_embs:
+        return None, None, None, None
+
+    embs_tensor = torch.stack(all_embs, dim=0)
+    return (
+        embs_tensor,
+        np.asarray(instance_ids, dtype=np.int64),
+        np.asarray(roles, dtype=np.int64),
+        np.asarray(triplet_ids, dtype=np.int64),
+    )
+
+
 def eval_stage2_on_val(
     embedder: SolutionEmbedder,
     env: CVRPEnv,
@@ -194,6 +259,55 @@ def eval_stage2_on_val(
     return mean_d_ap, mean_d_an, mean_ratio, list_d_ap, list_d_an, first_batch
 
 
+def compute_s2_val_embeddings(
+    embedder: SolutionEmbedder,
+    env: CVRPEnv,
+    val_triplets: List[Tuple[int, dict]],
+    val_instance_data_by_idx: Dict[int, dict],
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """Embed all Stage 2 val triplets and collect instance_ids, roles, and triplet_ids."""
+    if not val_triplets:
+        return None, None, None, None
+
+    embedder.eval()
+    all_embs: List[torch.Tensor] = []
+    instance_ids: List[int] = []
+    roles: List[int] = []        # 0 = anchor, 1 = positive, 2 = negative
+    triplet_ids: List[int] = []  # index of triplet for each row
+
+    with torch.no_grad():
+        basin_cache: Dict[str, dict] = {}
+        for t_idx, (inst_idx, record) in enumerate(val_triplets):
+            inst = val_instance_data_by_idx[inst_idx]
+            depot_xy = inst["depot_xy"].to(device)
+            node_xy_demand = inst["node_xy_demand"].to(device)
+            env.load(depot_xy, node_xy_demand, basin_cache)
+
+            sols = [
+                record["anchor_solution"],
+                record["positive_solution"],
+                record["negative_solution"],
+            ]
+            for role, sol in enumerate(sols):
+                emb = embed_solutions(embedder, [sol], env, basin_cache)
+                all_embs.append(emb.squeeze(0))
+                instance_ids.append(inst_idx)
+                roles.append(role)
+                triplet_ids.append(t_idx)
+
+    if not all_embs:
+        return None, None, None, None
+
+    embs_tensor = torch.stack(all_embs, dim=0)  # (3*T, D)
+    return (
+        embs_tensor,
+        np.asarray(instance_ids, dtype=np.int64),
+        np.asarray(roles, dtype=np.int64),
+        np.asarray(triplet_ids, dtype=np.int64),
+    )
+
+
 def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
     # Load fixed val data for S1
     val_records = load_val_data_1a1n10d(args.val_data_1a1n10d)
@@ -217,6 +331,11 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
 
     print(f"[S1] Found {len(ckpts)} checkpoints.")
 
+    epochs: List[float] = []
+    vals_ap: List[float] = []
+    vals_ad: List[float] = []
+    vals_ratio: List[float] = []
+
     for ckpt_path in ckpts:
         print(f"[S1] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -233,42 +352,83 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
             f"d(A,distant)={mean_d_ad:.4f}, ratio={ratio:.4f}"
         )
 
+        try:
+            e_float = float(epoch)
+        except Exception:
+            e_float = float(len(epochs))
+        epochs.append(e_float)
+        vals_ap.append(mean_d_ap)
+        vals_ad.append(mean_d_ad)
+        vals_ratio.append(ratio)
+
         # Distance histogram
         if d_ap_list and d_ad_list:
             hist_path = os.path.join(plot_dir, f"distance_hist_s1_{base}.png")
             plot_distance_histogram(d_ap_list, d_ad_list, save_path=hist_path)
             print(f"[S1] Saved {hist_path}")
 
-        # Embedding 2D (one anchor + neighbour + distant)
-        if first_triplet is not None:
-            inst_idx, rec, inst = first_triplet
-            basin_cache: Dict[str, dict] = {}
-            embedder.eval()
-            with torch.no_grad():
-                env.load(inst["depot_xy"].to(device), inst["node_xy_demand"].to(device), basin_cache)
-                emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
-                emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
-                emb_d = (
-                    embed_solutions(embedder, rec["distant_solutions"], env, basin_cache)
-                    if rec["distant_solutions"]
-                    else None
-                )
-                if emb_d is not None:
-                    emb = torch.cat([emb_a, emb_p, emb_d], dim=0)
-                    group_labels = [0, 1] + [2] * emb_d.size(0)
-                else:
-                    emb = torch.cat([emb_a, emb_p], dim=0)
-                    group_labels = [0, 1]
-                instance_ids = [inst_idx] * len(group_labels)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s1_{base}.png")
-                plot_embedding_2d(
-                    emb,
-                    instance_ids=instance_ids,
-                    group_labels=group_labels,
-                    method="pca",
-                    save_path=emb_path,
-                )
-                print(f"[S1] Saved {emb_path}")
+        # Embedding 2D & GIF over the entire fixed val set (all instances, all anchors/neighbours/distant)
+        embs_tensor, inst_ids_np, roles_np, triplet_ids_np = compute_s1_val_embeddings(
+            embedder, env, val_records, val_instance_data_by_idx, device
+        )
+        if embs_tensor is not None:
+            emb_path = os.path.join(plot_dir, f"embedding_2d_s1_{base}.png")
+            coords = plot_embedding_2d(
+                embs_tensor,
+                instance_ids=inst_ids_np,
+                group_labels=roles_np,
+                method="pca",
+                save_path=emb_path,
+            )
+            print(f"[S1] Saved {emb_path}")
+
+            # GIF: 每一帧高亮一条 (anchor, neighbour, all distant) 的数据
+            gif_path = os.path.join(plot_dir, f"embedding_2d_s1_triplets_{base}.gif")
+            make_triplet_gif(
+                coords=coords,
+                roles=roles_np,
+                triplet_ids=triplet_ids_np,
+                role_label_map={0: "anchor", 1: "neighbour", 2: "distant"},
+                role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:red"},
+                title_prefix="S1 record",
+                gif_path=gif_path,
+                duration=2.0,
+            )
+
+    # Line plots over epochs for S1 metrics
+    if epochs:
+        try:
+            import matplotlib.pyplot as plt
+
+            order = sorted(range(len(epochs)), key=lambda i: epochs[i])
+            xs = [epochs[i] for i in order]
+
+            plt.figure(figsize=(6, 4))
+            plt.plot(xs, [vals_ap[i] for i in order], "-o", label="d(A, neighbour)")
+            plt.plot(xs, [vals_ad[i] for i in order], "-o", label="d(A, distant)")
+            plt.xlabel("epoch")
+            plt.ylabel("distance")
+            plt.legend()
+            plt.title("Stage1 val distances over checkpoints")
+            plt.tight_layout()
+            path1 = os.path.join(plot_dir, "s1_val_distances_over_epochs.png")
+            plt.savefig(path1, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"[S1] Saved {path1}")
+
+            plt.figure(figsize=(6, 4))
+            plt.plot(xs, [vals_ratio[i] for i in order], "-o", label="d(A,D)/d(A,P)")
+            plt.xlabel("epoch")
+            plt.ylabel("ratio")
+            plt.legend()
+            plt.title("Stage1 val d(A,D)/d(A,P) over checkpoints")
+            plt.tight_layout()
+            path2 = os.path.join(plot_dir, "s1_val_ratio_over_epochs.png")
+            plt.savefig(path2, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"[S1] Saved {path2}")
+        except ImportError:
+            print("[S1] matplotlib not available, skip line plots.")
 
 
 def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
@@ -292,6 +452,11 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
 
     print(f"[S2] Found {len(ckpts)} checkpoints.")
 
+    epochs: List[float] = []
+    vals_ap: List[float] = []
+    vals_an: List[float] = []
+    vals_ratio: List[float] = []
+
     for ckpt_path in ckpts:
         print(f"[S2] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
@@ -308,32 +473,110 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
             f"d(A,N)={mean_d_an:.4f}, ratio={ratio:.4f}"
         )
 
+        try:
+            e_float = float(epoch)
+        except Exception:
+            e_float = float(len(epochs))
+        epochs.append(e_float)
+        vals_ap.append(mean_d_ap)
+        vals_an.append(mean_d_an)
+        vals_ratio.append(ratio)
+
         if d_ap_list and d_an_list:
             hist_path = os.path.join(plot_dir, f"distance_hist_s2_{base}.png")
             plot_distance_histogram(d_ap_list, d_an_list, save_path=hist_path)
             print(f"[S2] Saved {hist_path}")
 
-        if first_batch is not None:
-            basin_cache: Dict[str, dict] = {}
-            embedder.eval()
-            with torch.no_grad():
-                env.load(first_batch.depot_xy.to(device), first_batch.node_xy_demand.to(device), basin_cache)
-                emb_a = embed_solutions(embedder, first_batch.anchor_solutions, env, basin_cache)
-                emb_p = embed_solutions(embedder, first_batch.positive_solutions, env, basin_cache)
-                emb_n = embed_solutions(embedder, first_batch.negative_solutions, env, basin_cache)
-                emb = torch.cat([emb_a, emb_p, emb_n], dim=0)
-                B = emb_a.size(0)
-                group_labels = [0] * B + [1] * B + [2] * B
-                instance_ids = [first_batch.instance_idx] * (3 * B)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_{base}.png")
-                plot_embedding_2d(
-                    emb,
-                    instance_ids=instance_ids,
-                    group_labels=group_labels,
-                    method="pca",
-                    save_path=emb_path,
-                )
-                print(f"[S2] Saved {emb_path}")
+        # Embedding 2D and GIF over the entire fixed val set (all instances, all triplets)
+        embs_list: List[torch.Tensor] = []
+        inst_ids: List[int] = []
+        roles: List[int] = []
+        triplet_ids: List[int] = []
+
+        embedder.eval()
+        basin_cache: Dict[str, dict] = {}
+        with torch.no_grad():
+            for t_idx, (inst_idx, record) in enumerate(val_triplets):
+                inst = val_instance_data_by_idx[inst_idx]
+                depot_xy = inst["depot_xy"].to(device)
+                node_xy_demand = inst["node_xy_demand"].to(device)
+                env.load(depot_xy, node_xy_demand, basin_cache)
+
+                sols = [
+                    record["anchor_solution"],
+                    record["positive_solution"],
+                    record["negative_solution"],
+                ]
+                for role, sol in enumerate(sols):
+                    emb = embed_solutions(embedder, [sol], env, basin_cache)
+                    embs_list.append(emb.squeeze(0))
+                    inst_ids.append(inst_idx)
+                    roles.append(role)
+                    triplet_ids.append(t_idx)
+
+        if embs_list:
+            embs_tensor = torch.stack(embs_list, dim=0)
+            inst_ids_np = np.asarray(inst_ids, dtype=np.int64)
+            roles_np = np.asarray(roles, dtype=np.int64)
+            triplet_ids_np = np.asarray(triplet_ids, dtype=np.int64)
+
+            emb_path = os.path.join(plot_dir, f"embedding_2d_s2_{base}.png")
+            coords = plot_embedding_2d(
+                embs_tensor,
+                instance_ids=inst_ids_np,
+                group_labels=roles_np,
+                method="pca",
+                save_path=emb_path,
+            )
+            print(f"[S2] Saved {emb_path}")
+
+            # GIF: same 2D coordinates, each frame highlights a single (A, P, N) triplet
+            gif_path = os.path.join(plot_dir, f"embedding_2d_s2_triplets_{base}.gif")
+            make_triplet_gif(
+                coords=coords,
+                roles=roles_np,
+                triplet_ids=triplet_ids_np,
+                role_label_map={0: "anchor", 1: "positive", 2: "negative"},
+                role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
+                title_prefix="S2 triplet",
+                gif_path=gif_path,
+                duration=2.0,
+            )
+
+    # Line plots over epochs for S2 metrics
+    if epochs:
+        try:
+            import matplotlib.pyplot as plt
+
+            order = sorted(range(len(epochs)), key=lambda i: epochs[i])
+            xs = [epochs[i] for i in order]
+
+            plt.figure(figsize=(6, 4))
+            plt.plot(xs, [vals_ap[i] for i in order], "-o", label="d(A,P)")
+            plt.plot(xs, [vals_an[i] for i in order], "-o", label="d(A,N)")
+            plt.xlabel("epoch")
+            plt.ylabel("distance")
+            plt.legend()
+            plt.title("Stage2 val distances over checkpoints")
+            plt.tight_layout()
+            path1 = os.path.join(plot_dir, "s2_val_distances_over_epochs.png")
+            plt.savefig(path1, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"[S2] Saved {path1}")
+
+            plt.figure(figsize=(6, 4))
+            plt.plot(xs, [vals_ratio[i] for i in order], "-o", label="d(A,N)/d(A,P)")
+            plt.xlabel("epoch")
+            plt.ylabel("ratio")
+            plt.legend()
+            plt.title("Stage2 val d(A,N)/d(A,P) over checkpoints")
+            plt.tight_layout()
+            path2 = os.path.join(plot_dir, "s2_val_ratio_over_epochs.png")
+            plt.savefig(path2, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"[S2] Saved {path2}")
+        except ImportError:
+            print("[S2] matplotlib not available, skip line plots.")
 
 
 def main() -> None:

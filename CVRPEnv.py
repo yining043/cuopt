@@ -100,9 +100,7 @@ class CVRPEnv:
         ), -1)  # the node features
 
         feature = torch.cat([self._dummy_xy, self._dummy_demand.unsqueeze(-1)], dim=-1)
-        supplement_feature = to_actor
-        supplement_feature = to_actor[:, :, :-2]
-        feature = torch.cat((feature, supplement_feature), dim=-1)
+        feature = torch.cat((feature, to_actor), dim=-1)
         depot_feature = torch.cat((feature[:, :self._dummy_size, :3], feature[:, :self._dummy_size, 4:]), dim=2)  # rm demand dimension
         node_feature = feature[:, self._dummy_size:]
 

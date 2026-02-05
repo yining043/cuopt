@@ -85,6 +85,15 @@ basin_datasets0
 | `merge_perturb_batches.py` | Full merge (alt.) |
 | `reset_basin_info.py` | Reset basin_info from basin_pairs; regenerate distant_basins |
 
+**Validation / experiment data generation**:
+
+| Script | Purpose / I/O |
+|--------|---------------|
+| `script/run_extract_and_merge_perturb_k1.py` | For k=1 perturb collection: per-instance extract first-10-run perturb stats + `perturb_data.jsonl`, then merge all per-instance `perturb_k1_stats.xlsx` into `perturb_k1_collect/merged_perturb_k1_stats.xlsx`. Batch: `python script/run_extract_and_merge_perturb_k1.py` (default instances 0-49). |
+| `script/build_val_data_jsonl.py` | Validation set from **k=1 perturb** (per-instance random anchor from runs \>10). For instances 50–79: per selected instance, pick one anchor, run perturb (k=1) until collecting **30 positive (P>0.8) + 30 negative (P<0.1)**; save 10 records to `val_data.jsonl` and log **all** perturb runs (hash, solution_flat, cost, P, count) to `val_data_all_perturb_record.jsonl`. Example: `python script/build_val_data_jsonl.py --instance_path /home/jieyi/cvrp100_uniform.pkl --basin_base_dir basin_datasets0 --out val_data.jsonl`. |
+| `script/sample_val_1p1n.py` | Simple 1-anchor-1-pos-1-neg sampling from existing k=1 results. For instances 50–54, sample 20 lines per `k1_collection_results_remove_and_insert.ALL_r30.jsonl` and write **100 lines** to `perturb_k1_collect/val_data_1p1n.jsonl` (each with `instance_index`, `anchor`, `positive_sample`, `negative_sample`). Example: `python script/sample_val_1p1n.py --seed 42`. |
+| `script/build_val_1a1n10d.py` | Validation set for basin graph: from `basin_datasets0_analyze/cvrp100_uniform.pkl#50-54` use `basin_info.jsonl` + `basin_pairs.jsonl` + `distant_basins.jsonl` to build **1 anchor + 1 neighbor + 10 distant basins** per record. For each instance 50–54, sample 20 such triplets (if available), total **100 records** written to `basin_datasets0_analyze/val_data_1a1n10d.jsonl`. Example: `python script/build_val_1a1n10d.py --instances 50-54 --per_instance 20 --seed 0`. |
+
 **Pipeline scripts**: `run_all_trials.sh`, `run_basin_analysis_all_runs.sh`, `run_perturb.sh`, `run_perturb_k1_collect.sh`, `generate_cooccurrence.sh`, `run_find_distant_basins_batch.sh`; `analyze_basin.py`, `analyze_basin_statistics.py`, `perturb.py`, `perturb_k1_collect.py`, `generate_basin_pairs.py`, `visualize_basin_pairs.py`, `summarize_basin_statistics.py`, `find_distant_basins.py`, `train_basin_contrastive.py`. **Dependencies**: `utils.py`, `visualize_basin_cooccurrence_matrix.py`, `test_basin_pybind.py`, `test_load_data.py`.
 
 **k=1 variance** (optional): `./run_k1_variance.sh [idx] [gpu] [num_optima] [repeats]` → then `python analyze_k1_repeats.py --repeats_base_dir .../k1_variance --instance_index N --repeats M` → boxplots in `k1_variance_rep1/<instance_id>/`.
