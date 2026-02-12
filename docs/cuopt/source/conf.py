@@ -17,9 +17,15 @@
 from cuopt_server.webserver import app as cuoptapp
 from fastapi.openapi.utils import get_openapi
 import datetime
-import cuopt
 import yaml
 from packaging.version import Version
+from importlib.metadata import version as _pkg_version
+
+# Avoid importing cuopt directly (triggers CUDA native lib loading).
+try:
+    _CUOPT_VERSION_STR = _pkg_version("cuopt")
+except Exception:
+    _CUOPT_VERSION_STR = "0.0.0"
 import subprocess
 import sys
 import os
@@ -115,7 +121,7 @@ author = "NVIDIA Corporation"
 # |version| and |release|, also used in various other places throughout the
 # built documents.
 #
-CUOPT_VERSION = Version(cuopt.__version__)
+CUOPT_VERSION = Version(_CUOPT_VERSION_STR)
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
