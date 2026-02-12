@@ -39,7 +39,7 @@ from raft_dask.common import Comms, local_handle
 from cuopt.routing.assignment import Assignment
 from cuopt.utilities import type_cast
 
-from cuopt.routing.internals.internals cimport CustomizeNodesCallback
+from cuopt.routing.internals.internals cimport CustomizeEarlyStopCallback
 
 from libc.stdint cimport uintptr_t
 from libc.stdlib cimport free, malloc
@@ -755,8 +755,8 @@ cdef class SolverSettings:
     def set_routing_callback(self, callback):
         # Type check and cast
         if not hasattr(callback, 'get_native_callback'):
-            raise TypeError("callback must be an instance of CustomizeNodesCallback")
-        cdef CustomizeNodesCallback cb = callback
+            raise TypeError("callback must be an instance of CustomizeEarlyStopCallback")
+        cdef CustomizeEarlyStopCallback cb = callback
         cdef uintptr_t callback_ptr = cb.get_native_callback()
         cdef void* callback_void_ptr = <void*>callback_ptr
         self.c_solver_settings.get().set_routing_callback(callback_void_ptr)

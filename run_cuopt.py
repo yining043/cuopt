@@ -2,82 +2,23 @@ import argparse
 import numpy as np
 import cudf
 from cuopt import routing
-from cuopt.routing import CustomizeNodesCallback
+from cuopt.routing import CustomizeEarlyStopCallback
 from tqdm import tqdm
 from load_nco_data import load_raw_data
 import torch
 import random
-from model import Policy
 
 def pairwise_euclidean_distance(x: torch.Tensor) -> torch.Tensor:
     x_square = (x ** 2).sum(dim=2, keepdim=True)
     dist_square = x_square + x_square.transpose(1, 2) - 2 * torch.bmm(x, x.transpose(1, 2))
     return torch.sqrt(torch.clamp(dist_square, min=1e-9))
 
-class PolicyCustomizeNodesCallback(CustomizeNodesCallback):
-    """Callback that uses Policy model to score and select best trail candidate."""
-    def __init__(self, policy_model, coordinates, demand, vehicle_capacity, device='cpu'):
-        super().__init__()
-        self.policy = policy_model.eval()
-        self.coordinates = coordinates.to(device)
-        self.demand = (demand / vehicle_capacity).to(device)
-        self.device = device
-
-    # def customize_nodes_to_search(self, solution_flat, num_routes, 
-    #                               solution_cost, candidate_mask, iter):
-    #     """random change the trail candidates"""
-    #     num_candidates = sum(candidate_mask)
-    #     # print(f"[Callback] Num candidates: {num_candidates}")
-    #     if num_candidates == 0:
-    #         return [0] * len(candidate_mask)
-        
-    #     # 并行计算采样大小和生成 trail candidates
-    #     sample_size = num_candidates if num_candidates < 40 else (num_candidates // 2 if num_candidates < 80 else 40)
-        
-    #     candidate_nodes = [node_id for node_id in range(len(candidate_mask)) if candidate_mask[node_id] == 1]
-    #     selection_mask = np.zeros(len(candidate_mask), dtype=np.int32)
-    #     sampled = random.sample(candidate_nodes,min(sample_size, len(candidate_nodes)))
-    #     selection_mask[sampled] = 1
-    #     selection_mask = selection_mask.tolist()
-    #     return selection_mask
-
-    def customize_nodes_to_search(self, solution_flat, num_routes, 
-                                  solution_cost, candidate_mask, iter):
-        """使用 Policy 对 100 个随机 trail candidates 并行打分，选择得分最高的"""
-        num_candidates = sum(candidate_mask)
-        # print(f"[Callback] Num candidates: {num_candidates}")
-        if num_candidates == 0:
-            return [0] * len(candidate_mask)
-        
-        # 并行计算采样大小和生成 trail candidates
-        max_length = len(candidate_mask)
-        sample_size = num_candidates if num_candidates < 40 else (num_candidates // 2 if num_candidates < 80 else 40)
-        num_samples = 100
-        
-        # 并行生成所有 trail candidates
-        candidate_mask_t = torch.tensor(candidate_mask, dtype=torch.float32, device=self.device)
-        probs = candidate_mask_t.unsqueeze(0).expand(num_samples, -1)
-        sampled_indices = torch.multinomial(probs, sample_size, replacement=False)
-        selected = torch.zeros_like(probs, dtype=torch.int32)
-        selected.scatter_(1, sampled_indices, 1)  # (num_samples, max_length)
-
-        # 并行准备所有 Policy 输入
-        nodes_tensor = self.coordinates
-        demands_tensor = self.demand.unsqueeze(-1)  # (1, N, 1)
-        solution_flat_tensor = torch.tensor(solution_flat + [-1] * (max_length - len(solution_flat)), dtype=torch.long, device=self.device)
-        solution_flat_tensor = solution_flat_tensor.unsqueeze(0)
-        candidates_tensor = torch.tensor(candidate_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
-        selected = selected.unsqueeze(0)  # (1, num_samples, max_length)
-        
-        # Policy 并行打分
-        with torch.no_grad():
-            scores = self.policy(nodes_tensor, demands_tensor, solution_flat_tensor, candidates_tensor, selected)
-            s_mean, s_std = scores.mean(dim=-1), scores.std(dim=-1)
-            scores = (scores - s_mean) / (s_std + 1e-9)
-        # import pdb; pdb.set_trace(32)
-        # 返回得分最高的 trail candidate
-        best_idx = scores.argmax(dim=-1).item()
-        return selected[0, best_idx].cpu().numpy().tolist()
+class EarlyStopCallback(CustomizeEarlyStopCallback):
+    """Callback for early stop decision. Override customize_early_stop to implement custom logic."""
+    def customize_early_stop(self, solution_flat, objective, num_routes, iteration):
+        """Return True to stop local search early, False to continue."""
+        random_number = random.random()
+        return random_number < 0.5
 
 def make_cuopt_format(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_vehicles, scale):
     distance_matrix_df = cudf.DataFrame(raw_data_dist[index].numpy() * scale)
@@ -114,22 +55,9 @@ def run_experiment(
     scale=1e2,
     n_vehicles=21,
     use_callback=False,
-    policy_model_path=None,
 ):
     raw_nodes, raw_cap, raw_demand, raw_cost, raw_flag = load_raw_data(data_path, episode=problem_size, begin_index=index)
     raw_dist = pairwise_euclidean_distance(raw_nodes)
-
-    # 自动检测 device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"[Device] Using {device}")
-    
-    # 加载 Policy 模型（如果需要）
-    policy = None
-    if use_callback:
-        policy = Policy(device=device)
-    if policy_model_path:
-        print(f"[Callback] Loading Policy model from {policy_model_path}")
-        policy.load_state_dict(torch.load(policy_model_path, map_location=device)['model_state_dict'])
 
     costs = []
     gaps = []
@@ -138,7 +66,7 @@ def run_experiment(
         # 创建 callback（使用当前问题的数据）
         callback = None
         if use_callback:
-            callback = PolicyCustomizeNodesCallback(policy, raw_nodes, raw_demand, raw_cap, device)
+            callback = EarlyStopCallback()
         
         model = get_cuopt_model(index, raw_dist, raw_demand, raw_cap, n_vehicles, scale)
         solution = run_cuopt(model, time_limit, callback=callback)
@@ -166,8 +94,7 @@ if __name__ == "__main__":
     parser.add_argument("--problem_type", type=str, default="CVRP", help="Problem type (default: CVRP)")
     parser.add_argument("--n_vehicles", type=int, default=21, help="Number of vehicles")
     parser.add_argument("--scale", type=float, default=1e2, help="Coordinate scale")
-    parser.add_argument("--use_callback", action='store_true', help="Use callback for node selection (requires pred_with_NN=true in C++ code)")
-    parser.add_argument("--policy_model_path", type=str, default=None, help="Path to Policy model checkpoint (.pt file)")
+    parser.add_argument("--use_callback", action='store_true', help="Use early stop callback")
 
     args = parser.parse_args()
 
@@ -180,5 +107,4 @@ if __name__ == "__main__":
         scale=args.scale,
         n_vehicles=args.n_vehicles,
         use_callback=args.use_callback,
-        policy_model_path=args.policy_model_path
     )

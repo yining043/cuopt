@@ -25,7 +25,7 @@ namespace callbacks {
 
 // Base callback type enum
 enum class callback_type_t {
-  CUSTOMIZE_NODES
+  CUSTOMIZE_EARLY_STOP
 };
 
 // Base routing callback class
@@ -35,31 +35,29 @@ public:
   virtual callback_type_t get_type() const = 0;
 };
 
-// Customize nodes callback - customizes node sampling for local search
+// Customize early stop callback - decides whether to stop local search early
 template <typename i_t, typename f_t>
-class customize_nodes_callback_t : public base_routing_callback_t {
+class customize_early_stop_callback_t : public base_routing_callback_t {
 public:
-  virtual ~customize_nodes_callback_t() = default;
-  
-  // Customize which nodes to sample based on current search state
-  // 
-  // @param solution_flat          Current solution (flat array by route: [route0_dummies, route0_nodes, route1_dummies, ...])
-  // @param num_routes             Number of routes in current solution
-  // @param solution_cost          Current objective cost value
-  // @param candidate_mask          Mask indexed by node_id (candidate_mask[node_id]=1 means node_id is candidate)
-  // @param selection_mask_out     OUTPUT - Selection mask indexed by node_id (selection_mask_out[node_id]=1 means select)
-  // @param iteration              Current iteration number
-  virtual void customize_nodes_to_search(
+  virtual ~customize_early_stop_callback_t() = default;
+
+  // Customize early stop decision based on current search state
+  //
+  // @param solution_flat  Current solution (flat array by route)
+  // @param num_routes     Number of routes in current solution
+  // @param objective      Current objective cost value
+  // @param iteration      Current iteration number
+  // @param early_stop_out OUTPUT - Set to true to stop local search early
+  virtual void customize_early_stop(
     const std::vector<i_t>* solution_flat,
     i_t num_routes,
-    f_t solution_cost,
-    const std::vector<i_t>* candidate_mask,
-    std::vector<i_t>* selection_mask_out,
-    i_t iteration
+    f_t objective,
+    i_t iteration,
+    bool* early_stop_out
   ) = 0;
-  
+
   callback_type_t get_type() const override {
-    return callback_type_t::CUSTOMIZE_NODES;
+    return callback_type_t::CUSTOMIZE_EARLY_STOP;
   }
 };
 

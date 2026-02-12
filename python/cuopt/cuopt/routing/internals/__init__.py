@@ -13,6 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cuopt.routing.internals.internals import CustomizeNodesCallback
+from cuopt.routing.internals.internals import CustomizeEarlyStopCallback
 
-__all__ = ["CustomizeNodesCallback"]
+__all__ = ["CustomizeEarlyStopCallback"]

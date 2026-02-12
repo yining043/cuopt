@@ -66,8 +66,8 @@ __global__ void extract_non_overlapping_moves_kernel(
                                        uint64_t((threadIdx.x + blockIdx.x * blockDim.x)),
                                        0);
   if (threadIdx.x == 0) {
-    // random_shuffle(
-    //   shuffled_route_pair_indices.data(), shuffled_route_pair_indices.size(), thread_rng);
+    random_shuffle(
+      shuffled_route_pair_indices.data(), shuffled_route_pair_indices.size(), thread_rng);
     i_t n_moves_found = 0;
     for (i_t i = 0; i < shuffled_route_pair_indices.size(); ++i) {
       i_t random_idx     = shuffled_route_pair_indices[i];
@@ -397,11 +397,6 @@ i_t extract_non_overlapping_moves(solution_t<i_t, f_t, REQUEST>& sol,
   n_best_route_pair_moves = std::min(n_best_route_pair_moves, max_n_best_route_pair_moves);
   if (n_best_route_pair_moves == 0) { return 0; }
 
-  // 添加排序：按 tid 排序，使顺序确定
-  thrust::sort(rmm::exec_policy(sol.sol_handle->get_stream()),
-              move_candidates.vrp_move_candidates.compacted_move_indices.begin(),
-              move_candidates.vrp_move_candidates.compacted_move_indices.begin() + n_best_route_pair_moves);
-  sol.sol_handle->sync_stream();
   
   size_t sh_size = sizeof(i_t) * (sol.get_n_routes() + n_best_route_pair_moves * 2);
   bool is_set =

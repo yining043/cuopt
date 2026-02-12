@@ -27,14 +27,11 @@ cdef extern from "Python.h":
 
 
 cdef extern from "cuopt/routing/utilities/callbacks_implems.hpp" namespace "cuopt::routing::callbacks":  # noqa
-    cdef cppclass default_customize_nodes_callback_t[int, float]:
+    cdef cppclass default_customize_early_stop_callback_t[int, float]:
         PyObject* pyCallbackClass
 
 
-cdef class CustomizeNodesCallback:
-
-    cdef default_customize_nodes_callback_t[int, float] native_callback
-
+cdef class CustomizeEarlyStopCallback:
     def __init__(self):
         self.native_callback.pyCallbackClass = <PyObject *><void*>self
 

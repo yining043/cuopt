@@ -215,7 +215,7 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
     fast_operators.push_back(fast_operators_t::REGRET);
   }
 
-  // std::shuffle(fast_operators.begin(), fast_operators.end(), rng);
+  std::shuffle(fast_operators.begin(), fast_operators.end(), rng);
 
   auto& nodes_to_search = move_candidates.nodes_to_search;
   // this is activated if we ever want to run with full nodes
@@ -227,35 +227,31 @@ bool local_search_t<i_t, f_t, REQUEST>::run_fast_search(solution_t<i_t, f_t, r_t
 
   bool move_found = false;
 
-  move_found = perform_vrp_search(sol, move_candidates, changed_nb_size) || move_found;
-  move_found = run_sliding_search(sol) || move_found;
-  move_found = run_two_opt_search(sol) || move_found;
-
-  // for (auto const& op : fast_operators) {
-  //   switch (op) {
-  //     case fast_operators_t::SLIDING: {
-  //       move_found = run_sliding_search(sol) || move_found;
-  //       break;
-  //     }
-  //     case fast_operators_t::VRP: {
-  //       move_found = perform_vrp_search(sol, move_candidates, changed_nb_size) || move_found;
-  //       break;
-  //     }
-  //     case fast_operators_t::REGRET: {
-  //       move_found =
-  //         run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
-  //         move_found;
-  //       break;
-  //     }
-  //     case fast_operators_t::TWO_OPT: {
-  //       move_found = run_two_opt_search(sol) || move_found;
-  //       break;
-  //     }
-  //     case fast_operators_t::CROSS: {
-  //       break;
-  //     }
-  //   }
-  // }
+  for (auto const& op : fast_operators) {
+    switch (op) {
+      case fast_operators_t::SLIDING: {
+        move_found = run_sliding_search(sol) || move_found;
+        break;
+      }
+      case fast_operators_t::VRP: {
+        move_found = perform_vrp_search(sol, move_candidates, changed_nb_size) || move_found;
+        break;
+      }
+      case fast_operators_t::REGRET: {
+        move_found =
+          run_vehicle_assignment<i_t, f_t, REQUEST>(sol, move_candidates, vehicle_assignment) ||
+          move_found;
+        break;
+      }
+      case fast_operators_t::TWO_OPT: {
+        move_found = run_two_opt_search(sol) || move_found;
+        break;
+      }
+      case fast_operators_t::CROSS: {
+        break;
+      }
+    }
+  }
 
   move_candidates.nodes_to_search.restore_found_nodes(sol);
   if (full_set) { return move_found; }
@@ -373,29 +369,17 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
   const i_t N_nodes_w_dummy = sol.problem_ptr->get_num_orders() + 4 * sol.get_n_routes();
   const i_t N_nodes = sol.problem_ptr->get_num_orders() + sol.get_n_routes();
   printf("[search #%d] N_nodes_w_dummy: %d, N_nodes: %d\n", global_local_search_iter, N_nodes_w_dummy, N_nodes);
-  std::vector<NodeInfo<int>> base_node_to_search(N_nodes_w_dummy), work_node_to_search(N_nodes_w_dummy), best_node_to_search(N_nodes_w_dummy);
-  std::vector<std::vector<int>> global_orders(max_p_size, std::vector<int>(N_nodes_w_dummy));
   std::mt19937_64 rng(std::random_device{}());
-  double best_score = 1000000000.0;
-  int best_p = 0;
-  bool pred_with_NN = false;
-  // Get customize nodes callback
-  callbacks::customize_nodes_callback_t<i_t, f_t>* obs_callback = nullptr;
+  // Get customize early stop callback
+  callbacks::customize_early_stop_callback_t<i_t, f_t>* early_stop_callback = nullptr;
   if (sol.problem_ptr->solver_settings_ptr) {
     for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
-      if (callback->get_type() == callbacks::callback_type_t::CUSTOMIZE_NODES) {
-        obs_callback = static_cast<callbacks::customize_nodes_callback_t<i_t, f_t>*>(callback);
-        pred_with_NN = true;
+      if (callback->get_type() == callbacks::callback_type_t::CUSTOMIZE_EARLY_STOP) {
+        early_stop_callback = static_cast<callbacks::customize_early_stop_callback_t<i_t, f_t>*>(callback);
         break;
       }
     }
   }
-
-  auto load_to_device_both = [&](std::vector<NodeInfo<int>> nodes_to_search) {
-    move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
-    move_candidates.nodes_to_search.n_sampled_nodes = nodes_to_search.size();
-  };
-
   while (iter < iter_limit) {
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
@@ -403,194 +387,6 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
     while (true) { 
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
-      auto pause_begin = clock::now();
-      // #########
-      best_score = 1000000000.0;
-      best_p = 0;
-      if (iter == 2) {
-        // init max_p_size different global_orders with random order of 1 to N_nodes_w_dummy
-        for (int p = 0; p < max_p_size; ++p) {
-          for (int i = 0; i < N_nodes_w_dummy; ++i) {
-            global_orders[p][i] = i;
-          }
-          // std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
-        }
-      }
-      base_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
-      auto nodes_to_search_size = base_node_to_search.size();
-      if (nodes_to_search_size > 1) {
-          base_node_to_search.resize(nodes_to_search_size);
-      }
-      best_node_to_search = base_node_to_search;
-      i_t best_node_size = static_cast<i_t>(best_node_to_search.size());
-      i_t sample_size = get_sample_size_vrp(best_node_to_search.size());
-      if (pred_with_NN == false) {
-        printf("[iter #%d] best_node_size: %d, sample_size: %d\n", iter - 2, best_node_size, sample_size);
-        //print solution info
-        sol.sol_handle->sync_stream();
-        printf("[current_solution] number_of_routes: %d, ", sol.get_n_routes());
-        for (i_t i = 0; i < sol.get_n_routes(); ++i) {
-          auto& route = sol.get_route(i);
-          auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
-          i_t n_nodes = route.n_nodes.value(sol.sol_handle->get_stream());
-          printf("[");
-          for (i_t j = 0; j < n_nodes; ++j) {
-            printf("%d", node_infos[j].node());
-            if (j < n_nodes - 1) {
-              printf(",");
-            }
-          }
-          printf("] ");
-        }
-        printf("\n");
-
-        for (int p = 0; p < max_p_size; ++p) {
-          for (int t = 0; t < 10; ++t) {
-            work_node_to_search = base_node_to_search;
-            if (false &&t == 0) {
-              std::sort(work_node_to_search.begin(), 
-                work_node_to_search.begin() + work_node_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
-                return global_orders[p][a.node()] < global_orders[p][b.node()];
-              });
-            }
-            else {
-              std::shuffle(work_node_to_search.begin(), work_node_to_search.begin() + nodes_to_search_size, rng);
-            }
-            load_to_device_both(work_node_to_search);
-
-            //get the sample size 
-            i_t sample_size = get_sample_size_vrp(best_node_to_search.size());
-            // randomly sample only 10% of the first sample_size nodes and replace them with the remaining nodes
-            i_t best_node_size = static_cast<i_t>(best_node_to_search.size());
-            printf("[trail #%d] candidates: [", t);
-            for (size_t i = 0; i < base_node_to_search.size(); ++i) {
-              printf("%d", base_node_to_search[i].node());
-              if (i < base_node_to_search.size() - 1) {
-                printf(",");
-              }
-            }
-            printf("] selected: [");
-            for (int i = 0; i < sample_size; ++i) {
-              printf("%d", work_node_to_search[i].node());
-              if (i < sample_size - 1) {
-                printf(",");
-              }
-            }
-            printf("] ");
-
-            Sol trail_routes(sol);
-            bool move = true;
-            int horizon_count = 0;
-            for (int ii = 0; ii < 10 && move; ++ii)  {
-              move = run_fast_search(trail_routes, trail_routes.problem_ptr->is_tsp && iter == 2, 96, false);
-              std::sort(move_candidates.nodes_to_search.h_nodes_to_search.begin(), 
-                        move_candidates.nodes_to_search.h_nodes_to_search.begin() + move_candidates.nodes_to_search.h_nodes_to_search.size(), [&global_orders, p](const auto& a, const auto& b) {
-                return global_orders[p][a.node()] < global_orders[p][b.node()];
-              });
-              horizon_count++;
-            }
-            auto s = trail_routes.get_cost(true, move_candidates.weights);
-            if (s < best_score) {
-              best_score = s;
-              best_node_to_search = work_node_to_search;  // 保存最佳配置
-              best_p = p;  // 保存最好的 global_order 索引
-            }
-            printf("score: %f best score: %f\n", s, best_score);
-
-            //print solution info
-            trail_routes.sol_handle->sync_stream();
-            printf("[basin_solution #%d] number_of_routes: %d, ", t, trail_routes.get_n_routes());
-            for (i_t i = 0; i < trail_routes.get_n_routes(); ++i) {
-              auto& route = trail_routes.get_route(i);
-              auto node_infos = cuopt::host_copy(route.dimensions.requests.node_info);
-              i_t n_nodes = route.n_nodes.value(trail_routes.sol_handle->get_stream());
-              printf("[");
-              for (i_t j = 0; j < n_nodes; ++j) {
-                printf("%d", node_infos[j].node());
-                if (j < n_nodes - 1) {
-                  printf(",");
-                }
-              }
-              printf("] ");
-            }
-            printf("\n");
-          }
-        }
-      }
-
-      // 更新没有被选中的 global_order 为全新的随机顺序
-      for (int p = 0; p < max_p_size; ++p) {
-        if (p != best_p) {
-          // std::shuffle(global_orders[p].begin(), global_orders[p].end(), rng);
-        }
-      }
-
-      // use callback and get best_node_to_search
-      if (pred_with_NN == true) {
-        
-        if (obs_callback) {
-          // Sync stream before building solution_flat
-          sol.sol_handle->sync_stream();
-          
-          // Build solution_flat
-          std::vector<i_t> solution_flat = this->build_solution_flat(sol);
-          f_t objective = sol.get_cost(true, move_candidates.weights);
-          
-          // Build candidate_mask from base_node_to_search
-          std::vector<i_t> candidate_mask(N_nodes_w_dummy, 0);
-          std::unordered_map<i_t, size_t> node_id_to_h_idx;
-          node_id_to_h_idx.reserve(base_node_to_search.size());
-          for (size_t i = 0; i < base_node_to_search.size(); ++i) {
-            i_t node_id = base_node_to_search[i].node();
-            candidate_mask[node_id] = 1;
-            node_id_to_h_idx[node_id] = i;  // Store index in base_node_to_search
-          }
-
-          std::vector<i_t> selection_mask;
-          obs_callback->customize_nodes_to_search(
-              &solution_flat,
-              sol.n_routes,
-              objective,
-              &candidate_mask,
-              &selection_mask,
-              iter
-          );
-
-          if (selection_mask.size() != (size_t)N_nodes_w_dummy) { 
-            printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)N_nodes_w_dummy);
-            exit(1); 
-          }
-
-           // Extract selected nodes from mask and build sampled lists (single pass)
-          best_node_to_search.clear();
-          for (i_t node_id = 0; node_id < N_nodes_w_dummy; ++node_id) {
-            auto it = node_id_to_h_idx.find(node_id);
-            if (it != node_id_to_h_idx.end()) {
-              size_t h_idx = it->second;
-              if (selection_mask[node_id] == 1) {
-                best_node_to_search.insert(best_node_to_search.begin(), base_node_to_search[h_idx]);
-              }
-              else {
-                best_node_to_search.push_back(base_node_to_search[h_idx]);
-              }
-            }
-          }
-        
-        } else {
-          // No callback available, fall back to base_node_to_search
-          best_node_to_search = base_node_to_search;
-          printf("No callback available, fall back to base_node_to_search\n");
-          exit(1);
-        }
-      }
-
-      // end looking ahead
-      load_to_device_both(best_node_to_search);
-      auto pause_end   = clock::now();
-      auto offset = pause_end - pause_begin;
-      printf("offset: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
-      local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
-      // #########
 
       // Run the actual search
       auto cost_before = sol.get_cost(true, move_candidates.weights);
@@ -599,8 +395,32 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (sol.is_feasible()) {
         printf("[executed] cost before: %f, cost after: %f, move_found: %d\n\n", cost_before, cost_after, move_found_here);
       }
+      bool early_stop = false;
+      auto pause_begin = clock::now();
 
-      if (move_found_here) { continue; }
+      if (early_stop_callback) {
+        // Sync stream before building solution_flat
+        sol.sol_handle->sync_stream();
+
+        // Build solution_flat and invoke callback for early stop decision
+        std::vector<i_t> solution_flat = this->build_solution_flat(sol);
+        f_t objective = sol.get_cost(true, move_candidates.weights);
+        early_stop_callback->customize_early_stop(
+            &solution_flat,
+            sol.n_routes,
+            objective,
+            iter,
+            &early_stop
+        );
+      }
+      auto pause_end   = clock::now();
+      auto offset = pause_end - pause_begin;
+      printf("offset: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
+      local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
+      // #########
+
+      if (move_found_here && !early_stop) { continue; }
+      else if (early_stop) { printf("[iter #%d] early stop signal received\n", iter); }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;

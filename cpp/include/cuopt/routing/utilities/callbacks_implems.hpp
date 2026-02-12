@@ -26,69 +26,53 @@ namespace routing {
 namespace callbacks {
 
 template <typename i_t, typename f_t>
-class default_customize_nodes_callback_t : public customize_nodes_callback_t<i_t, f_t> {
+class default_customize_early_stop_callback_t : public customize_early_stop_callback_t<i_t, f_t> {
 public:
-  void customize_nodes_to_search(
+  void customize_early_stop(
     const std::vector<i_t>* solution_flat,
     i_t num_routes,
-    f_t solution_cost,
-    const std::vector<i_t>* candidate_mask,
-    std::vector<i_t>* selection_mask_out,
-    i_t iteration
+    f_t objective,
+    i_t iteration,
+    bool* early_stop_out
   ) override
   {
     PyObject* pycl = (PyObject*)this->pyCallbackClass;
-    
+
     // Convert solution_flat to Python list
     PyObject* py_solution_flat = PyList_New(solution_flat->size());
     for (size_t i = 0; i < solution_flat->size(); ++i) {
       PyList_SetItem(py_solution_flat, i, PyLong_FromLong((*solution_flat)[i]));
     }
-    
-    // Convert candidate_mask to Python list
-    PyObject* py_candidate_mask = PyList_New(candidate_mask->size());
-    for (size_t i = 0; i < candidate_mask->size(); ++i) {
-      PyList_SetItem(py_candidate_mask, i, PyLong_FromLong((*candidate_mask)[i]));
-    }
-    
-    // Call Python method
+
+    // Call Python method: customize_early_stop(solution_flat, objective, num_routes, iteration) -> bool
     PyObject* result = PyObject_CallMethod(
-      pycl, 
-      "customize_nodes_to_search", 
-      "OifOi",
+      pycl,
+      "customize_early_stop",
+      "Odii",
       py_solution_flat,
+      (double)objective,
       (int)num_routes,
-      (double)solution_cost,
-      py_candidate_mask,
       (int)iteration
     );
-    
-    // Clean up input arguments
+
     Py_DECREF(py_solution_flat);
-    Py_DECREF(py_candidate_mask);
-    
+
     if (result == nullptr) {
       PyErr_Print();
       return;
     }
-    
-    // Extract selection_mask from result (should be a list)
-    if (PyList_Check(result)) {
-      Py_ssize_t size = PyList_Size(result);
-      selection_mask_out->resize(size);
-      for (Py_ssize_t i = 0; i < size; ++i) {
-        PyObject* item = PyList_GetItem(result, i);
-        (*selection_mask_out)[i] = (i_t)PyLong_AsLong(item);
-      }
+
+    // Extract early_stop from result (should be bool)
+    if (PyBool_Check(result)) {
+      *early_stop_out = (result == Py_True);
     }
-    
+
     Py_DECREF(result);
   }
-  
+
   PyObject* pyCallbackClass;
 };
 
 }  // namespace callbacks
 }  // namespace routing
 }  // namespace cuopt
-
