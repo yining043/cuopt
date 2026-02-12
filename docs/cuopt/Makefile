@@ -17,6 +17,7 @@
 #
 
 # You can set these variables from the command line.
+# Use -W to treat warnings as errors (e.g. for CI). Omit -W to allow build when cuopt cannot be imported (CUDA lib mismatch).
 SPHINXOPTS    = -n -v --keep-going
 SPHINXBUILD   = sphinx-build
 SPHINXPROJ    = cuOpt
