@@ -380,7 +380,8 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       }
     }
   }
-  while (iter < iter_limit) {
+  bool early_stop = false;
+  while (iter < iter_limit || !early_stop) {
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
     // fast loop, insider this sliding, fast vrp search and fast cross search happens
@@ -393,9 +394,8 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96, false);
       auto cost_after = sol.get_cost(true, move_candidates.weights);
       if (sol.is_feasible()) {
-        printf("[executed] cost before: %f, cost after: %f, move_found: %d\n\n", cost_before, cost_after, move_found_here);
+        printf("[iter #%d] cost before: %f, cost after: %f, move_found: %d\n", iter, cost_before, cost_after, move_found_here);
       }
-      bool early_stop = false;
       auto pause_begin = clock::now();
 
       if (early_stop_callback) {
@@ -415,12 +415,12 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       }
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
-      printf("offset: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
+      printf("[iter #%d] offset: %ld ms\n", iter, std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
       local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
       // #########
 
       if (move_found_here && !early_stop) { continue; }
-      else if (early_stop) { printf("[iter #%d] early stop signal received\n", iter); }
+      else if (early_stop) { printf("[iter #%d] early stop signal received\3n", iter); }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;
