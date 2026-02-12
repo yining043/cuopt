@@ -58,6 +58,7 @@ version_cache.json
 error_log.txt
 
 # Generated data and logs (from experiments)
+log/
 *.log
 basin_datasets/
 basin_datasets*/

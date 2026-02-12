@@ -1,0 +1,4 @@
+[submodule "basin_callback"]
+	path = basin_callback
+	url = https://github.com/yining043/cuopt.git
+	branch = callback_basin
