@@ -381,7 +381,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
     }
   }
   bool early_stop = false;
-  while (iter < iter_limit || !early_stop) {
+  while (iter < iter_limit) {
     if constexpr (REQUEST == request_t::VRP) { extract_nodes_to_search(sol, move_candidates); }
     iter++;
     // fast loop, insider this sliding, fast vrp search and fast cross search happens
@@ -420,7 +420,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       // #########
 
       if (move_found_here && !early_stop) { continue; }
-      else if (early_stop) { printf("[iter #%d] early stop signal received\3n", iter); }
+      else if (early_stop) { printf("[iter #%d] early stop signal received\n\n", iter); }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;
@@ -428,7 +428,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (!sol.problem_ptr->special_nodes.is_empty() && perform_break_moves(sol)) { continue; }
       break;
     }
-
+    if (early_stop) { break; }
     //########################################################
     sol.global_runtime_checks(
       should_all_nodes_be_served, false, "run_best_local_search_after_fast_search");

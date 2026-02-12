@@ -18,7 +18,7 @@ class EarlyStopCallback(CustomizeEarlyStopCallback):
     def customize_early_stop(self, solution_flat, objective, num_routes, iteration):
         """Return True to stop local search early, False to continue."""
         random_number = random.random()
-        return random_number < 0.5
+        return random_number < 0.1
 
 def make_cuopt_format(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_vehicles, scale):
     distance_matrix_df = cudf.DataFrame(raw_data_dist[index].numpy() * scale)
