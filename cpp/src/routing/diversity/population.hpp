@@ -57,6 +57,7 @@ struct population {
   int last_stamp{0};
 
   std::vector<int> helper;
+  bool verbose{false};
   //! \param threshold { Has to be in range [0.0,1.0]. Value 0.5 is usually
   //! considered very low. }
   population(double threshold_,
@@ -257,15 +258,26 @@ struct population {
     cuopt_func_call(sol.sol.check_cost_coherence(detail::default_weights));
 
     // We store the best feasible found so far at index 0.
+    bool updated_best_feasible = false;
     if (sol.is_feasible() &&
         (solutions[0].first == false || sol_cost + MOVE_EPSILON < indices[0].second)) {
+      double old_best = indices[0].second;
       solutions[0].first  = true;
       solutions[0].second = sol;
       indices[0].second   = sol_cost;
+      updated_best_feasible = true;
+      if (verbose) {
+        printf("[POP] new best feasible! cost=%.2f (prev=%.2f)\n", sol_cost, old_best);
+      }
     }
 
     // Fast reject
     if (indices.size() == max_solutions && indices.back().second <= sol_cost + MOVE_EPSILON) {
+      if (verbose) {
+        printf("[POP] add_solution: REJECTED (cost=%.2f >= worst=%.2f, pop full=%zu)%s\n",
+               sol_cost, indices.back().second, current_size(),
+               updated_best_feasible ? " [but updated best feasible]" : "");
+      }
       dump_results(elapsed_time);
       return -1;
     }
@@ -282,8 +294,17 @@ struct population {
       // If the population is full eject the worse solution
       if (indices.size() == max_solutions) {
         hint = (int)indices.back().first;
+        if (verbose) {
+          printf("[POP] add_solution: INSERTED (no similar, evicted worst=%.2f) cost=%.2f pop_size=%zu\n",
+                 indices.back().second, sol_cost, current_size());
+        }
         indices.pop_back();
         solutions[hint].first = false;
+      } else {
+        if (verbose) {
+          printf("[POP] add_solution: INSERTED (no similar, pop not full) cost=%.2f pop_size=%zu→%zu\n",
+                 sol_cost, current_size(), current_size() + 1);
+        }
       }
 
       // ASSERT ( there is some free place )
@@ -293,12 +314,24 @@ struct population {
       solutions[hint].second = sol;
 
       int inserted_pos = insert_index(std::pair<size_t, double>((size_t)hint, sol_cost));
+      if (verbose) {
+        printf("[POP]   → rank=%d/%zu best=%.2f\n", inserted_pos, current_size(),
+               indices[1].second);
+      }
       RUNTIME_TEST(test_invariant());
       dump_results(elapsed_time);
       return inserted_pos;
 
     } else if (sol_cost + MOVE_EPSILON < indices[index].second) {
-      eradicate_similar(index, sol);
+      if (verbose) {
+        size_t before_size = current_size();
+        printf("[POP] add_solution: REPLACED similar (similar_cost=%.2f → new_cost=%.2f) ",
+               indices[index].second, sol_cost);
+        eradicate_similar(index, sol);
+        printf("pop_size=%zu→%zu\n", before_size, current_size());
+      } else {
+        eradicate_similar(index, sol);
+      }
 
       size_t free = find_free_solution_index();
 
@@ -307,11 +340,19 @@ struct population {
 
       // ASSERT ( there is some free place )
       int inserted_pos = insert_index(std::pair<size_t, double>((size_t)free, sol_cost));
+      if (verbose) {
+        printf("[POP]   → rank=%d/%zu best=%.2f\n", inserted_pos, current_size(),
+               indices[1].second);
+      }
       RUNTIME_TEST(test_invariant());
       dump_results(elapsed_time);
       return inserted_pos;
     }
 
+    if (verbose) {
+      printf("[POP] add_solution: REJECTED (similar exists at cost=%.2f ≤ new=%.2f) pop_size=%zu\n",
+             indices[index].second, sol_cost, current_size());
+    }
     dump_results(elapsed_time);
     return -1;
   }

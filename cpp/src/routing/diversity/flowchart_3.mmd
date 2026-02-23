@@ -1,0 +1,18 @@
+flowchart TD
+  subgraph improve["improve_population per threshold level"]
+    A[Set p.threshold = diversity_levels index]
+    B[p.add_solutions_to_island to reserve]
+    C[Reset viable for best]
+    D[improve_population_fixed_threshold: recombine + LS for N steps]
+    E{Best feasible?}
+    F[lm.improve on best; add back to p]
+    G[Decrement threshold index]
+    H{Time limit?}
+    I[Return]
+  end
+  A --> B --> C --> D --> E
+  E -->|No| F --> G
+  E -->|Yes| G
+  G --> H
+  H -->|Yes| I
+  H -->|No| A

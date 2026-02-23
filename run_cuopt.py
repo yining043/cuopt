@@ -12,11 +12,16 @@ Examples:
   python run_cuopt.py plot run1.log run2.log --ymin 1200 --ymax 1800
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from datetime import datetime
 import math
 import os
 import random
 import re
 import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import threading
+import time
 
 import matplotlib
 matplotlib.use("Agg")  # save only, no GUI
@@ -36,6 +41,12 @@ TIME_RE = re.compile(
     r"Total time used:\s*(\d+)\s*ms\s*,\s*offset:\s*(\d+)\s*ms",
     re.IGNORECASE,
 )
+# Match "[iter #N] offset: X ms" from C++ solver (local_search.cu)
+OFFSET_LINE_RE = re.compile(r"\[iter\s*#\d+\]\s*offset:\s*(\d+)\s*ms")
+# Match "[search #N] ..." from C++ (trial boundary; same as # --- break ---)
+SEARCH_HEADER_RE = re.compile(r"\[search\s*#\s*\d+\]")
+# Match "Best Known: X.XX" from solve log (HGS reference cost)
+BEST_KNOWN_RE = re.compile(r"Best Known:\s*([\d.]+)", re.IGNORECASE)
 
 # ── Log parsing & series building ───────────────────────────────────
 
@@ -44,7 +55,8 @@ def parse_points(text: str):
     Scan the log sequentially and build a point sequence:
       Each cost before/after pair -> new point (after value).
       If followed by time/offset -> bind to that point (first match only).
-    Returns: [{'after': float, 'best_so_far': float, 'time': float|None, 'offset': float|None}, ...]
+      Lines containing [INFEASIBLE] are tagged; only feasible costs update best_so_far.
+    Returns: [{'after': float, 'best_so_far': float, 'time': float|None, 'offset': float|None, 'is_feasible': bool}, ...]
     """
     pts = []
     best_so_far = float('inf')
@@ -53,23 +65,27 @@ def parse_points(text: str):
         ln = ln.strip()
         if not ln:
             continue
-        if ln == "# --- break ---":
+        if ln == "# --- break ---" or SEARCH_HEADER_RE.search(ln):
             pts.append({
                 'after': float('nan'),
                 'best_so_far': float('nan'),
                 'time': None,
                 'offset': None,
+                'is_feasible': True,
             })
             continue
         m_cost = COST_PAIR_RE.search(ln)
         if m_cost:
+            is_feasible = '[INFEASIBLE]' not in ln
             after_cost = float(m_cost.group(2))
-            best_so_far = min(best_so_far, after_cost)
+            if is_feasible:
+                best_so_far = min(best_so_far, after_cost)
             pts.append({
                 'after': after_cost,
                 'best_so_far': best_so_far,
                 'time': None,
                 'offset': None,
+                'is_feasible': is_feasible,
             })
             continue
         m_time = TIME_RE.search(ln)
@@ -151,12 +167,13 @@ def build_series(pts, break_mode: str, max_segments, xshift: float,
 
 def _plot_one_figure(named_points, labels, break_mode, segments, xshift, dpi,
                      ymin, ymax, data_key, use_percentage, ylabel, out_path,
-                     hlines=None):
+                     hlines=None, feasible_only=True):
     """Render one figure to *out_path*.
 
     Args:
         named_points: [(name, [point_dict, ...]), ...]
         hlines: Optional list of (value, label) for horizontal reference lines.
+        feasible_only: If True (default) and data_key is 'best_so_far', only use points with is_feasible=True.
     Returns True if anything was plotted.
     """
     plt.figure(figsize=(9.5, 5.5))
@@ -167,6 +184,10 @@ def _plot_one_figure(named_points, labels, break_mode, segments, xshift, dpi,
             if not use_percentage and data_key == 'after':
                 print(f"[INFO] '{name}' has no data points, skipping.")
             continue
+        if feasible_only and data_key == 'best_so_far':
+            pts = [p for p in pts if p.get('is_feasible', True)]
+            if not pts:
+                continue
         xs, ys = build_series(
             pts,
             break_mode=break_mode,
@@ -209,13 +230,219 @@ def _plot_one_figure(named_points, labels, break_mode, segments, xshift, dpi,
     return True
 
 
+def _plot_best_so_far_interval(config_curves, out_path, out_path_pct,
+                               dpi=160, ymin=None, ymax=None, hgs_cost=None,
+                               colors=None, feasible_only=True):
+    """Plot best_so_far as mean ± std band per config (for multiple runs).
+
+    config_curves: dict config_name -> list of [point_dict, ...] (one list per run).
+    feasible_only: If True (default), only use points with is_feasible=True.
+    """
+    import numpy as np
+
+    def _series_from_points(pts, data_key):
+        ys = []
+        last = None
+        for p in pts:
+            v = p.get(data_key)
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                if last is not None:
+                    ys.append(last)
+            else:
+                last = v
+                ys.append(v)
+        return np.array(ys) if ys else np.array([], dtype=float)
+
+    def _filter_feasible(pts):
+        return [p for p in pts if p.get('is_feasible', True)] if feasible_only else pts
+
+    colors = colors or ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
+    for idx, (cfg_name, run_list) in enumerate(config_curves.items()):
+        if not run_list:
+            continue
+        # (n_runs, max_len), pad with last value
+        series_list = [_series_from_points(_filter_feasible(pts), 'best_so_far') for pts in run_list]
+        max_len = max(len(s) for s in series_list)
+        if max_len == 0:
+            continue
+        padded = np.full((len(series_list), max_len), np.nan)
+        for i, s in enumerate(series_list):
+            if len(s) > 0:
+                padded[i, :len(s)] = s
+                padded[i, len(s):] = s[-1]
+        mean_y = np.nanmean(padded, axis=0)
+        std_y = np.nanstd(padded, axis=0)
+        x = np.arange(1, max_len + 1, dtype=float)
+        c = colors[idx % len(colors)]
+        ax.plot(x, mean_y, color=c, linewidth=1.5, label=cfg_name)
+        ax.fill_between(x, mean_y - std_y, mean_y + std_y, color=c, alpha=0.25)
+
+    if hgs_cost is not None:
+        ax.axhline(hgs_cost, color='red', linestyle='--', linewidth=1.5, label="HGS")
+    ax.set_xlabel("Cumulative Iteration")
+    ax.set_ylabel("Best So Far Cost")
+    ax.legend()
+    ax.grid(True)
+    if ymin is not None and ymax is not None:
+        ax.set_ylim(ymin, ymax)
+    plt.tight_layout()
+    plt.savefig(out_path, bbox_inches="tight", dpi=dpi)
+    plt.close()
+    print(f"Saved Best So Far (interval) to: {out_path}")
+
+    if out_path_pct and hgs_cost is not None and hgs_cost != 0:
+        fig, ax = plt.subplots(figsize=(9.5, 5.5))
+        for idx, (cfg_name, run_list) in enumerate(config_curves.items()):
+            if not run_list:
+                continue
+            series_list = [_series_from_points(_filter_feasible(pts), 'best_so_far') for pts in run_list]
+            max_len = max(len(s) for s in series_list)
+            if max_len == 0:
+                continue
+            padded = np.full((len(series_list), max_len), np.nan)
+            for i, s in enumerate(series_list):
+                if len(s) > 0:
+                    pct = (s / hgs_cost) * 100.0
+                    padded[i, :len(pct)] = pct
+                    padded[i, len(pct):] = pct[-1]
+            mean_y = np.nanmean(padded, axis=0)
+            std_y = np.nanstd(padded, axis=0)
+            x = np.arange(1, max_len + 1, dtype=float)
+            c = colors[idx % len(colors)]
+            ax.plot(x, mean_y, color=c, linewidth=1.5, label=cfg_name)
+            ax.fill_between(x, mean_y - std_y, mean_y + std_y, color=c, alpha=0.25)
+        ax.axhline(100.0, color='red', linestyle='--', linewidth=1.5, label="HGS (100%)")
+        ax.set_xlabel("Cumulative Iteration")
+        ax.set_ylabel("Best So Far Cost (% of HGS)")
+        ax.legend()
+        ax.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_path_pct, bbox_inches="tight", dpi=dpi)
+        plt.close()
+        print(f"Saved Best So Far % (interval) to: {out_path_pct}")
+
+
+def _points_to_trials_by_break(points):
+    """Split points into trials (NaN = break). One trial = one C++ search."""
+    trials, cur = [], []
+    for p in points:
+        if math.isnan(p.get('after', 0)):
+            if cur:
+                trials.append(cur)
+                cur = []
+        else:
+            cur.append(p)
+    if cur:
+        trials.append(cur)
+    return trials
+
+
+def plot_cost_curve_by_trial_duplicates(named_points, out_path, dpi=150, hgs_cost=None, cost_ymax=None, min_cost=None):
+    """
+    Plot cost evolution with one line per trial; color by duplicate local optima.
+    Trials that end at the same basin (same solution_hash or same cost) share a color; unique trials are black.
+    If min_cost is set, trials with best cost > min_cost are not counted as distinct basins (one group).
+    cost_ymax: if set, cap y-axis (cost) at this value so local search trajectory is easier to read.
+    """
+    import numpy as np
+    _ABOVE_MIN_COST_KEY = "_above_min_cost_"
+    all_pts = []
+    for _label, pts in named_points:
+        all_pts.extend(pts)
+        all_pts.append({'after': float('nan'), 'best_so_far': float('nan')})
+    trials = _points_to_trials_by_break(all_pts)
+    if not trials:
+        return
+    # Build duplicate_groups: basin_key -> [trial_idx, ...]; cost > min_cost -> same key (not a basin).
+    optimum_id_map = {}
+    duplicate_groups = {}
+    for t_idx, t in enumerate(trials):
+        last = t[-1]
+        best = last.get('best_so_far')
+        if min_cost is not None and best is not None and best > min_cost:
+            key = _ABOVE_MIN_COST_KEY
+        else:
+            key = last.get('solution_hash')
+            if key is None:
+                key = last.get('best_so_far')
+        if key not in optimum_id_map:
+            optimum_id_map[key] = len(optimum_id_map)
+            duplicate_groups[key] = [t_idx]
+        else:
+            duplicate_groups[key].append(t_idx)
+    # Trial index -> basin key (for legend)
+    trial_to_key = {}
+    for key, indices in duplicate_groups.items():
+        for i in indices:
+            trial_to_key[i] = key
+    # Trial colors: unique = black, duplicate group = same color
+    trial_colors = {}
+    unique_color = 'black'
+    duplicate_colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    duplicate_colors = [tuple(c[:3]) for c in duplicate_colors if np.sum(c[:3]) >= 0.3]
+    if not duplicate_colors:
+        duplicate_colors = [(0.2, 0.6, 0.8)]
+    color_idx = 0
+    for key, indices in duplicate_groups.items():
+        if len(indices) == 1:
+            trial_colors[indices[0]] = unique_color
+        else:
+            c = duplicate_colors[color_idx % len(duplicate_colors)]
+            for i in indices:
+                trial_colors[i] = c
+            color_idx += 1
+    # Build (global_iter, cost) per point per trial
+    fig, ax = plt.subplots(figsize=(12, 6))
+    labeled_colors = set()
+    global_iter = 0
+    for t_idx, t in enumerate(trials):
+        iters, costs = [], []
+        for p in t:
+            iters.append(global_iter)
+            costs.append(p['after'])
+            global_iter += 1
+        color = trial_colors.get(t_idx, unique_color)
+        hashable_c = tuple(color) if isinstance(color, (tuple, list)) else color
+        if hasattr(color, 'tolist'):
+            hashable_c = tuple(color.tolist())
+        label = None
+        if hashable_c not in labeled_colors:
+            key = trial_to_key.get(t_idx)
+            indices = duplicate_groups.get(key, [t_idx])
+            if color == unique_color or len(indices) <= 1:
+                label = 'Unique trials'
+            else:
+                label = f"Trials {sorted(indices)} (duplicate)"
+            labeled_colors.add(hashable_c)
+        ax.plot(iters, costs, marker='.', linestyle='-', linewidth=1.2, markersize=3,
+                color=color, label=label, alpha=0.7)
+    if hgs_cost is not None:
+        ax.axhline(y=hgs_cost, color='red', linestyle='--', linewidth=1.5, label='HGS')
+    best_cost = min(p['after'] for t in trials for p in t)
+    ax.set_xlabel('Global Iteration')
+    ax.set_ylabel('Cost after')
+    ax.set_title(f'Cost by trial (duplicate local optima same color) | Best: {best_cost:.4f}')
+    if cost_ymax is not None:
+        all_costs = [p['after'] for t in trials for p in t]
+        y_min = min(all_costs) * 0.98 if all_costs else 0.0
+        ax.set_ylim(y_min, float(cost_ymax))
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='center left', bbox_to_anchor=(1.02, 0.5), fontsize=7, ncol=1)
+    fig.subplots_adjust(right=0.78)
+    plt.savefig(out_path, dpi=dpi, bbox_inches='tight')
+    plt.close()
+    print(f"Saved duplicate-trial curve to: {out_path}")
+
+
 def plot_from_points(named_points, labels=None, break_mode="none", segments=0,
                      xshift=0.0, dpi=160, ymin=None, ymax=None, out_dir=".",
-                     hgs_costs=None):
+                     hgs_costs=None, feasible_only=True):
     """Generate all 4 standard figures from pre-parsed point lists.
 
     Args:
         hgs_costs: Optional dict {instance_index: cost} for HGS reference lines.
+        feasible_only: If True, best_so_far / best_so_far_pct use only points with is_feasible=True.
     """
     os.makedirs(out_dir, exist_ok=True)
     # Build HGS horizontal lines
@@ -230,6 +457,7 @@ def plot_from_points(named_points, labels=None, break_mode="none", segments=0,
         named_points=named_points, labels=labels,
         break_mode=break_mode, segments=segments, xshift=xshift,
         dpi=dpi, ymin=ymin, ymax=ymax, hlines=hlines,
+        feasible_only=feasible_only,
     )
     _plot_one_figure(**common, data_key='after',       use_percentage=False,
                      ylabel="Cost after",       out_path=os.path.join(out_dir, "after.png"))
@@ -299,9 +527,26 @@ def load_txt_data(data_path, start_index=0, episode=1):
     return load_raw_data(data_path, episode=episode, start_index=start_index)
 
 
+def _solution_to_edge_hash(sol):
+    """Compute stable basin hash from flat solution [0, c1, c2, 0, c3, ...].
+
+    Converts to undirected edges and hashes with SHA1, matching utils.edges_hash.
+    """
+    from utils import edges_hash
+    edges = set()
+    for i in range(len(sol) - 1):
+        u, v = int(sol[i]), int(sol[i + 1])
+        if u == 0 and v == 0:
+            continue
+        edges.add((min(u, v), max(u, v)))
+    return edges_hash(edges)
+
+
 def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
                          embedder=None, env=None, classifier=None,
-                         check_interval=1, classifier_type="threshold"):
+                         check_interval=1, classifier_type="threshold",
+                         callback_timeout=30.0,
+                         demands=None, capacity=None):
     """Build SolverCallback class that records iteration data.
 
     Args:
@@ -313,8 +558,12 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
         classifier: Dict with 'tau_embed'/'tau_struct' and 'clf_embed'/'clf_struct'.
         check_interval: Check convergence every N iterations.
         classifier_type: "threshold" (d < tau) or "lr" (LogisticRegression).
+        callback_timeout: Max seconds for early-stop decision; on timeout return False (no stop) to avoid hang.
+        demands: 1-D array of node demands (index 0 = depot = 0). Used for feasibility check.
+        capacity: Vehicle capacity scalar. Used for feasibility check.
     """
     import torch
+    import numpy as np
     from cuopt.routing import CustomizeEarlyStopCallback
 
     class SolverCallback(CustomizeEarlyStopCallback):
@@ -331,18 +580,29 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
             self._classifier = classifier
             self._check_interval = check_interval
             self._classifier_type = classifier_type
+            self._demands = np.asarray(demands, dtype=np.float64) if demands is not None else None
+            self._capacity = float(capacity) if capacity is not None else None
             # Embedding mode: store embeddings
             self._local_optima_embs = []   # [(embedding, cost), ...]
-            # Structure mode: store route-format solutions
-            self._local_optima_sols = []   # [(solution_route, cost), ...]
+            # Structure mode: store (pairs_set, cost) for fast similarity
+            self._local_optima_sols = []   # [(pairs, cost), ...]
+            # Cache current embedding to avoid re-forward when solution unchanged
+            self._last_flat = None
+            self._last_emb = None
             # Shared state
             self._prev_iteration = -1
+            self._prev_after = None
             self._prev_solution_flat = None
             self._prev_objective = None
             self._restart_detected = False
             self.n_early_stops = 0
             self.n_iterations = 0
             self.n_trials = 1  # starts at 1 (first trial)
+            self._last_es_path = None  # for debug: skip_interval | skip_no_optima | cache_hit | full
+            self._cached_optima_emb = None  # torch.cat of local_optima_embs; invalidate when list grows
+            self._total_callback_time_ms = 0.0  # accumulated time inside customize_early_stop (Python side)
+            self._callback_timeout = callback_timeout
+            self._executor = ThreadPoolExecutor(max_workers=2)
 
         # ── helpers: convert solution_flat ───────────────────────────
 
@@ -351,10 +611,28 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
             from helper import solution_flat_to_solution
             return solution_flat_to_solution(list(solution_flat))
 
+        def _check_feasible(self, sol):
+            """Check capacity feasibility from route-format solution."""
+            if self._demands is None or self._capacity is None:
+                return True
+            route_load = 0.0
+            for node in sol:
+                if node == 0:
+                    if route_load > self._capacity:
+                        return False
+                    route_load = 0.0
+                else:
+                    route_load += self._demands[node]
+            return route_load <= self._capacity
+
         # ── embedding mode ───────────────────────────────────────────
 
         def _embed_solution(self, solution_flat):
-            """Embed a single solution. Returns (1, embedding_dim) tensor."""
+            """Embed a single solution. Returns (emb, from_cache). Caches when solution unchanged."""
+            flat = list(solution_flat)
+            if self._last_flat is not None and len(self._last_flat) == len(flat):
+                if all(a == b for a, b in zip(self._last_flat, flat)):
+                    return self._last_emb, True
             sol = self._to_route_solution(solution_flat)
             h = "_cb_tmp"
             self._env._basin_info[h] = {"solution": sol}
@@ -362,21 +640,27 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
             with torch.no_grad():
                 emb = self._embedder(ctx, self._env)
             del self._env._basin_info[h]
-            return emb  # (1, embedding_dim)
+            self._last_flat = flat
+            self._last_emb = emb
+            return emb, False
 
         def _add_local_optimum_emb(self, solution_flat, objective):
-            emb = self._embed_solution(solution_flat)
+            emb, _ = self._embed_solution(solution_flat)
             self._local_optima_embs.append((emb, objective / self._scale))
+            self._cached_optima_emb = None  # invalidate so next _check_convergence_emb recomputes
 
         def _check_convergence_emb(self, current_emb):
             if not self._local_optima_embs:
                 return False
-            import numpy as np
-            optima = torch.cat([e for e, _ in self._local_optima_embs], dim=0)
-            dists = torch.cdist(current_emb, optima).squeeze(0)  # (K,)
+            if self._cached_optima_emb is None:
+                self._cached_optima_emb = torch.cat([e for e, _ in self._local_optima_embs], dim=0)
+            dists = torch.cdist(current_emb, self._cached_optima_emb).squeeze(0)  # (K,)
             if self._classifier_type == "lr":
-                d_np = dists.cpu().numpy().reshape(-1, 1)
-                preds = self._classifier["clf_embed"].predict(d_np)
+                # GPU prediction to avoid .cpu().numpy() sync
+                coef = self._classifier["_clf_embed_coef"].to(dists.device)
+                intercept = self._classifier["_clf_embed_intercept"].to(dists.device)
+                logits = dists.unsqueeze(-1) @ coef.T + intercept
+                preds = logits.squeeze(-1) >= 0
                 return bool(preds.any())
             else:  # threshold
                 return bool((dists < self._classifier["tau_embed"]).any())
@@ -387,33 +671,48 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
                 self._restart_detected = False
             self._prev_solution_flat = list(solution_flat)
             self._prev_objective = objective
-            if iteration % self._check_interval == 0 and self._local_optima_embs:
-                current_emb = self._embed_solution(solution_flat)
-                if self._check_convergence_emb(current_emb):
-                    self.n_early_stops += 1
-                    return True
+            if iteration % self._check_interval != 0:
+                self._last_es_path = "skip_interval"
+                return False
+            if not self._local_optima_embs:
+                self._last_es_path = "skip_no_optima"
+                return False
+            current_emb, from_cache = self._embed_solution(solution_flat)
+            self._last_es_path = "cache_hit" if from_cache else "full"
+            if self._check_convergence_emb(current_emb):
+                self.n_early_stops += 1
+                return True
             return False
 
         # ── structure (broken-pairs) mode ────────────────────────────
+        # Store (pairs_set, cost) so we only compute current solution's pairs once per check.
 
         def _add_local_optimum_struct(self, solution_flat, objective):
+            from helper import solution_to_pairs
             sol = self._to_route_solution(solution_flat)
-            self._local_optima_sols.append((sol, objective / self._scale))
+            pairs = solution_to_pairs(sol)
+            self._local_optima_sols.append((pairs, objective / self._scale))
 
         def _check_convergence_struct(self, current_sol):
-            from helper import broken_pairs_ratio
-            import numpy as np
+            from helper import solution_to_pairs, broken_pairs_ratio_from_pairs
             if not self._local_optima_sols:
                 return False
+            pairs_a = solution_to_pairs(current_sol)
+            if not pairs_a:
+                return False
             if self._classifier_type == "lr":
-                dists = np.array([broken_pairs_ratio(current_sol, s)
-                                  for s, _ in self._local_optima_sols]).reshape(-1, 1)
-                preds = self._classifier["clf_struct"].predict(dists)
+                dists_list = [broken_pairs_ratio_from_pairs(pairs_a, p) for p, _ in self._local_optima_sols]
+                device = self._classifier["_clf_struct_coef"].device
+                dists = torch.tensor(dists_list, dtype=torch.float32, device=device).unsqueeze(-1)
+                coef = self._classifier["_clf_struct_coef"]
+                intercept = self._classifier["_clf_struct_intercept"]
+                logits = dists @ coef.T + intercept
+                preds = logits.squeeze(-1) >= 0
                 return bool(preds.any())
             else:  # threshold
                 tau = self._classifier["tau_struct"]
-                for opt_sol, _ in self._local_optima_sols:
-                    if broken_pairs_ratio(current_sol, opt_sol) < tau:
+                for pairs_b, _ in self._local_optima_sols:
+                    if broken_pairs_ratio_from_pairs(pairs_a, pairs_b) < tau:
                         return True
                 return False
 
@@ -430,15 +729,25 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
                     return True
             return False
 
+        def _run_early_stop_decision(self, solution_flat, objective, iteration):
+            """Run early-stop decision (may be slow); used inside thread with timeout."""
+            if self._early_stop_base == "embedding":
+                return self._embedding_early_stop(solution_flat, objective, iteration)
+            if self._early_stop_base == "structure":
+                return self._structure_early_stop(solution_flat, objective, iteration)
+            if self._early_stop_base == "random":
+                return random.random() < 0.1
+            return False
+
         # ── main callback ────────────────────────────────────────────
 
         def customize_early_stop(self, solution_flat, objective, num_routes, iteration):
+            t0 = time.perf_counter()
             val = objective / self._scale
-            self._best_so_far = min(self._best_so_far, val)
 
             self.n_iterations += 1
 
-            # Detect restart: insert NaN gap to break the line between trials
+            # One trial = one C++ search ([search #N]). C++ resets iter per search, so iteration drops when a new search starts.
             if self._prev_iteration >= 0 and iteration < self._prev_iteration:
                 self.n_trials += 1
                 self.points.append({
@@ -448,23 +757,43 @@ def _make_callback_class(scale=1.0, early_stop=False, early_stop_base="random",
                     'offset': None,
                 })
                 self._restart_detected = True
+                self._prev_after = None  # first point of new trial uses before=val
 
             self._prev_iteration = iteration
 
+            cost_before = self._prev_after if self._prev_after is not None else val
+
+            sol = self._to_route_solution(solution_flat)
+            solution_hash = _solution_to_edge_hash(sol)
+            is_feasible = self._check_feasible(sol)
+
+            if is_feasible:
+                self._best_so_far = min(self._best_so_far, val)
+
             self.points.append({
+                'before': cost_before,
                 'after': val,
                 'best_so_far': self._best_so_far,
                 'time': None,
                 'offset': None,
+                'solution_hash': solution_hash,
+                'is_feasible': is_feasible,
             })
+            self._prev_after = val
+
             if self._early_stop:
-                if self._early_stop_base == "embedding":
-                    return self._embedding_early_stop(solution_flat, objective, iteration)
-                elif self._early_stop_base == "structure":
-                    return self._structure_early_stop(solution_flat, objective, iteration)
-                elif self._early_stop_base == "random":
-                    return random.random() < 0.1
-            return False
+                future = self._executor.submit(
+                    self._run_early_stop_decision, list(solution_flat), objective, iteration
+                )
+                try:
+                    out = future.result(timeout=self._callback_timeout)
+                except (FuturesTimeoutError, TimeoutError, Exception):
+                    out = False  # don't block: continue search
+            else:
+                out = False
+
+            self._total_callback_time_ms += (time.perf_counter() - t0) * 1000
+            return out
 
     return SolverCallback
 
@@ -502,11 +831,22 @@ def load_embedder_and_classifier(checkpoint_path, classifier_path, problem_size,
     ckpt = torch.load(checkpoint_path, map_location=device)
     embedder.encoder.load_state_dict(ckpt["encoder_state"])
     embedder.eval()
+    # Skip torch.compile(embedder.forward): forward uses numpy in position encoding (basesin/basecos), causing "cudagraph partition due to non gpu ops"
     print(f"Loaded embedder from {checkpoint_path} (stage {ckpt.get('stage', '?')}, epoch {ckpt.get('epoch', '?')})")
 
     with open(classifier_path, "rb") as f:
         classifier = pickle.load(f)
     print(f"Loaded classifier from {classifier_path} (tau_embed={classifier.get('tau_embed', '?'):.4f})")
+
+    # GPU-side LR weights to avoid dists.cpu().numpy() sync in early-stop hot path
+    if "clf_embed" in classifier and hasattr(classifier["clf_embed"], "coef_"):
+        clf = classifier["clf_embed"]
+        classifier["_clf_embed_coef"] = torch.tensor(clf.coef_, dtype=torch.float32, device=device)
+        classifier["_clf_embed_intercept"] = torch.tensor(clf.intercept_, dtype=torch.float32, device=device)
+    if "clf_struct" in classifier and hasattr(classifier["clf_struct"], "coef_"):
+        clf = classifier["clf_struct"]
+        classifier["_clf_struct_coef"] = torch.tensor(clf.coef_, dtype=torch.float32, device=device)
+        classifier["_clf_struct_intercept"] = torch.tensor(clf.intercept_, dtype=torch.float32, device=device)
 
     return embedder, classifier
 
@@ -572,7 +912,7 @@ def get_cuopt_model(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_
 
 
 def solve_cuopt(data_model, time_limit, callback=None):
-    """Run the cuOpt solver and return the solution (or None if infeasible)."""
+    """Run the cuOpt solver and return the ssolve_cuoptolution (or None if infeasible)."""
     from cuopt import routing
     solver_settings = routing.SolverSettings()
     solver_settings.set_time_limit(time_limit)
@@ -580,6 +920,63 @@ def solve_cuopt(data_model, time_limit, callback=None):
         solver_settings.set_routing_callback(callback)
     solution = routing.Solve(data_model, solver_settings)
     return solution if solution.get_status() == 0 else None
+
+
+def _run_solver_capture_stdout(data_model, time_limit, callback, log_path=None):
+    """Run solver with fd-1 redirected to a pipe; return (solution, captured_text).
+    Avoids deadlock by using a single pipe (no pty). Streams to terminal in real-time.
+    Optionally streams to log_path."""
+    r, w = os.pipe()
+    # Enlarge pipe buffer (Linux) to reduce solver blocking on write
+    try:
+        import fcntl
+        fcntl.fcntl(r, getattr(fcntl, "F_SETPIPE_SZ", 1031), 1048576)  # 1MB
+    except (ImportError, OSError, AttributeError):
+        pass
+    saved_stdout = os.dup(1)
+    os.dup2(w, 1)
+    os.close(w)
+    captured = []
+    log_file = open(log_path, "ab") if log_path else None
+
+    def reader():
+        while True:
+            chunk = os.read(r, 65536)
+            if not chunk:
+                break
+            captured.append(chunk)
+            if log_file:
+                log_file.write(chunk)
+                log_file.flush()
+            try:
+                os.write(saved_stdout, chunk)
+            except OSError:
+                pass
+        os.close(r)
+        if log_file:
+            log_file.close()
+
+    reader_thread = threading.Thread(target=reader)
+    reader_thread.start()
+    try:
+        solution = solve_cuopt(data_model, time_limit, callback=callback)
+    finally:
+        os.dup2(saved_stdout, 1)
+        os.close(saved_stdout)
+    reader_thread.join()
+    text = b"".join(captured).decode("utf-8", errors="replace")
+    return solution, text
+
+
+def _parse_offset_ms_from_capture(text):
+    """Return (sum, max, counts) from C++ log lines '[iter #N] offset: X ms'. counts: dict of X -> occurrence count."""
+    values = [int(m.group(1)) for m in OFFSET_LINE_RE.finditer(text)]
+    if not values:
+        return 0, 0, {}
+    counts = {}
+    for x in values:
+        counts[x] = counts.get(x, 0) + 1
+    return sum(values), max(values), counts
 
 
 def run_experiment(
@@ -591,7 +988,7 @@ def run_experiment(
     start_index=0,
     problem_type="CVRP",
     scale=1e2,
-    n_vehicles=21,
+    n_vehicles=30,
     n_runs=1,
     use_callback=False,
     collect_data=False,
@@ -600,7 +997,9 @@ def run_experiment(
     classifier_path=None,
     check_interval=1,
     classifier_type="threshold",
+    callback_timeout=30.0,
     device="cuda",
+    log_path=None,
 ):
     """Run cuOpt solver on CVRP instances.
 
@@ -638,9 +1037,15 @@ def run_experiment(
         if not classifier_path:
             raise ValueError("--classifier_pkl is required for structure early stop")
         import pickle
+        import torch
         with open(classifier_path, "rb") as f:
             classifier = pickle.load(f)
         print(f"Loaded classifier from {classifier_path} (tau_struct={classifier.get('tau_struct', '?'):.4f})")
+        if "clf_struct" in classifier and hasattr(classifier["clf_struct"], "coef_"):
+            clf = classifier["clf_struct"]
+            dev = torch.device(device) if isinstance(device, str) else device
+            classifier["_clf_struct_coef"] = torch.tensor(clf.coef_, dtype=torch.float32, device=dev)
+            classifier["_clf_struct_intercept"] = torch.tensor(clf.intercept_, dtype=torch.float32, device=dev)
 
     # Build callback class if needed
     need_callback = use_callback or collect_data
@@ -654,6 +1059,12 @@ def run_experiment(
     trial_counts = []       # [total_trials_per_instance, ...]
 
     total = n_instances * n_runs
+    total_callback_time_ms = 0.0
+    total_offset_cpp_ms = 0
+    max_offset_cpp_ms = 0
+    offset_value_counts = {}
+    if log_path and need_callback:
+        open(log_path, "w").close()
     with tqdm(total=total, desc="Solving with cuOpt") as pbar:
         for i in range(n_instances):
             raw_cost_value = raw_cost[i].item()
@@ -674,29 +1085,44 @@ def run_experiment(
                 early_stop_base=early_stop_base,
                 embedder=embedder, env=env, classifier=classifier,
                 check_interval=check_interval, classifier_type=classifier_type,
+                callback_timeout=callback_timeout,
+                demands=raw_demand[i].numpy(),
+                capacity=raw_cap[i].item(),
             ) if need_callback else None
 
             for k in range(n_runs):
                 callback = CallbackCls() if need_callback else None
                 model = get_cuopt_model(i, raw_dist, raw_demand, raw_cap, n_vehicles, scale)
-                solution = solve_cuopt(model, time_limit, callback=callback)
+                if need_callback:
+                    solution, captured = _run_solver_capture_stdout(model, time_limit, callback, log_path=log_path if k == 0 and i == 0 else None)
+                    if log_path and (i > 0 or k > 0):
+                        with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+                            lf.write(captured)
+                    run_sum, run_max, run_counts = _parse_offset_ms_from_capture(captured)
+                    total_offset_cpp_ms += run_sum
+                    if run_max > max_offset_cpp_ms:
+                        max_offset_cpp_ms = run_max
+                    for x, c in run_counts.items():
+                        offset_value_counts[x] = offset_value_counts.get(x, 0) + c
+                else:
+                    print(f"[run_cuopt] Instance {i} Run {k}: calling solver (time_limit={time_limit}s)...", file=sys.stderr, flush=True)
+                    solution = solve_cuopt(model, time_limit, callback=callback)
+                    print(f"[run_cuopt] Instance {i} Run {k}: solver returned.", file=sys.stderr, flush=True)
 
                 if solution:
                     cost = solution.get_total_objective() / scale
                     run_costs.append(cost)
                     gap = ((cost - raw_cost_value) / raw_cost_value) * 100
-                    es_info = ""
-                    if callback and hasattr(callback, 'n_early_stops'):
-                        es_info = f" | EarlyStops: {callback.n_early_stops}"
-                    print(f"[Instance {i} Run {k}] Cost: {cost:.2f} | Best Known: {raw_cost_value:.2f} | Gap: {gap:.2f}%{es_info}")
+                    es_info = f" | EarlyStops: {callback.n_early_stops}" if callback else ""
+                    print(f"[Instance {i} Run {k}] Cost: {cost:.2f} | Best Known: {raw_cost_value:.2f} | Gap: {gap:.2f}%{es_info}", flush=True)
                 else:
-                    print(f"[Instance {i} Run {k}] No feasible solution.")
+                    print(f"[Instance {i} Run {k}] No feasible solution.", flush=True)
 
-                # Accumulate callback stats
-                if callback and hasattr(callback, 'n_early_stops'):
+                if callback:
                     inst_es += callback.n_early_stops
                     inst_iters += callback.n_iterations
                     inst_trials += callback.n_trials
+                    total_callback_time_ms += callback._total_callback_time_ms
 
                 # Collect callback data
                 if collect_data and callback and callback.points:
@@ -720,32 +1146,129 @@ def run_experiment(
                 best_costs.append(None)
                 best_gaps.append(None)
 
+    if need_callback:
+        print(
+            f"[Summary] Time limit: {time_limit} s | "
+            f"Total callback time (Python): {total_callback_time_ms:.1f} ms"
+        )
     return best_costs, best_gaps, all_run_points, hgs_costs, early_stop_counts, iteration_counts, trial_counts
 
 # ── Subcommand handlers ─────────────────────────────────────────────
 
-def _write_log(all_run_points, hgs_costs, filepath):
-    """Write all callback points to a single log file compatible with parse_points()."""
-    dirpath = os.path.dirname(filepath)
-    if dirpath:
-        os.makedirs(dirpath, exist_ok=True)
+def _write_log(named_points, hgs_costs, filepath):
+    """Write log: [search #N] then cost before/after lines."""
+    os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
     with open(filepath, 'w') as f:
-        for label, points in all_run_points:
-            inst_idx = int(label.split("_")[0].replace("inst", ""))
-            hgs_cost = hgs_costs.get(inst_idx, 0)
+        for label, points in named_points:
+            m = re.search(r"inst(\d+)", label)
+            inst_idx = int(m.group(1)) if m else 0
+            hgs_cost = (hgs_costs or {}).get(inst_idx, 0)
             f.write(f"# === {label} (HGS: {hgs_cost}) ===\n")
+            search_id = 1
+            prev_was_break = True
             for p in points:
                 if math.isnan(p['after']):
-                    f.write("# --- break ---\n")  # trial gap marker
+                    search_id += 1
+                    prev_was_break = True
                     continue
-                f.write(f"cost before: 0, cost after: {p['after']}\n")
+                if prev_was_break:
+                    f.write(f"[search #{search_id}]\n")
+                    prev_was_break = False
+                f.write(f"cost before: {p.get('before', 0)}, cost after: {p['after']}\n")
     print(f"Saved log to: {filepath}")
 
 
+def _timestamp_dir():
+    """Return a directory name with current time (e.g. 20250212_143052)."""
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+class _TeeStdout:
+    """Context manager: redirect fd 1 so all stdout (Python + C++) is written to both terminal and log file.
+    Uses a pty when available so C++ sees a tty and uses line buffering (avoids appearing stuck with pipe)."""
+    def __init__(self, log_path):
+        self.log_path = log_path
+        self._log_file = None
+        self._saved_fd = None
+        self._read_fd = None
+        self._write_fd = None
+        self._thread = None
+        self._use_pty = False
+
+    def __enter__(self):
+        self._log_file = open(self.log_path, "w", encoding="utf-8", errors="replace")
+        self._saved_fd = os.dup(1)
+        self._use_pty = False
+        # Always use a pipe (not pty) to avoid the tiny 4KB pty buffer that
+        # causes hangs when nested with _run_solver_capture_stdout.
+        self._read_fd, self._write_fd = os.pipe()
+        try:
+            import fcntl
+            fcntl.fcntl(self._read_fd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 1048576)
+        except (ImportError, OSError, AttributeError):
+            pass
+        os.dup2(self._write_fd, 1)
+
+        def reader():
+            while True:
+                try:
+                    data = os.read(self._read_fd, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    text = data.decode("utf-8", errors="replace")
+                    self._log_file.write(text)
+                    self._log_file.flush()
+                except (OSError, AttributeError, TypeError):
+                    pass
+                try:
+                    os.write(self._saved_fd, data)
+                except OSError:
+                    pass
+        self._thread = threading.Thread(target=reader, daemon=False)
+        self._thread.start()
+        return self
+
+    def _close_fd(self, fd):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __exit__(self, *exc):
+        # Close ALL write ends of the pipe so reader thread sees EOF.
+        # fd 1 and self._write_fd both reference the pipe write end.
+        self._close_fd(self._write_fd)
+        self._write_fd = None
+        if self._saved_fd is not None:
+            try:
+                os.dup2(self._saved_fd, 1)  # closes fd 1 (pipe write) and restores terminal
+            except OSError:
+                pass
+            self._close_fd(self._saved_fd)
+            self._saved_fd = None
+        if self._thread is not None:
+            self._thread.join(timeout=10.0)
+        self._close_fd(self._read_fd)
+        self._read_fd = None
+        if self._log_file is not None:
+            self._log_file.close()
+        return False
+
+
 def cmd_solve(args):
-    """Execute the 'solve' subcommand."""
-    need_collect = args.plot or (args.log is not None)
-    costs, gaps, all_run_points, hgs_costs, *_ = run_experiment(
+    """Execute the 'solve' subcommand. With --log, stdout (including C++ solver) is tee'd to the log file."""
+    effective_out = os.path.join(args.out_dir, "curves", str(args.start_index) + "_tl_" + str(int(args.time_limit)) + "_" + _timestamp_dir())
+    log_path = None
+    if args.log is not None:
+        os.makedirs(effective_out, exist_ok=True)
+        log_path = os.path.join(effective_out, os.path.basename(args.log) or "log.txt")
+
+    need_collect = args.plot or args.save_upper_bound_log
+    run_kwargs = dict(
         data_path=args.data_path,
         problem_path=args.problem_path,
         solution_path=args.solution_path,
@@ -763,25 +1286,57 @@ def cmd_solve(args):
         classifier_path=args.classifier_pkl,
         check_interval=args.check_interval,
         classifier_type=args.classifier_type,
+        callback_timeout=args.callback_timeout,
         device=args.device,
     )
 
-    # Save log file
-    if args.log is not None and all_run_points:
-        _write_log(all_run_points, hgs_costs, args.log)
+    if log_path is not None:
+        with _TeeStdout(log_path):
+            costs, gaps, all_run_points, hgs_costs, *_ = run_experiment(**run_kwargs)
+    else:
+        costs, gaps, all_run_points, hgs_costs, *_ = run_experiment(**run_kwargs)
 
-    # Auto-plot from collected callback data
+    if log_path is not None:
+        print(f"Saved log (terminal output) to: {log_path}", flush=True)
     if args.plot and all_run_points:
-        out_dir = args.out_dir
-        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(effective_out, exist_ok=True)
+        ymin = args.ymin
+        ymax = args.ymax
+        if (ymin is None or ymax is None) and hgs_costs:
+            hgs_min = min(hgs_costs.values())
+            if ymin is None:
+                ymin = hgs_min - 0.5
+            if ymax is None:
+                ymax = hgs_min + 4.5
         plot_from_points(
             all_run_points,
             dpi=args.dpi,
-            ymin=args.ymin,
-            ymax=args.ymax,
-            out_dir=out_dir,
+            ymin=ymin,
+            ymax=ymax,
+            out_dir=effective_out,
             hgs_costs=hgs_costs,
+            feasible_only=not args.include_infeasible,
         )
+        print(f"Outputs in: {effective_out}/")
+    elif args.plot and not all_run_points:
+        print("No callback data for plotting (run without --log or ensure callback is used).")
+    if args.save_upper_bound_log and all_run_points:
+        try:
+            import json
+            from upper_bound_analyzer import logs_from_run_cuopt_points
+            label, points = all_run_points[0]
+            logs = logs_from_run_cuopt_points(
+                points,
+                steps_to_time_ratio=1e-3,
+                basin_key=args.ub_basin_key,
+            )
+            out_path = os.path.join(effective_out, "upper_bound_log.json")
+            os.makedirs(effective_out, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(logs, f, indent=2)
+            print(f"Saved upper-bound trial log to: {out_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to save upper_bound_log: {e}")
 
 
 def cmd_plot(args):
@@ -806,10 +1361,16 @@ def cmd_plot(args):
 
     # Parse text logs into point lists
     named_points = []
+    scale = getattr(args, 'scale', 1.0)
     for name, raw in inputs:
         pts = parse_points(raw)
         if not pts:
             print(f"[INFO] '{name}' has no 'cost before/after' lines, skipping.")
+        if scale != 1.0:
+            for p in pts:
+                for k in ('before', 'after', 'best_so_far'):
+                    if k in p and p[k] is not None:
+                        p[k] = p[k] / scale
         named_points.append((name, pts))
 
     # Process labels
@@ -820,7 +1381,7 @@ def cmd_plot(args):
             print(f"[WARN] Label count ({len(labels)}) != file count ({len(named_points)}); ignoring custom labels.")
             labels = None
 
-    # Parse --hgs_costs into hlines
+    # Parse --hgs_costs into hlines; else try to parse "Best Known: X.XX" from logs
     hlines = None
     if args.hgs_costs:
         vals = [float(v.strip()) for v in args.hgs_costs.split(",")]
@@ -828,11 +1389,31 @@ def cmd_plot(args):
         for i, v in enumerate(vals):
             lab = "HGS" if len(vals) == 1 else f"HGS inst{i}"
             hlines.append((v, lab))
+    else:
+        hgs_from_logs = []
+        for _name, raw in inputs:
+            for m in BEST_KNOWN_RE.finditer(raw):
+                hgs_from_logs.append(float(m.group(1)))
+                break  # one value per file
+        if hgs_from_logs:
+            hgs_min = min(hgs_from_logs)
+            hlines = [(hgs_min, "HGS")]
+
+    # Default ymin/ymax from HGS (same as solve --plot)
+    ymin, ymax = args.ymin, args.ymax
+    if (ymin is None or ymax is None) and hlines:
+        hgs_vals = [v for v, _ in hlines]
+        hgs_min = min(hgs_vals)
+        if ymin is None:
+            ymin = hgs_min - 0.5
+        if ymax is None:
+            ymax = hgs_min + 4.5
 
     common = dict(
         named_points=named_points, labels=labels,
         break_mode=args.break_mode, segments=args.segments, xshift=args.xshift,
-        dpi=args.dpi, ymin=args.ymin, ymax=args.ymax, hlines=hlines,
+        dpi=args.dpi, ymin=ymin, ymax=ymax, hlines=hlines,
+        feasible_only=not args.include_infeasible,
     )
     _plot_one_figure(**common, data_key='after',       use_percentage=False, ylabel="Cost after",       out_path=args.out)
     _plot_one_figure(**common, data_key='best_so_far', use_percentage=False, ylabel="Best So Far Cost", out_path=args.out_best)
@@ -859,8 +1440,10 @@ def cmd_compare(args):
     labels = [c[0] for c in configs]
     colors = ['#AAAAAA', '#5B9BD5', '#2E75B6', '#ED7D31', '#C55A11']
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    base, ext = os.path.splitext(args.out)
+    effective_out = os.path.join(args.out_dir, "curves", _timestamp_dir())
+    os.makedirs(effective_out, exist_ok=True)
+    args.out_dir = effective_out
+    prefix = args.out  # e.g. "compare" -> compare_cost.png, compare_stats.png, ...
     n_inst = args.n_instances
 
     # ── Helper: draw & save for one instance ─────────────────────
@@ -875,6 +1458,9 @@ def cmd_compare(args):
 
         suffix = "" if n_inst == 1 else f"_inst{global_idx}"
 
+        def _out(tag, extension=".png"):
+            return os.path.join(args.out_dir, f"{prefix}_{tag}{suffix}{extension}")
+
         # ── Cost boxplot ─────────────────────────────────────────
         fig, ax = plt.subplots(figsize=(9, 5))
         bp = ax.boxplot([results[l] for l in labels], labels=labels,
@@ -888,7 +1474,7 @@ def cmd_compare(args):
         ax.set_ylabel("Best Cost")
         ax.set_title(f"Instance {global_idx}  ({args.n_repeat} repeats, {args.time_limit}s/run)")
         ax.grid(axis='y', alpha=0.3)
-        p = os.path.join(args.out_dir, f"{base}_cost{suffix}{ext}")
+        p = _out("cost")
         fig.tight_layout(); fig.savefig(p, dpi=args.dpi); plt.close(fig)
         print(f"  Saved: {p}")
 
@@ -911,7 +1497,7 @@ def cmd_compare(args):
         fig.suptitle(f"Instance {global_idx}  ({args.n_repeat} repeats, {args.time_limit}s/run)",
                      fontsize=13)
         fig.tight_layout()
-        p = os.path.join(args.out_dir, f"{base}_stats{suffix}{ext}")
+        p = _out("stats")
         fig.savefig(p, dpi=args.dpi); plt.close(fig)
         print(f"  Saved: {p}")
 
@@ -925,7 +1511,7 @@ def cmd_compare(args):
                 "cost": results[name], "gap": gap[name],
                 "iters": iters[name], "trials": trials[name], "es": es[name],
             }
-        p = os.path.join(args.out_dir, f"{base}_data{suffix}.json")
+        p = _out("data", extension=".json")
         with open(p, "w") as f:
             json.dump(data_dict, f, indent=2)
         print(f"  Saved: {p}")
@@ -1001,6 +1587,108 @@ def cmd_compare(args):
     print(f"\nAll {n_inst} instances done. Results in: {args.out_dir}/")
 
 
+def cmd_curves(args):
+    """Run 3 configs (no ES, emb+lr, struct+lr) and plot after / best_so_far convergence curves."""
+    # (label, use_callback, early_stop_base, classifier_type)
+    configs = [
+        ("no ES",    False, "random",    "threshold"),
+        ("emb+lr",   True,  "embedding", "lr"),
+        ("struct+lr", True, "structure", "lr"),
+    ]
+    labels = [c[0] for c in configs]
+    named_points = []
+    hgs_costs = None
+
+    for cfg_name, use_cb, es_base, clf_type in configs:
+        print(f"\n--- {cfg_name} ---")
+        _, _, all_run_points, hgs_costs, *_ = run_experiment(
+            data_path=args.data_path,
+            problem_path=args.problem_path,
+            solution_path=args.solution_path,
+            time_limit=args.time_limit,
+            n_instances=args.n_instances,
+            start_index=args.start_index,
+            problem_type=args.problem_type,
+            scale=args.scale,
+            n_vehicles=args.n_vehicles,
+            n_runs=args.n_runs,
+            use_callback=use_cb,
+            collect_data=True,
+            early_stop_base=es_base,
+            checkpoint_path=args.checkpoint,
+            classifier_path=args.classifier_pkl,
+            check_interval=args.check_interval,
+            classifier_type=clf_type,
+            device=args.device,
+        )
+        for label, points in all_run_points:
+            named_points.append((f"{cfg_name}_{label}", points))
+
+    if not named_points:
+        print("No data collected. Check problem/solution paths.")
+        return
+
+    effective_out = os.path.join(args.out_dir, "curves", _timestamp_dir())
+    os.makedirs(effective_out, exist_ok=True)
+    log_path = os.path.join(effective_out, "log.txt")
+    _write_log(named_points, hgs_costs, log_path)
+
+    n_per_config = args.n_instances * args.n_runs
+    use_custom_labels = (args.n_instances == 1 and args.n_runs == 1 and len(named_points) == len(labels))
+
+    if args.n_runs > 1:
+        # Best-so-far: interval curve (mean ± std) per config
+        config_curves = {}
+        for j, cfg_name in enumerate(labels):
+            start = j * n_per_config
+            end = start + n_per_config
+            if end <= len(named_points):
+                config_curves[cfg_name] = [named_points[k][1] for k in range(start, end)]
+        hgs_val = None
+        if hgs_costs and 0 in hgs_costs:
+            hgs_val = hgs_costs[0]
+        _plot_best_so_far_interval(
+            config_curves,
+            out_path=os.path.join(effective_out, "best_so_far.png"),
+            out_path_pct=os.path.join(effective_out, "best_so_far_pct.png"),
+            dpi=args.dpi, ymin=args.ymin, ymax=args.ymax, hgs_cost=hgs_val,
+            colors=['#1f77b4', '#ff7f0e', '#2ca02c'],
+            feasible_only=not args.include_infeasible,
+        )
+        # After: still multi-line (all runs)
+        _plot_one_figure(
+            named_points=named_points, labels=None,
+            break_mode="none", segments=0, xshift=0.0, dpi=args.dpi,
+            ymin=args.ymin, ymax=args.ymax,
+            data_key='after', use_percentage=False, ylabel="Cost after",
+            out_path=os.path.join(effective_out, "after.png"),
+            hlines=[(hgs_val, "HGS")] if hgs_val else None,
+        )
+        _plot_one_figure(
+            named_points=named_points, labels=None,
+            break_mode="none", segments=0, xshift=0.0, dpi=args.dpi,
+            ymin=args.ymin, ymax=args.ymax,
+            data_key='after', use_percentage=True, ylabel="Cost after",
+            out_path=os.path.join(effective_out, "after_pct.png"),
+            hlines=[(100.0, "HGS (100%)")] if hgs_val else None,
+        )
+    else:
+        plot_from_points(
+            named_points,
+            labels=labels if use_custom_labels else None,
+            break_mode="none",
+            segments=0,
+            xshift=0.0,
+            dpi=args.dpi,
+            ymin=args.ymin,
+            ymax=args.ymax,
+            out_dir=effective_out,
+            hgs_costs=hgs_costs,
+            feasible_only=not args.include_infeasible,
+        )
+    print(f"\nCurves saved to {effective_out}/ (log.txt, after.png, best_so_far.png, after_pct.png, best_so_far_pct.png)")
+
+
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
@@ -1014,15 +1702,15 @@ def main():
     sp = sub.add_parser("solve", help="Run cuOpt solver on CVRP instances")
     sp.add_argument("--data_path", default=None, type=str,
                     help="Path to txt dataset file (original format)")
-    sp.add_argument("--problem_path", default="/home/jieyi/cvrp100_uniform.pkl", type=str,
+    sp.add_argument("--problem_path", default="/home/jieyi/CaR-constraint/data/CVRP/cvrp1000_uniform_LV0.pkl", type=str,
                     help="Path to CVRP problem pkl file")
-    sp.add_argument("--solution_path", default="/home/jieyi/hgs_cvrp100_uniform.pkl", type=str,
+    sp.add_argument("--solution_path", default="/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl", type=str,
                     help="Path to HGS solution pkl file")
     sp.add_argument("--time_limit", type=float, default=5, help="Time limit per instance (seconds)")
     sp.add_argument("--n_instances", type=int, default=1, help="Number of instances to run")
     sp.add_argument("--start_index", type=int, default=60, help="Starting instance index")
     sp.add_argument("--problem_type", type=str, default="CVRP", help="Problem type (default: CVRP)")
-    sp.add_argument("--n_vehicles", type=int, default=21, help="Number of vehicles")
+    sp.add_argument("--n_vehicles", type=int, default=100, help="Number of vehicles")
     sp.add_argument("--scale", type=float, default=1e2, help="Coordinate scale")
     sp.add_argument("--n_runs", type=int, default=1, help="Number of runs per instance (best is kept)")
     sp.add_argument("--use_callback", action='store_true', help="Use early stop callback")
@@ -1041,14 +1729,31 @@ def main():
     sp.add_argument("--classifier_type", type=str, default="lr",
                     choices=["threshold", "lr"],
                     help="Classifier method: 'threshold' (d<tau) or 'lr' (LogisticRegression)")
+    sp.add_argument("--callback_timeout", type=float, default=30.0,
+                    help="Max seconds for early-stop callback; on timeout solver continues (default 30)")
     sp.add_argument("--device", type=str, default="cuda", help="Torch device for embedder (default: cuda)")
     # Auto-plot options
     sp.add_argument("--plot", action='store_true', help="Auto-plot convergence after solving")
     sp.add_argument("--log", type=str, default=None, help="Save log to this file (for later re-plotting)")
+    sp.add_argument("--save_upper_bound_log", action="store_true",
+                    help="After solve, write upper_bound_log.json for UpperBoundAnalyzer (uses first run's callback data).")
+    sp.add_argument(
+        "--ub_basin_key",
+        type=str,
+        default="hash",
+        choices=["hash", "cost"],
+        help=(
+            "Basin identity used in upper_bound_log.json: "
+            "'hash' = callback solution_hash (edge-based, default); "
+            "'cost' = per-trial best cost (coarser, matches tl_sensitivity)."
+        ),
+    )
     sp.add_argument("--out_dir", type=str, default=".", help="Output directory for plots and logs (default: cwd)")
     sp.add_argument("--dpi", type=int, default=160, help="Plot DPI (default 160)")
-    sp.add_argument("--ymin", type=float, default=14, help="Y-axis lower bound (auto if omitted)")
-    sp.add_argument("--ymax", type=float, default=16, help="Y-axis upper bound (auto if omitted)")
+    sp.add_argument("--ymin", type=float, default=None, help="Y-axis lower bound (auto from HGS if omitted)")
+    sp.add_argument("--ymax", type=float, default=None, help="Y-axis upper bound (auto from HGS if omitted)")
+    sp.add_argument("--include-infeasible", action="store_true",
+                    help="Include infeasible points in best_so_far / best_so_far_pct (default: feasible only).")
 
     # ---- plot ----
     pp = sub.add_parser("plot", help="Plot cost curves from solver log files")
@@ -1069,10 +1774,14 @@ def main():
                     help="Plot only the first N segments; N<=0 means all. Applied per file.")
     pp.add_argument("--labels", type=str, default=None,
                     help="Custom legend labels, comma-separated, must match file count.")
-    pp.add_argument("--ymax", type=float, default=1800, help="Y-axis upper bound.")
-    pp.add_argument("--ymin", type=float, default=1200, help="Y-axis lower bound (default 1200).")
+    pp.add_argument("--ymax", type=float, default=None, help="Y-axis upper bound (default: auto).")
+    pp.add_argument("--ymin", type=float, default=None, help="Y-axis lower bound (default: auto).")
+    pp.add_argument("--scale", type=float, default=1.0,
+                    help="Divide all parsed cost values by this factor (e.g. 100 for C++ logs with scale=1e2).")
     pp.add_argument("--hgs_costs", type=str, default=None,
                     help="HGS reference costs, comma-separated (e.g. '1580.12,1690.50'). Draws red dashed lines.")
+    pp.add_argument("--include-infeasible", action="store_true",
+                    help="Include infeasible points in best_so_far / best_so_far_pct (default: feasible only).")
 
     # ---- compare ----
     cp = sub.add_parser("compare",
@@ -1087,7 +1796,7 @@ def main():
     cp.add_argument("--n_instances", type=int, default=1, help="Number of instances to run")
     cp.add_argument("--start_index", type=int, default=0, help="Starting instance index")
     cp.add_argument("--problem_type", type=str, default="CVRP", help="Problem type (default: CVRP)")
-    cp.add_argument("--n_vehicles", type=int, default=21, help="Number of vehicles")
+    cp.add_argument("--n_vehicles", type=int, default=30, help="Number of vehicles")
     cp.add_argument("--scale", type=float, default=1e2, help="Coordinate scale")
     cp.add_argument("--n_repeat", type=int, default=10,
                     help="Number of independent repetitions per config (default 10)")
@@ -1100,10 +1809,36 @@ def main():
     cp.add_argument("--check_interval", type=int, default=1,
                     help="Check convergence every N iterations (default 1)")
     cp.add_argument("--device", type=str, default="cuda", help="Torch device (default: cuda)")
-    cp.add_argument("--out", type=str, default="compare_boxplot.png",
-                    help="Output boxplot path (default compare_boxplot.png)")
+    cp.add_argument("--out", type=str, default="compare",
+                    help="Output filename prefix (default 'compare' -> compare_cost.png, compare_stats.png, compare_data.json)")
     cp.add_argument("--out_dir", type=str, default=".", help="Output directory (default: cwd)")
     cp.add_argument("--dpi", type=int, default=160, help="Plot DPI (default 160)")
+
+    # ---- curves ----
+    cv = sub.add_parser("curves",
+                        help="Run no ES / emb+lr / struct+lr and plot after & best_so_far curves")
+    cv.add_argument("--data_path", default=None, type=str)
+    cv.add_argument("--problem_path", default="/home/jieyi/cvrp100_uniform.pkl", type=str)
+    cv.add_argument("--solution_path", default="/home/jieyi/hgs_cvrp100_uniform.pkl", type=str)
+    cv.add_argument("--time_limit", type=float, default=5)
+    cv.add_argument("--n_instances", type=int, default=1)
+    cv.add_argument("--start_index", type=int, default=0)
+    cv.add_argument("--problem_type", type=str, default="CVRP")
+    cv.add_argument("--n_vehicles", type=int, default=21)
+    cv.add_argument("--scale", type=float, default=1e2)
+    cv.add_argument("--n_runs", type=int, default=1, help="Runs per instance (each = one curve per config)")
+    cv.add_argument("--checkpoint", type=str,
+                    default="/home/jieyi/cuopt/out/20260210_204422_0-49_2stages_stage1e100_stage2e50/s1_epoch100.pt")
+    cv.add_argument("--classifier_pkl", type=str,
+                    default="/home/jieyi/cuopt/out/20260210_204422_0-49_2stages_stage1e100_stage2e50/convergence/trial_convergence_s1_epoch100_classifiers.pkl")
+    cv.add_argument("--check_interval", type=int, default=1)
+    cv.add_argument("--device", type=str, default="cuda")
+    cv.add_argument("--out_dir", type=str, default=".")
+    cv.add_argument("--dpi", type=int, default=160)
+    cv.add_argument("--ymin", type=float, default=14)
+    cv.add_argument("--ymax", type=float, default=16)
+    cv.add_argument("--include-infeasible", action="store_true",
+                    help="Include infeasible points in best_so_far / best_so_far_pct (default: feasible only).")
 
     args = parser.parse_args()
 
@@ -1113,6 +1848,8 @@ def main():
         cmd_plot(args)
     elif args.command == "compare":
         cmd_compare(args)
+    elif args.command == "curves":
+        cmd_curves(args)
     else:
         parser.print_help()
 

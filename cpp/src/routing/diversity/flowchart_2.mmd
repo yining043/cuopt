@@ -1,0 +1,32 @@
+flowchart TD
+  subgraph iter["One iteration (until time limit)"]
+    A[Reset recombine_stats]
+    B[adjust_reserve_threshold]
+    C[populate_working_vector: pick 2-5 from reserve]
+    D{CVRP?}
+    E[Set working threshold: diversity_levels 1]
+    F[find_initial_diversity on working_vector]
+    G[Set working threshold; clamp index 2-4]
+    H[populate_working_population: add to working]
+    I{CVRP?}
+    J[Generate up to 5 new solutions via GES + improve; add to reserve and working]
+    K[Skip if working empty]
+    L[Record best_before_improvement]
+    M[improve_population: recombine + local search over threshold levels]
+    N[adjust_weights if no improvement]
+    O[add_working_to_reserve]
+    P[run_make_feasible if reserve has no feasible]
+    Q[working_population.clear]
+    R[Refill reserve if size less than 5]
+  end
+  A --> B --> C --> D
+  D -->|Yes| E
+  D -->|No| F --> G
+  E --> H
+  G --> H
+  H --> I
+  I -->|Yes| J
+  I -->|No| K
+  J --> K
+  K --> L --> M --> N --> O --> P --> Q --> R
+  R --> next[Next iteration]

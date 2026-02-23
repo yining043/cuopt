@@ -336,7 +336,8 @@ template <typename i_t, typename f_t, request_t REQUEST>
 std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
                                                               const bool consider_unserviced,
                                                               const bool time_limit_enabled,
-                                                              const bool run_cycle_finder)
+                                                              const bool run_cycle_finder,
+                                                              const bool enable_callback)
 {
   // Handle a corner case when there is no single task that is feasible
   if (sol.n_routes == 0) { return std::chrono::steady_clock::duration(0); }
@@ -368,17 +369,20 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
   const i_t max_p_size = 1;
   const i_t N_nodes_w_dummy = sol.problem_ptr->get_num_orders() + 4 * sol.get_n_routes();
   const i_t N_nodes = sol.problem_ptr->get_num_orders() + sol.get_n_routes();
-  printf("[search #%d] N_nodes_w_dummy: %d, N_nodes: %d\n", global_local_search_iter, N_nodes_w_dummy, N_nodes);
   std::mt19937_64 rng(std::random_device{}());
-  // Get customize early stop callback
+  // Only activate callback when explicitly enabled (evolution core loop)
   callbacks::customize_early_stop_callback_t<i_t, f_t>* early_stop_callback = nullptr;
-  if (sol.problem_ptr->solver_settings_ptr) {
+  if (enable_callback && sol.problem_ptr->solver_settings_ptr) {
     for (auto callback : sol.problem_ptr->solver_settings_ptr->get_routing_callbacks()) {
       if (callback->get_type() == callbacks::callback_type_t::CUSTOMIZE_EARLY_STOP) {
         early_stop_callback = static_cast<callbacks::customize_early_stop_callback_t<i_t, f_t>*>(callback);
         break;
       }
     }
+  }
+  const bool verbose = (early_stop_callback != nullptr);
+  if (verbose) {
+    printf("[search #%d] N_nodes_w_dummy: %d, N_nodes: %d\n", global_local_search_iter, N_nodes_w_dummy, N_nodes);
   }
   bool early_stop = false;
   while (iter < iter_limit) {
@@ -393,16 +397,19 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       auto cost_before = sol.get_cost(true, move_candidates.weights);
       bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96, false);
       auto cost_after = sol.get_cost(true, move_candidates.weights);
-      if (sol.is_feasible()) {
-        printf("[iter #%d] cost before: %f, cost after: %f, move_found: %d\n", iter, cost_before, cost_after, move_found_here);
+      if (verbose) {
+        if (sol.is_feasible()) {
+          printf("[iter #%d] cost before: %f, cost after: %f, move_found: %d\n", iter, cost_before, cost_after, move_found_here);
+        }
+        else {
+          printf("[iter #%d] [INFEASIBLE] cost before: %f, cost after: %f, move_found: %d\n", iter, cost_before, cost_after, move_found_here);
+        }
+        fflush(stdout);
       }
       auto pause_begin = clock::now();
 
       if (early_stop_callback) {
-        // Sync stream before building solution_flat
         sol.sol_handle->sync_stream();
-
-        // Build solution_flat and invoke callback for early stop decision
         std::vector<i_t> solution_flat = this->build_solution_flat(sol);
         f_t objective = sol.get_cost(true, move_candidates.weights);
         early_stop_callback->customize_early_stop(
@@ -415,12 +422,14 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       }
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
-      printf("[iter #%d] offset: %ld ms\n", iter, std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
+      if (verbose) {
+        printf("[iter #%d] offset: %ld ms\n", iter, std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
+      }
       local_search_t<i_t, f_t, REQUEST>::add_offset(offset);
       // #########
 
       if (move_found_here && !early_stop) { continue; }
-      else if (early_stop) { printf("[iter #%d] early stop signal received\n\n", iter); }
+      else if (early_stop) { if (verbose) printf("[iter #%d] early stop signal received\n\n", iter); }
       if (consider_unserviced && sol.problem_ptr->has_prize_collection() &&
           run_collect_prizes(sol)) {
         continue;
@@ -432,7 +441,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
     //########################################################
     sol.global_runtime_checks(
       should_all_nodes_be_served, false, "run_best_local_search_after_fast_search");
-    printf("[iter #%d] run cycle finder\n", iter);
+    if (verbose) { printf("[iter #%d] run cycle finder\n", iter); }
     if (!run_cycle_finder || (sol.n_routes > 1023)) { break; }
     // cycle finder is needed even for single route in PDP cases
     if (REQUEST == request_t::VRP && sol.n_routes < 2) { break; }

@@ -288,6 +288,7 @@ nitpick_ignore = [
     ("py:class", "cuopt.distance_engine.waypoint_matrix_wrapper.WaypointMatrix"),
     ("py:class", "enum.Enum"),
     ("py:obj",   "cuopt.routing.DataModel.add_order_precedence"),
+    ("py:obj",   "cuopt.routing.SolverSettings.set_routing_callback"),
     ("py:obj",   "cuopt_sh_client.SolverMethod.denominator"),
     ("py:obj",   "cuopt_sh_client.SolverMethod.imag"),
     ("py:obj",   "cuopt_sh_client.SolverMethod.numerator"),
@@ -311,9 +312,19 @@ nitpick_ignore = [
     ("c:identifier", "int8_t"),
 ]
 
+# Ignore refs from package docstrings for str/int-like types (VType, CType, sense)
+nitpick_ignore_regex = [
+    (r"py:obj", r"cuopt\.linear_programming\.problem\.(VType|CType)\.[a-z_]+"),
+    (r"py:obj", r"cuopt\.linear_programming\.problem\.sense\.(denominator|imag|numerator|real|as_integer_ratio|bit_count|bit_length|conjugate|from_bytes|is_integer|to_bytes)"),
+]
+
 def skip_unwanted_inherited_members(app, what, name, obj, skip, options):
-    inherited_to_skip = {"as_integer_ratio", "conjugate", "from_bytes", "to_bytes", "is_integer", "bit_count", "bit_length", "is_integer"}  # add more as needed
+    inherited_to_skip = {"as_integer_ratio", "conjugate", "from_bytes", "to_bytes", "is_integer", "bit_count", "bit_length", "denominator", "imag", "numerator", "real"}
     if name in inherited_to_skip:
+        return True
+    # Skip str methods when documenting str subclasses (e.g. VType, CType)
+    str_methods = {"capitalize", "casefold", "center", "count", "encode", "endswith", "expandtabs", "find", "format", "format_map", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier", "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join", "ljust", "lower", "lstrip", "maketrans", "partition", "removeprefix", "removesuffix", "replace", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "split", "splitlines", "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"}
+    if name in str_methods and getattr(obj, "__objclass__", None) is str:
         return True
     return skip
 

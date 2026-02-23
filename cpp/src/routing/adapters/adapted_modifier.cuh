@@ -35,7 +35,8 @@ struct adapted_modifier_t {
   std::chrono::steady_clock::duration improve(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
                costs final_weight,
                f_t time_limit,
-               bool run_cycle_finder = true);
+               bool run_cycle_finder = true,
+               bool enable_callback = false);
   void perturbate(adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
                   costs final_weight,
                   i_t perturbation_count = 20);

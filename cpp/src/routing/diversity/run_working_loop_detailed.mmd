@@ -1,0 +1,48 @@
+flowchart TD
+  Start([run_working_loop])
+  Start --> A[improvement_timer = timer]
+  A --> B{!timer.check_time_limit?}
+  B -->|No| End([Exit loop])
+  B -->|Yes| C[recombine_stats.reset]
+  C --> D[benchmark: print time elapsed]
+  D --> E[adjust_reserve_threshold]
+  E --> F[populate_working_vector: 70% random / 30% best, 2-5 from reserve]
+  F --> G{CVRP?}
+  G -->|Yes| H[threshold_index = 1]
+  G -->|No| I[threshold_index = find_initial_diversity]
+  H --> J[working_population.threshold = diversity_levels]
+  I --> K[clamp threshold_index 2-4]
+  K --> J
+  J --> L[populate_working_population: add working_vector to working]
+  L --> M{CVRP?}
+  M -->|Yes| N[Loop 5x: generate_solution -> improve -> add to reserve and working]
+  M -->|No| O[Skip]
+  N --> O
+  O --> P{working_population.current_size == 0?}
+  P -->|Yes| B
+  P -->|No| Q[best_before_improvement = best feasible cost or max]
+  Q --> R[benchmark: display Working before]
+  R --> S[improve_population: recombine + LS over threshold levels]
+  S --> T[benchmark: display Working after]
+  T --> U[best_found = working_population.best]
+  U --> V{!best_found.is_feasible?}
+  V -->|Yes| W[lm.perturbate on best_found]
+  V -->|No| X[adjust_weights]
+  W --> X
+  X --> Y[print_working_weights]
+  Y --> Z[add_working_to_reserve]
+  Z --> AA{!reserve_population.is_feasible?}
+  AA -->|Yes| AB[run_make_feasible]
+  AA -->|No| AC[print_population_best]
+  AB --> AC
+  AC --> AD[working_population.clear]
+  AD --> AE{!best_found.is_feasible?}
+  AE -->|Yes| AF[working_population.add_solution best_found]
+  AE -->|No| AG[working_population.change_weights]
+  AF --> AG
+  AG --> AH[benchmark: display Updated reserve]
+  AH --> AI{reserve_population.current_size < 5?}
+  AI -->|Yes| AJ[refill_reserve]
+  AI -->|No| AK[recombine_stats.print]
+  AJ --> AK
+  AK --> B

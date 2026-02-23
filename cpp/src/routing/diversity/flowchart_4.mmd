@@ -1,0 +1,16 @@
+flowchart LR
+  subgraph reserve["Reserve population"]
+    R[Best solutions so far; threshold relaxed over time]
+  end
+  subgraph working["Working population per round"]
+    W[2-5 from reserve + optional new; threshold from diversity_levels]
+  end
+  subgraph ops["Operations"]
+    G[generate_solution]
+    I[improve_population]
+  end
+  R -->|pick 2-5| W
+  G -->|new sols CVRP only| R
+  G -->|new sols CVRP only| W
+  I -->|recombine + LS| W
+  W -->|add_working_to_reserve| R

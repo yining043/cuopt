@@ -33,6 +33,7 @@
 
 #include <cuda_profiler_api.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -455,6 +456,13 @@ struct solve {
   void populate_random_solutions(int number_to_fill)
   {
     auto ret = reserve_population.get_n_random(number_to_fill, true);
+    if (reserve_population.verbose) {
+      printf("[BASIN] picking %zu basins from reserve (tournament random):", ret.size());
+      for (size_t i = 0; i < ret.size(); ++i) {
+        printf(" %.2f", ret[i].get_cost(final_weights));
+      }
+      printf("\n");
+    }
     for (size_t i = 0; i < ret.size(); ++i) {
       working_vector.push_back(ret[i]);
     }
@@ -463,6 +471,13 @@ struct solve {
   void populate_best_solutions(int number_to_fill)
   {
     auto ret = reserve_population.get_n_best(number_to_fill);
+    if (reserve_population.verbose) {
+      printf("[BASIN] picking %zu basins from reserve (best):", ret.size());
+      for (size_t i = 0; i < ret.size(); ++i) {
+        printf(" %.2f", ret[i].get_cost(final_weights));
+      }
+      printf("\n");
+    }
     for (size_t i = 0; i < ret.size(); ++i) {
       working_vector.push_back(ret[i]);
     }
@@ -601,6 +616,16 @@ struct solve {
         }
       }
     }
+    if (working_population.verbose) {
+      printf("[BASIN] propagating %zu basins from working→reserve:", working_population.current_size());
+      for (size_t i = 1; i < working_population.indices.size(); ++i) {
+        auto idx = working_population.indices[i].first;
+        if (working_population.solutions[idx].first) {
+          printf(" %.2f", working_population.solutions[idx].second.get_cost(final_weights));
+        }
+      }
+      printf("\n");
+    }
     working_population.add_solutions_to_island(timer.elapsed_time(), reserve_population);
   }
 
@@ -628,17 +653,33 @@ struct solve {
   void run_working_loop()
   {
     improvement_timer = timer;
+    int wloop_iter = 0;
     while (!timer.check_time_limit()) {
-      recombine_stats.reset();
+      // reset the recombine statistics, e.g., the number of attempts, success, better_than_one, better_than_both
+      recombine_stats.reset(); 
       benchmark_print("time elapsed: %f \n", timer.elapsed_time());
-      adjust_reserve_threshold();
+      // adjust the reserve threshold, e.g., the number of solutions in the reserve
+      adjust_reserve_threshold(); 
 
-      populate_working_vector();
+      // select the reserved solutions to put into working (70%: random; 30%: best)
+      populate_working_vector(); 
       constexpr bool use_average = false;
       int threshold_index = p->is_cvrp() ? 1 : find_initial_diversity(working_vector, use_average);
       working_population.threshold = diversity_levels[threshold_index];
       if (!p->is_cvrp()) { threshold_index = std::min(4, std::max(2, threshold_index)); }
       populate_working_population();
+
+      wloop_iter++;
+      if (working_population.verbose) {
+        printf("\n[WLOOP] ========== iter=%d time=%.1f/%.1f ==========\n",
+               wloop_iter, timer.elapsed_time(), timer.get_time_limit());
+        printf("[WLOOP] reserve: size=%zu best=%.2f threshold=%.4f\n",
+               reserve_population.current_size(), reserve_population.best_quality(),
+               reserve_population.threshold);
+        printf("[WLOOP] working: size=%zu from %zu vectors, threshold=%.4f (level_idx=%d)\n",
+               working_population.current_size(), working_vector.size(),
+               working_population.threshold, threshold_index);
+      }
 
       // for pure cvrp problems, we add more solutions to the reserve population
       // this is because it is quicker to find feasible solutions in case of
@@ -674,14 +715,31 @@ struct solve {
       benchmark_call(display_pool(working_population, "Working after: \n"));
 
       auto best_found = working_population.best();
+      if (working_population.verbose) {
+        double best_after = working_population.best_quality();
+        printf("[WLOOP] after improve: working best=%.2f (was %.2f) size=%zu feasible=%d\n",
+               best_after, best_before_improvement, working_population.current_size(),
+               best_found.is_feasible());
+      }
       if (!best_found.is_feasible()) {
         lm.perturbate(best_found, final_weights, perturbation_count + 1);
+        if (working_population.verbose) {
+          printf("[WLOOP] best infeasible → perturbed (count=%d)\n", perturbation_count + 1);
+        }
       }
 
       // adjust working weights
       adjust_weights(best_before_improvement);
       print_working_weights();
+      if (working_population.verbose) {
+        printf("[WLOOP] propagating working→reserve (reserve before: size=%zu best=%.2f)\n",
+               reserve_population.current_size(), reserve_population.best_quality());
+      }
       add_working_to_reserve();
+      if (working_population.verbose) {
+        printf("[WLOOP] reserve after: size=%zu best=%.2f\n",
+               reserve_population.current_size(), reserve_population.best_quality());
+      }
 
       if (!reserve_population.is_feasible()) { run_make_feasible(); }
 
@@ -712,6 +770,14 @@ struct solve {
     raft::common::nvtx::range fun_scope("perform_search");
     feasible_only    = feasible_only_;
     target_vehicles_ = routes_number;
+
+    // Enable verbose logging when an early-stop callback is registered
+    bool has_callback = p->solver_settings_ptr &&
+      std::any_of(p->solver_settings_ptr->get_routing_callbacks().begin(),
+                  p->solver_settings_ptr->get_routing_callbacks().end(),
+                  [](auto* cb) { return cb->get_type() == callbacks::callback_type_t::CUSTOMIZE_EARLY_STOP; });
+    reserve_population.verbose = has_callback;
+    working_population.verbose = has_callback;
 
     if (target_vehicles_ > 0) {
       target_vehicle_ids_.resize(target_vehicles_);
@@ -874,6 +940,7 @@ struct solve {
         threshold, pop_size, final_weights, p, pool_allocator));
 
       auto& a = initial_islands.back();
+      a.verbose = reserve_population.verbose;
 
       timer_t island_creation_timer(max_island_generation_time);
       for (int i = 0; i < min_island_size; ++i) {
@@ -927,6 +994,13 @@ struct solve {
           }
         }
 
+        if (reserve_population.verbose) {
+          printf("[INIT] island=%zu sol=%d cost=%.2f feasible=%d routes=%d\n",
+                 initial_islands.size(), i,
+                 temp_pair.first.get_cost(final_weights),
+                 temp_pair.first.is_feasible(),
+                 (int)temp_pair.first.get_routes().size());
+        }
         if (injection_info.has_info() && injection_state) {
           auto ret        = a.add_solution(timer.elapsed_time(), temp_pair.first);
           injection_state = false;
@@ -954,8 +1028,16 @@ struct solve {
         improve_time_limit,
         timer.elapsed_time());
 
+      if (reserve_population.verbose) {
+        printf("[INIT] improving island %zu (size=%zu, threshold=%.4f)\n",
+               initial_islands.size(), a.current_size(), a.threshold);
+      }
       const bool island_generation_mode = true;
       improve_population(a, island_generation_mode, start_index);
+      if (reserve_population.verbose) {
+        printf("[INIT] island %zu after improve: size=%zu best=%.2f\n",
+               initial_islands.size(), a.current_size(), a.best_quality());
+      }
       if (timer.check_time_limit()) return;
 
       benchmark_call(display_pool(a,
@@ -1065,15 +1147,21 @@ struct solve {
                                           int start_threshold_index              = 0,
                                           bool consider_expensive_recombiners    = true)
   {
-    // std::cout << "Improve population\n";
     raft::common::nvtx::range fun_scope("improve_population_fixed_threshold");
     if (p.current_size() < 2) return;
     bool improved = true;
+    int round = 0;
 
     while (improved) {
       int k                 = max_iterations_without_improvement;
       improved              = false;
       double quality_before = p.best_quality();
+      round++;
+      if (p.verbose) {
+        printf("[EVOLVE] === round=%d threshold=%.4f pop_size=%zu best=%.2f max_steps=%d ===\n",
+               round, p.threshold, p.current_size(), quality_before, k);
+      }
+      int step = 0;
       while (k-- > 0) {
         fflush(f.file_ptr);
         if (improvement_timer.check_time_limit()) return;
@@ -1083,6 +1171,7 @@ struct solve {
 
           return;
         }
+        step++;
         constexpr bool tournament = true;
         p.get_two_random(temp_pair, tournament);
         // for inversion make it less equal than 8
@@ -1096,6 +1185,11 @@ struct solve {
         }
         double cost_first  = temp_pair.first.get_cost(weights);
         double cost_second = temp_pair.second.get_cost(weights);
+        if (p.verbose) {
+          double sim = temp_pair.first.calculate_similarity_radius(temp_pair.second);
+          printf("[EVOLVE] step=%d parents: basin_A=%.2f basin_B=%.2f similarity=%.4f\n",
+                 step, cost_first, cost_second, sim);
+        }
         bool guiding       = false;
         // reset the routes to search before hand so that we can mark the routes
         // that can be searched
@@ -1104,22 +1198,47 @@ struct solve {
         int working_insertion_index = -1;
         if (recombine(temp_pair.first, temp_pair.second, guiding, run_expensive_recombiners)) {
           auto& offspring = guiding == false ? temp_pair.first : temp_pair.second;
+          double cost_after_recombine = offspring.get_cost(weights);
           if (!feasible_only || offspring.is_feasible()) {
-            auto offset = lm.improve(offspring, weights, improvement_timer.remaining_time(), run_cycle_finder);
+            auto offset = lm.improve(offspring, weights, improvement_timer.remaining_time(), run_cycle_finder, true);
             timer.add_offset(offset);
             improvement_timer.add_offset(offset);
-            recombine_stats.update_improve_stats(
-              offspring.get_cost(weights), cost_first, cost_second);
+            double cost_after_ls = offspring.get_cost(weights);
+            recombine_stats.update_improve_stats(cost_after_ls, cost_first, cost_second);
+            if (p.verbose) {
+              printf("[EVOLVE]   crossover→%.2f  LS→new_basin=%.2f  feasible=%d",
+                     cost_after_recombine, cost_after_ls, offspring.is_feasible());
+              if (cost_after_ls < std::min(cost_first, cost_second))
+                printf(" ★better_than_both_parents");
+              else if (cost_after_ls < std::max(cost_first, cost_second))
+                printf(" ☆better_than_one_parent");
+              else
+                printf(" ✗worse_than_both");
+              printf("\n");
+            }
             working_insertion_index = p.add_solution(timer.elapsed_time(), offspring);
+          } else if (p.verbose) {
+            printf("[EVOLVE]   recombine→%.2f  SKIPPED (infeasible, feasible_only mode)\n",
+                   cost_after_recombine);
           }
+        } else if (p.verbose) {
+          printf("[EVOLVE]   recombine FAILED\n");
         }
         temp_pair.first.set_routes_to_search();
         temp_pair.second.set_routes_to_search();
         // if we have inserted to the first 2 positions
         if (working_insertion_index != -1 && working_insertion_index <= 3) {
+          if (p.verbose) {
+            printf("[EVOLVE] ↑ inserted at rank=%d, new best=%.2f (was %.2f) → restart round\n",
+                   working_insertion_index, p.best_quality(), quality_before);
+          }
           improved = true;
           break;
         }
+      }
+      if (!improved && p.verbose) {
+        printf("[EVOLVE] round=%d exhausted %d steps without top-3 insertion, best=%.2f\n",
+               round, max_iterations_without_improvement, p.best_quality());
       }
     }
   }
@@ -1181,6 +1300,11 @@ struct solve {
     std::advance(recombiner_it, dist(rng));
     auto recombiner = *recombiner_it;
     recombine_stats.add_attempt(recombiner);
+    if (working_population.verbose) {
+      printf("[EVOLVE]   recombiner=%s (from %zu options)\n",
+             all_recombine_stats::recombiner_labels[static_cast<int>(recombiner)],
+             recombine_options.size());
+    }
 
     switch (recombiner) {
       case recombiner_t::DISPOSE: {

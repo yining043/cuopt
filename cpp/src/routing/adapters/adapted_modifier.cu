@@ -56,7 +56,8 @@ std::chrono::steady_clock::duration adapted_modifier_t<i_t, f_t, REQUEST>::impro
   adapted_sol_t<i_t, f_t, REQUEST>& adapted_solution,
   costs weight,
   f_t time_limit,
-  bool run_cycle_finder)
+  bool run_cycle_finder,
+  bool enable_callback)
 {
   raft::common::nvtx::range fun_scope("improve");
   auto [resource, index] = pool_allocator.resource_pool->acquire();
@@ -68,7 +69,7 @@ std::chrono::steady_clock::duration adapted_modifier_t<i_t, f_t, REQUEST>::impro
   resource.ls.set_active_weights(gpu_weight);
   resource.ls.start_timer(time_limit);
   auto offset = resource.ls.run_best_local_search(
-    adapted_solution.sol, consider_unserviced, time_limit_enabled, run_cycle_finder);
+    adapted_solution.sol, consider_unserviced, time_limit_enabled, run_cycle_finder, enable_callback);
   adapted_solution.populate_host_data();
   adapted_solution.check_device_host_coherence();
   cuopt_func_call(adapted_solution.sol.check_cost_coherence(gpu_weight));

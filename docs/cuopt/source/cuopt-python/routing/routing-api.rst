@@ -18,7 +18,7 @@ cuOpt Routing Python API Reference
    :undoc-members:
    :show-inheritance:
 
-.. autoclass:: cuopt.routing.SolverSettings
+.. autoclass:: cuopt.routing.vehicle_routing.SolverSettings
    :members:
    :undoc-members:
    :show-inheritance:

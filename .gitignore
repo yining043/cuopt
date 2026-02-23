@@ -75,3 +75,9 @@ ml_data*
 *.png
 _back_*
 dataset*
+curves/*
+compare*/
+*.txt
+*.md
+*.log
+oracle_out/*

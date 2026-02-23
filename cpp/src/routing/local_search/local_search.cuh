@@ -122,7 +122,8 @@ class local_search_t {
   std::chrono::steady_clock::duration run_best_local_search(solution_t<i_t, f_t, REQUEST>& sol,
                              const bool consider_unserviced,
                              const bool time_limit_enabled,
-                             const bool run_cycle_finder);
+                             const bool run_cycle_finder,
+                             const bool enable_callback = false);
   void run_random_local_search(solution_t<i_t, f_t, REQUEST>& sol, bool time_limit_enabled = true);
 
   void perturb_solution(solution_t<i_t, f_t, REQUEST>& sol, i_t perturb_count = -1);
