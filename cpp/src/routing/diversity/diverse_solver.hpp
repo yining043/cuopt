@@ -285,7 +285,7 @@ struct solve {
         step_lengths.push_back(step_number);
         if (step_number > 149) step_number -= 50;
         if (diversity_levels.back() <= 0.55) break;
-        auto delta = p->is_cvrp() ? 8 : 32;
+        auto delta = p->is_cvrp() ? 16 : 32; //8 : 32;
         max -= delta;
         levels_number--;
       }
@@ -370,7 +370,7 @@ struct solve {
   {
     reserve_population.max_solutions = default_reserve_population_size;
     working_population.max_solutions = default_reserve_population_size;
-    generate_initial(target_vehicles_);
+    generate_initial(target_vehicles_, 1);
 
     auto from_islands = load_sols_from_islands();
     if (initial_islands.size() > 1) {

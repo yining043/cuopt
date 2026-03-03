@@ -20,6 +20,9 @@
 #include "../utilities/cuopt_utils.cuh"
 #include "local_search.cuh"
 #include "permutation_helper.cuh"
+#include "vrp/nodes_to_search.cuh"
+
+#include <raft/core/copy.hpp>
 
 #include <thrust/fill.h>
 #include <thrust/remove.h>
@@ -699,7 +702,8 @@ __global__ void kernel_perform_sliding_window(
   found_sliding_solution_t<i_t>* best_candidates,
   typename move_candidates_t<i_t, f_t>::view_t move_candidates,
   int* locks,
-  int blocks_per_node)
+  int blocks_per_node,
+  i_t* anchor_per_route)
 {
   extern __shared__ i_t shmem[];
   // Each block handles a different starting point for the window
@@ -790,13 +794,16 @@ __global__ void kernel_perform_sliding_window(
   // Handle non found case
   if (shbuf[0] != std::numeric_limits<double>::max() && shbuf[0] < -EPSILON &&
       reduction_index == threadIdx.x) {
-    // move_candidates.nodes_to_search.active_nodes_impacted[node_info.node()] = 1;
+    atomicOr(&move_candidates.nodes_to_search.anchor_type_flags[node_info.node()],
+             ANCHOR_SLIDING);
     while (atomicCAS(&locks[route_id], 0, 1))
       ;
     // Acquire
     __threadfence();
-    if (found_sliding_solution.delta < best_candidates[route_id].delta)
+    if (found_sliding_solution.delta < best_candidates[route_id].delta) {
       best_candidates[route_id] = found_sliding_solution;
+      if (anchor_per_route) { anchor_per_route[route_id] = node_info.node(); }
+    }
     __threadfence();
     // Release
     locks[route_id] = 0;
@@ -1046,6 +1053,10 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
   // this case, need to replicate what we do in the two opt here
   auto is_cvrp = solution.problem_ptr->is_cvrp();
 
+  // Resize/fill before stream capture - allocation during capture causes cudaErrorStreamCaptureUnsupported
+  sliding_anchor_per_route_.resize(solution.n_routes, solution.sol_handle->get_stream());
+  async_fill(sliding_anchor_per_route_, static_cast<i_t>(-1), solution.sol_handle->get_stream());
+
   sliding_cuda_graph.start_capture(solution.sol_handle->get_stream());
   async_fill(found_sliding_solution_data_,
              is_sliding_uinitialized_t<i_t>::init_data(),
@@ -1079,7 +1090,8 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
                                               found_sliding_solution_data_.data(),
                                               move_candidates.view(),
                                               locks_.data(),
-                                              blocks_per_node);
+                                              blocks_per_node,
+                                              sliding_anchor_per_route_.data());
   } else {
     kernel_perform_sliding_window<i_t, f_t, REQUEST, false>
       <<<n_blocks,  // One block for each node
@@ -1089,7 +1101,8 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
                                               found_sliding_solution_data_.data(),
                                               move_candidates.view(),
                                               locks_.data(),
-                                              blocks_per_node);
+                                              blocks_per_node,
+                                              sliding_anchor_per_route_.data());
   }
   sliding_cuda_graph.end_capture(solution.sol_handle->get_stream());
   sliding_cuda_graph.launch_graph(solution.sol_handle->get_stream());
@@ -1123,6 +1136,29 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_sliding_window(
   cuopt_func_call(solution.compute_cost());
   cuopt_func_call(cost_after =
                     solution.get_cost(move_candidates.include_objective, move_candidates.weights));
+
+  // Collect executed sliding anchors for reporting
+  solution.sol_handle->sync_stream();
+  std::vector<found_sliding_solution_t<i_t>> h_found(
+    static_cast<size_t>(solution.n_routes),
+    is_sliding_uinitialized_t<i_t>::init_data());
+  std::vector<i_t> h_anchor_per_route(static_cast<size_t>(solution.n_routes), -1);
+  raft::copy(h_found.data(),
+             found_sliding_solution_data_.data(),
+             static_cast<size_t>(solution.n_routes),
+             solution.sol_handle->get_stream());
+  raft::copy(h_anchor_per_route.data(),
+             sliding_anchor_per_route_.data(),
+             static_cast<size_t>(solution.n_routes),
+             solution.sol_handle->get_stream());
+  solution.sol_handle->sync_stream();
+  std::vector<i_t> sliding_anchors;
+  for (i_t r = 0; r < solution.n_routes; ++r) {
+    if (h_found[r].delta != std::numeric_limits<double>::max() && h_anchor_per_route[r] >= 0) {
+      sliding_anchors.push_back(h_anchor_per_route[r]);
+    }
+  }
+  if (!sliding_anchors.empty()) { append_executed_anchors(sliding_anchors, 0); }
 
   cuopt_assert(cost_before - cost_after >= EPSILON, "Cost should improve!");
   cuopt_assert(abs((cost_before - cost_after) -

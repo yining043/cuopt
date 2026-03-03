@@ -1,4 +1,7 @@
 import argparse
+from gc import set_debug
+from os import pread
+from statistics import mean
 import numpy as np
 import cudf
 from cuopt import routing
@@ -49,17 +52,17 @@ class PolicyCustomizeNodesCallback(CustomizeNodesCallback):
         if num_candidates == 0:
             return [0] * len(candidate_mask)
         
-        # 并行计算采样大小和生成 trail candidates
+        # # 并行计算采样大小和生成 trail candidates
         max_length = len(candidate_mask)
-        sample_size = num_candidates if num_candidates < 40 else (num_candidates // 2 if num_candidates < 80 else 40)
-        num_samples = 100
+        # sample_size = num_candidates if num_candidates < 40 else (num_candidates // 2 if num_candidates < 80 else 40)
+        # num_samples = 100
         
-        # 并行生成所有 trail candidates
-        candidate_mask_t = torch.tensor(candidate_mask, dtype=torch.float32, device=self.device)
-        probs = candidate_mask_t.unsqueeze(0).expand(num_samples, -1)
-        sampled_indices = torch.multinomial(probs, sample_size, replacement=False)
-        selected = torch.zeros_like(probs, dtype=torch.int32)
-        selected.scatter_(1, sampled_indices, 1)  # (num_samples, max_length)
+        # # 并行生成所有 trail candidates
+        # candidate_mask_t = torch.tensor(candidate_mask, dtype=torch.float32, device=self.device)
+        # probs = candidate_mask_t.unsqueeze(0).expand(num_samples, -1)
+        # sampled_indices = torch.multinomial(probs, sample_size, replacement=False)
+        # selected = torch.zeros_like(probs, dtype=torch.int32)
+        # selected.scatter_(1, sampled_indices, 1)  # (num_samples, max_length)
 
         # 并行准备所有 Policy 输入
         nodes_tensor = self.coordinates
@@ -67,17 +70,22 @@ class PolicyCustomizeNodesCallback(CustomizeNodesCallback):
         solution_flat_tensor = torch.tensor(solution_flat + [-1] * (max_length - len(solution_flat)), dtype=torch.long, device=self.device)
         solution_flat_tensor = solution_flat_tensor.unsqueeze(0)
         candidates_tensor = torch.tensor(candidate_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
-        selected = selected.unsqueeze(0)  # (1, num_samples, max_length)
-        
+        # selected = selected.unsqueeze(0)  # (1, num_samples, max_length)
+
         # Policy 并行打分
         with torch.no_grad():
-            scores = self.policy(nodes_tensor, demands_tensor, solution_flat_tensor, candidates_tensor, selected)
-            s_mean, s_std = scores.mean(dim=-1), scores.std(dim=-1)
-            scores = (scores - s_mean) / (s_std + 1e-9)
-        # import pdb; pdb.set_trace(32)
+            scores = self.policy(nodes_tensor, demands_tensor, solution_flat_tensor, candidates_tensor)
+            scores = torch.sigmoid(scores)
+            scores = scores * candidates_tensor.view_as(scores)
+            size_candidates = min(50, int(candidates_tensor.sum().item() * 0.3))
+            threshold = torch.topk(scores, size_candidates)[0].min().item()
+            pred = (scores >= threshold).bool()
+
         # 返回得分最高的 trail candidate
-        best_idx = scores.argmax(dim=-1).item()
-        return selected[0, best_idx].cpu().numpy().tolist()
+        # best_idx = scores.argmax(dim=-1).item()
+        # return selected[0, best_idx].cpu().numpy().tolist()
+        return pred[0].cpu().numpy().tolist()
+        # return result.cpu().numpy().tolist()
 
 def make_cuopt_format(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_vehicles, scale):
     distance_matrix_df = cudf.DataFrame(raw_data_dist[index].numpy() * scale)
@@ -127,9 +135,9 @@ def run_experiment(
     policy = None
     if use_callback:
         policy = Policy(device=device)
-    if policy_model_path:
-        print(f"[Callback] Loading Policy model from {policy_model_path}")
-        policy.load_state_dict(torch.load(policy_model_path, map_location=device)['model_state_dict'])
+        if policy_model_path:
+            print(f"[Callback] Loading Policy model from {policy_model_path}")
+            policy.load_state_dict(torch.load(policy_model_path, map_location=device)['model_state_dict'])
 
     costs = []
     gaps = []

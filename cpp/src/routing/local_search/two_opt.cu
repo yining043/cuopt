@@ -22,6 +22,8 @@
 #include "local_search.cuh"
 #include "vrp/fragment_kernels.cuh"
 
+#include <raft/core/copy.hpp>
+
 namespace cuopt {
 namespace routing {
 namespace detail {
@@ -83,7 +85,8 @@ __global__ void find_two_opt_moves(typename solution_t<i_t, f_t, REQUEST>::view_
                                    typename move_candidates_t<i_t, f_t>::view_t move_candidates,
                                    raft::device_span<two_opt_cand_t<i_t>> best_candidates,
                                    raft::device_span<two_opt_cand_t<i_t>> sampled_nodes_data,
-                                   raft::device_span<i_t> locks)
+                                   raft::device_span<i_t> locks,
+                                   i_t* anchor_per_route)
 {
   extern __shared__ double shmem[];
 
@@ -166,16 +169,22 @@ __global__ void find_two_opt_moves(typename solution_t<i_t, f_t, REQUEST>::view_
   if (!sol.problem.is_cvrp_intra()) {
     if (shbuf[0] != std::numeric_limits<double>::max() && shbuf[0] < -EPSILON &&
         reduction_index == threadIdx.x) {
+      atomicOr(&move_candidates.nodes_to_search.anchor_type_flags[node_info.node()],
+               ANCHOR_TWO_OPT);
       if (two_opt_cand.selection_delta < best_candidates[route_id].selection_delta) {
         acquire_lock(&locks[route_id]);
         if (two_opt_cand.selection_delta < best_candidates[route_id].selection_delta) {
           best_candidates[route_id] = two_opt_cand;
+          if (anchor_per_route) { anchor_per_route[route_id] = node_info.node(); }
         }
         release_lock(&locks[route_id]);
       }
     }
   } else {
-    if (threadIdx.x == reduction_index) {
+    if (shbuf[0] != std::numeric_limits<double>::max() && shbuf[0] < -EPSILON &&
+    threadIdx.x == reduction_index) {
+      atomicOr(&move_candidates.nodes_to_search.anchor_type_flags[node_info.node()],
+              ANCHOR_TWO_OPT);
       sampled_nodes_data[route_id * sol.get_num_orders() + node_info.node()] = two_opt_cand;
     }
   }
@@ -395,6 +404,8 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_two_opt(
                sol.sol_handle->get_stream());
   } else {
     two_opt_cand_data_.resize(sol.get_n_routes(), sol.sol_handle->get_stream());
+    two_opt_anchor_per_route_.resize(sol.get_n_routes(), sol.sol_handle->get_stream());
+    async_fill(two_opt_anchor_per_route_, static_cast<i_t>(-1), sol.sol_handle->get_stream());
     async_fill(locks_, 0, sol.sol_handle->get_stream());
   }
 
@@ -408,7 +419,8 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_two_opt(
       move_candidates.view(),
       cuopt::make_span(two_opt_cand_data_),
       cuopt::make_span(sampled_nodes_data_),
-      cuopt::make_span(locks_));
+      cuopt::make_span(locks_),
+      sol.problem_ptr->is_cvrp_intra() ? nullptr : two_opt_anchor_per_route_.data());
   RAFT_CHECK_CUDA(sol.sol_handle->get_stream());
 
   n_moves_found = thrust::count_if(sol.sol_handle->get_thrust_policy(),
@@ -459,6 +471,40 @@ bool local_search_t<i_t, f_t, REQUEST>::perform_two_opt(
         cuopt::make_span(moved_regions_));
   }
   RAFT_CHECK_CUDA(sol.sol_handle->get_stream());
+
+  // Collect executed two_opt anchors for reporting
+  sol.sol_handle->sync_stream();
+  std::vector<i_t> two_opt_anchors;
+  if (sol.problem_ptr->is_cvrp_intra()) {
+    std::vector<two_opt_cand_t<i_t>> h_sampled(
+      static_cast<size_t>(sol.get_n_routes()) * static_cast<size_t>(sol.get_num_orders()),
+      is_two_opt_uinitialized_t<i_t>::init_data());
+    raft::copy(h_sampled.data(),
+               sampled_nodes_data_.data(),
+               sampled_nodes_data_.size(),
+               sol.sol_handle->get_stream());
+    sol.sol_handle->sync_stream();
+    i_t n_orders = sol.get_num_orders();
+    for (size_t idx = 0; idx < h_sampled.size(); ++idx) {
+      if (h_sampled[idx].selection_delta != std::numeric_limits<double>::max()) {
+        two_opt_anchors.push_back(static_cast<i_t>(idx % n_orders));
+      }
+    }
+  } else {
+    std::vector<two_opt_cand_t<i_t>> h_cand(
+      static_cast<size_t>(sol.get_n_routes()),
+      is_two_opt_uinitialized_t<i_t>::init_data());
+    std::vector<i_t> h_anchor(static_cast<size_t>(sol.get_n_routes()), -1);
+    raft::copy(h_cand.data(), two_opt_cand_data_.data(), two_opt_cand_data_.size(), sol.sol_handle->get_stream());
+    raft::copy(h_anchor.data(), two_opt_anchor_per_route_.data(), two_opt_anchor_per_route_.size(), sol.sol_handle->get_stream());
+    sol.sol_handle->sync_stream();
+    for (i_t r = 0; r < sol.get_n_routes(); ++r) {
+      if (h_cand[r].selection_delta != std::numeric_limits<double>::max() && h_anchor[r] >= 0) {
+        two_opt_anchors.push_back(h_anchor[r]);
+      }
+    }
+  }
+  if (!two_opt_anchors.empty()) { append_executed_anchors(two_opt_anchors, 3); }
 
   cuopt_func_call(sol.compute_cost());
   cuopt_func_call(cost_after =

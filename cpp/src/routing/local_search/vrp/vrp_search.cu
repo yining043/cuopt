@@ -18,9 +18,54 @@
 #include "vrp_execute.cuh"
 #include "vrp_search.cuh"
 
+#include <raft/core/copy.hpp>
+
 namespace cuopt {
 namespace routing {
 namespace detail {
+
+template <typename i_t, typename f_t, request_t REQUEST>
+void collect_executed_vrp_anchors(solution_t<i_t, f_t, REQUEST>& sol,
+                                  move_candidates_t<i_t, f_t>& move_candidates,
+                                  std::vector<i_t>* out_anchors,
+                                  std::vector<int>* out_operators,
+                                  int operator_id)
+{
+  if (!out_anchors || !out_operators) { return; }
+  sol.sol_handle->sync_stream();
+  auto& vrp = move_candidates.vrp_move_candidates;
+  i_t n_sel = vrp.n_of_selected_moves.value(sol.sol_handle->get_stream());
+  if (n_sel <= 0) { return; }
+  i_t nr = sol.get_n_routes();
+  std::vector<i_t> h_sel(static_cast<size_t>(n_sel));
+  raft::copy(h_sel.data(),
+             vrp.selected_move_indices.data(),
+             static_cast<size_t>(n_sel),
+             sol.sol_handle->get_stream());
+  std::vector<i_t> h_node_id_1(static_cast<size_t>(nr) * static_cast<size_t>(nr));
+  raft::copy(h_node_id_1.data(),
+             vrp.node_id_1.data(),
+             static_cast<size_t>(nr) * static_cast<size_t>(nr),
+             sol.sol_handle->get_stream());
+  sol.sol_handle->sync_stream();
+  i_t n_orders = sol.get_num_orders();
+  constexpr i_t depot_mult = after_depot_insertion_multiplier;
+  for (i_t i = 0; i < n_sel; ++i) {
+    i_t id = h_node_id_1[h_sel[i]];
+    // VRP uses compact depot (n_orders + route_id); expand to full form (n_orders + route_id*4 + 0..3)
+    if (id >= n_orders && id < n_orders + nr) {
+      i_t route_id = id - n_orders;
+      i_t base     = n_orders + route_id * depot_mult;
+      for (i_t k = 0; k < depot_mult; ++k) {
+        out_anchors->push_back(base + k);
+        out_operators->push_back(operator_id);
+      }
+    } else {
+      out_anchors->push_back(id);
+      out_operators->push_back(operator_id);
+    }
+  }
+}
 
 // FIXME get rid of share memory completely. (Akif has a commit for this somewhere)
 // #ifdef BENCHMARK
@@ -655,7 +700,8 @@ __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::vi
     search_data.move_type,
     search_data.offset,
     selection_delta,
-    move_candidates.nodes_to_search.active_nodes_impacted);
+    move_candidates.nodes_to_search.active_nodes_impacted,
+    move_candidates.nodes_to_search.anchor_type_flags);
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
@@ -703,7 +749,9 @@ bool find_vrp_moves(solution_t<i_t, f_t, REQUEST>& sol,
 template <typename i_t, typename f_t, request_t REQUEST>
 bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
                           move_candidates_t<i_t, f_t>& move_candidates,
-                          i_t changed_nb_size)
+                          i_t changed_nb_size,
+                          std::vector<i_t>* out_executed_anchors,
+                          std::vector<int>* out_executed_operator)
 {
   raft::common::nvtx::range fun_scope("recycle_unused_moves");
   auto& nodes_to_search  = move_candidates.nodes_to_search;
@@ -712,26 +760,29 @@ bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
   if (!nodes_remained) { return false; }
   if (!find_vrp_moves(sol, move_candidates, recycle, changed_nb_size)) { return false; }
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
+  if (move_found) {
+    collect_executed_vrp_anchors(sol, move_candidates, out_executed_anchors, out_executed_operator, 2);
+  }
   return move_found;
 }
 
 template <typename i_t, typename f_t, request_t REQUEST>
 bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
                         move_candidates_t<i_t, f_t>& move_candidates,
-                        i_t changed_nb_size)
+                        i_t changed_nb_size,
+                        std::vector<i_t>* out_executed_anchors,
+                        std::vector<int>* out_executed_operator)
 {
   raft::common::nvtx::range fun_scope("perform_vrp_search");
   cuopt_func_call(sol.check_cost_coherence(move_candidates.weights));
   if (!find_vrp_moves(sol, move_candidates, false, changed_nb_size)) { return false; }
-  // f_t cost_before = sol.get_cost(true, move_candidates.weights);
   bool move_found = select_and_execute_vrp_move(sol, move_candidates);
-  // f_t cost_after = sol.get_cost(true, move_candidates.weights);
-  // printf("cost before: %f, cost after: %f, move_found: %d\n", cost_before, cost_after, move_found);
   if (move_found) {
+    collect_executed_vrp_anchors(sol, move_candidates, out_executed_anchors, out_executed_operator, 1);
     // copy the current nodes to search beforehand, so sliding can search for it again
     auto copy_sampled_nodes = move_candidates.nodes_to_search.h_sampled_nodes;
     // do a single iteration as more iterations doesn't find more moves
-    recycle_unused_moves(sol, move_candidates, changed_nb_size);
+    recycle_unused_moves(sol, move_candidates, changed_nb_size, out_executed_anchors, out_executed_operator);
     move_candidates.nodes_to_search.h_sampled_nodes = copy_sampled_nodes;
     move_candidates.nodes_to_search.n_sampled_nodes = copy_sampled_nodes.size();
   }
@@ -739,7 +790,11 @@ bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
 }
 
 template bool perform_vrp_search<int, float, request_t::VRP>(
-  solution_t<int, float, request_t::VRP>& sol, move_candidates_t<int, float>& move_candidates, int changed_nb_size);
+  solution_t<int, float, request_t::VRP>& sol,
+  move_candidates_t<int, float>& move_candidates,
+  int changed_nb_size,
+  std::vector<int>* out_executed_anchors,
+  std::vector<int>* out_executed_operator);
 
 }  // namespace detail
 }  // namespace routing

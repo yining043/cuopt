@@ -19,6 +19,8 @@
 #include "../move_candidates/move_candidates.cuh"
 #include "fragment_kernels.cuh"
 
+#include <vector>
+
 namespace cuopt {
 namespace routing {
 namespace detail {
@@ -65,7 +67,16 @@ struct search_data_t {
 template <typename i_t, typename f_t, request_t REQUEST>
 bool perform_vrp_search(solution_t<i_t, f_t, REQUEST>& sol,
                         move_candidates_t<i_t, f_t>& move_candidates,
-                        i_t changed_nb_size);
+                        i_t changed_nb_size,
+                        std::vector<i_t>* out_executed_anchors = nullptr,
+                        std::vector<int>* out_executed_operator = nullptr);
+
+template <typename i_t, typename f_t, request_t REQUEST>
+bool recycle_unused_moves(solution_t<i_t, f_t, REQUEST>& sol,
+                          move_candidates_t<i_t, f_t>& move_candidates,
+                          i_t changed_nb_size,
+                          std::vector<i_t>* out_executed_anchors = nullptr,
+                          std::vector<int>* out_executed_operator = nullptr);
 
 }  // namespace detail
 }  // namespace routing

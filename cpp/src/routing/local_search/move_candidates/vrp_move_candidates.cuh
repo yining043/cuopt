@@ -17,8 +17,11 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <routing/cuda_graph.cuh>
 #include <routing/solution/solution_handle.cuh>
+#include "../vrp/nodes_to_search.cuh"
 
 #include <raft/core/host_span.hpp>
 #include <rmm/device_uvector.hpp>
@@ -77,7 +80,8 @@ class vrp_move_candidates_t {
                              i_t move_type_,
                              i_t insert_offset_,
                              double cost_delta_,
-                             raft::device_span<i_t>& active_nodes_impacted)
+                             raft::device_span<i_t>& active_nodes_impacted,
+                             raft::device_span<unsigned int>& anchor_type_flags)
     {
       // we want to store the best per node, to retry the moves on changed routes
       if (cost_delta_ < best_cost_delta_per_node[node_id_1_]) {
@@ -89,6 +93,7 @@ class vrp_move_candidates_t {
         release_lock(&locks_per_node[node_id_1_]);
       }
       atomicExch(&active_nodes_impacted[node_id_1_], 1);
+      atomicOr(&anchor_type_flags[node_id_1_], ANCHOR_VRP);
 
       if (cost_delta_ > cost_delta[route_pair_idx]) return;
       acquire_lock(&locks_per_route_pair[route_pair_idx]);

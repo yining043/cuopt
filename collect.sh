@@ -10,9 +10,9 @@ do
 
    # 执行你的命令
    # 注意：--index 使用的是原始数字 $i，重定向文件名使用的是带 0 的 $formatted_index
-   CUDA_VISIBLE_DEVICES=3 python run_cuopt.py \
-      --time_limit 20 \
-      --index $i > "dataset_near10_wo_orders/instance_${formatted_index}.txt"
+   CUDA_VISIBLE_DEVICES=0 python run_cuopt.py \
+      --time_limit 50 \
+      --index $i > "dataset_anchor/instance_${formatted_index}.txt"
 
 done
 

@@ -20,6 +20,8 @@
 #include "vrp_execute.cuh"
 #include "vrp_search.cuh"
 
+#include <algorithm>
+#include <vector>
 #include <cooperative_groups.h>
 
 namespace cuopt {
@@ -381,7 +383,7 @@ __global__ void find_max_added_size_kernel(
   }
 }
 
-// Finds the non-overlapping route-pair moves in random order
+// Finds the non-overlapping route-pair moves, sorted by cost_delta (best first)
 template <typename i_t, typename f_t, request_t REQUEST>
 i_t extract_non_overlapping_moves(solution_t<i_t, f_t, REQUEST>& sol,
                                   move_candidates_t<i_t, f_t>& move_candidates)
@@ -397,10 +399,45 @@ i_t extract_non_overlapping_moves(solution_t<i_t, f_t, REQUEST>& sol,
   n_best_route_pair_moves = std::min(n_best_route_pair_moves, max_n_best_route_pair_moves);
   if (n_best_route_pair_moves == 0) { return 0; }
 
-  // 添加排序：按 tid 排序，使顺序确定
-  thrust::sort(rmm::exec_policy(sol.sol_handle->get_stream()),
-              move_candidates.vrp_move_candidates.compacted_move_indices.begin(),
-              move_candidates.vrp_move_candidates.compacted_move_indices.begin() + n_best_route_pair_moves);
+  // Sort moves by cost_delta (ascending, smaller is better since cost_delta is negative)
+  // This ensures we prioritize the best moves first in the greedy selection
+  auto& vrp_candidates = move_candidates.vrp_move_candidates;
+  
+  // Copy compacted_move_indices to host
+  std::vector<i_t> h_compacted_indices(n_best_route_pair_moves);
+  raft::copy(h_compacted_indices.data(),
+             vrp_candidates.compacted_move_indices.data(),
+             n_best_route_pair_moves,
+             sol.sol_handle->get_stream());
+  
+  // Copy entire cost_delta array to host for indexed access
+  i_t cost_delta_size = sol.get_n_routes() * sol.get_n_routes();
+  std::vector<double> h_cost_delta_full(cost_delta_size);
+  raft::copy(h_cost_delta_full.data(),
+             vrp_candidates.cost_delta.data(),
+             cost_delta_size,
+             sol.sol_handle->get_stream());
+  sol.sol_handle->sync_stream();
+  
+  // Create pairs and sort by cost_delta
+  std::vector<std::pair<double, i_t>> cost_index_pairs;
+  cost_index_pairs.reserve(n_best_route_pair_moves);
+  for (i_t i = 0; i < n_best_route_pair_moves; ++i) {
+    cost_index_pairs.emplace_back(h_cost_delta_full[h_compacted_indices[i]], 
+                                  h_compacted_indices[i]);
+  }
+  std::sort(cost_index_pairs.begin(), cost_index_pairs.end());
+  
+  // Extract sorted indices
+  for (i_t i = 0; i < n_best_route_pair_moves; ++i) {
+    h_compacted_indices[i] = cost_index_pairs[i].second;
+  }
+  
+  // Write sorted indices back to device
+  raft::copy(vrp_candidates.compacted_move_indices.data(),
+             h_compacted_indices.data(),
+             n_best_route_pair_moves,
+             sol.sol_handle->get_stream());
   sol.sol_handle->sync_stream();
   
   size_t sh_size = sizeof(i_t) * (sol.get_n_routes() + n_best_route_pair_moves * 2);

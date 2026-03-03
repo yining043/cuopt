@@ -147,6 +147,14 @@ class local_search_t {
 
   void set_active_weights(const infeasible_cost_t weights, bool include_objective = true);
 
+  // Executed anchors from last run_fast_search (0=sliding, 1=vrp, 2=recycle_vrp, 3=two_opt)
+  void clear_executed_anchors();
+  void append_executed_anchors(const std::vector<i_t>& node_ids, int operator_id);
+  const std::vector<i_t>& get_last_executed_anchors() const { return last_executed_anchors_; }
+  const std::vector<int>& get_last_executed_anchor_operator() const {
+    return last_executed_anchor_operator_;
+  }
+
   static inline void start_timer(f_t time_limit_)
   {
     time_limit         = time_limit_;
@@ -195,16 +203,28 @@ class local_search_t {
   void calculate_route_compatibility(solution_t<i_t, f_t, REQUEST>& sol);
 
  private:
+  void print_solution(solution_t<i_t, f_t, REQUEST>& sol, const char* prefix);
+  std::set<std::pair<i_t, i_t>> get_undirected_edges(solution_t<i_t, f_t, REQUEST>& sol);
+  std::pair<std::set<i_t>, std::set<i_t>> compute_impact_and_intersection(
+    const std::set<std::pair<i_t, i_t>>& old_edges,
+    const std::set<std::pair<i_t, i_t>>& new_edges,
+    const std::vector<NodeInfo<int>>& best_nodes_to_search,
+    i_t sample_size);
   void fill_gpu_graph(solution_t<i_t, f_t, REQUEST>& sol);
+  template <typename Container, typename Accessor>
+  void print_collection(const char* prefix, 
+                        const Container& container, 
+                        size_t limit, 
+                        Accessor accessor);
   void sort_move_candidates_by_cost(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_sliding_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_two_opt_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_cross_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_inter_search(solution_t<i_t, f_t, REQUEST>& sol);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::PDP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96, bool random_shuffle = true);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96, bool random_shuffle = true, bool look_ahead = false);
   template <request_t r_t = REQUEST, std::enable_if_t<r_t == request_t::VRP, bool> = true>
-  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96, bool random_shuffle = true);
+  bool run_fast_search(solution_t<i_t, f_t, r_t>& sol, bool full_set = false, i_t changed_nb_size = 96, bool random_shuffle = true, bool look_ahead = false);
 
   void reset_cross_vectors(solution_t<i_t, f_t, REQUEST>& solution);
 
@@ -228,6 +248,11 @@ class local_search_t {
   rmm::device_uvector<i_t> moved_regions_;
   rmm::device_uvector<sliding_tsp_cand_t<i_t>> sampled_tsp_data_;
   rmm::device_uvector<int> locks_;
+  // Executed move anchors: anchor node ids and operator id (0=sliding, 1=vrp, 2=recycle_vrp, 3=two_opt)
+  std::vector<i_t> last_executed_anchors_;
+  std::vector<int> last_executed_anchor_operator_;
+  rmm::device_uvector<i_t> sliding_anchor_per_route_;
+  rmm::device_uvector<i_t> two_opt_anchor_per_route_;
   // random number generator
   std::mt19937 rng;
 

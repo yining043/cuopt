@@ -32,9 +32,6 @@ cdef extern from "cuopt/routing/utilities/callbacks_implems.hpp" namespace "cuop
 
 
 cdef class CustomizeNodesCallback:
-
-    cdef default_customize_nodes_callback_t[int, float] native_callback
-
     def __init__(self):
         self.native_callback.pyCallbackClass = <PyObject *><void*>self
 

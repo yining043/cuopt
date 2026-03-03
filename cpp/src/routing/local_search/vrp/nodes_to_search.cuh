@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <utilities/vector_helpers.cuh>
 #include "../../cuda_graph.cuh"
 #include "../../solution/solution.cuh"
@@ -28,6 +30,11 @@
 namespace cuopt {
 namespace routing {
 namespace detail {
+
+// Anchor tracking: bitmask for which operator triggered each node
+constexpr uint8_t ANCHOR_VRP     = 1u << 0;
+constexpr uint8_t ANCHOR_SLIDING = 1u << 1;
+constexpr uint8_t ANCHOR_TWO_OPT = 1u << 2;
 
 template <typename i_t, typename f_t>
 class move_candidates_t;
@@ -62,9 +69,11 @@ class nodes_to_search_t {
       sampled_nodes_to_search(n_orders + after_depot_insertion_multiplier * n_routes,
                               sol_handle_->get_stream()),
       active_nodes_impacted(n_orders + n_routes, sol_handle_->get_stream()),
+      anchor_type_flags(n_orders + n_routes, sol_handle_->get_stream()),
       recycled_node_pairs(n_orders + after_depot_insertion_multiplier * n_routes,
                           sol_handle_->get_stream()),
       h_active_nodes_impacted(n_orders + n_routes),
+      h_anchor_type_flags(n_orders + n_routes),
       h_recycled_node_pairs(n_orders + after_depot_insertion_multiplier * n_routes),
       h_best_id_per_node(n_orders + n_routes)
   {
@@ -87,6 +96,7 @@ class nodes_to_search_t {
   void reset_active_nodes(solution_handle_t<i_t, f_t> const* sol_handle)
   {
     async_fill(active_nodes_impacted, 0, sol_handle->get_stream());
+    async_fill(anchor_type_flags, 0u, sol_handle->get_stream());
   }
 
   struct view_t {
@@ -95,6 +105,7 @@ class nodes_to_search_t {
     raft::device_span<NodeInfo<i_t>> nodes_to_search;
     raft::device_span<NodeInfo<i_t>> sampled_nodes_to_search;
     raft::device_span<i_t> active_nodes_impacted;
+    raft::device_span<unsigned int> anchor_type_flags;
     // raft::device_span<i_t> routes_modified;
     raft::device_span<int2> recycled_node_pairs;
   };
@@ -110,6 +121,8 @@ class nodes_to_search_t {
                                                                  sampled_nodes_to_search.size()};
     v.active_nodes_impacted =
       raft::device_span<i_t>{active_nodes_impacted.data(), active_nodes_impacted.size()};
+    v.anchor_type_flags =
+      raft::device_span<unsigned int>{anchor_type_flags.data(), anchor_type_flags.size()};
     // v.routes_modified =
     //   raft::device_span<i_t>{routes_modified.data(), routes_modified.size()};
     v.recycled_node_pairs =
@@ -121,12 +134,14 @@ class nodes_to_search_t {
   rmm::device_uvector<NodeInfo<i_t>> nodes_to_search;
   rmm::device_uvector<NodeInfo<i_t>> sampled_nodes_to_search;
   rmm::device_uvector<i_t> active_nodes_impacted;
+  rmm::device_uvector<unsigned int> anchor_type_flags;
   // rmm::device_uvector<i_t> routes_modified;
   rmm::device_uvector<int2> recycled_node_pairs;
 
   std::vector<NodeInfo<i_t>> h_sampled_nodes;
   std::vector<NodeInfo<i_t>> h_nodes_to_search;
   std::vector<i_t> h_active_nodes_impacted;
+  std::vector<unsigned int> h_anchor_type_flags;
   std::vector<int2> h_recycled_node_pairs;
   std::vector<i_t> h_best_id_per_node;
   i_t n_sampled_nodes;
