@@ -29,6 +29,7 @@ template <typename i_t>
 struct search_data_t {
   i_t block_node_id;
   i_t node_id_2;
+  i_t anchor_node_id;  // pre-swap candidate for correct anchor tracking
   // the neighbors of block_node_id that we will use
   raft::device_span<const i_t> nodes_to_consider;
   i_t start_idx_1;

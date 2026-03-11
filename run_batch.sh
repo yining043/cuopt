@@ -8,7 +8,7 @@ gpus=(0 1 2 3)
 total_tasks=16
 
 # 3. 自定义输出文件的前缀名 (例如设置为 "exp_cuopt"，输出就会变成 exp_cuopt_1.txt, exp_cuopt_2.txt...)
-output_prefix="greedy_highrecall"
+output_prefix="only_onestep"
 # =========================================
 
 num_gpus=${#gpus[@]}

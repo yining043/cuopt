@@ -77,7 +77,7 @@ class PolicyCustomizeNodesCallback(CustomizeNodesCallback):
             scores = self.policy(nodes_tensor, demands_tensor, solution_flat_tensor, candidates_tensor)
             scores = torch.sigmoid(scores)
             scores = scores * candidates_tensor.view_as(scores)
-            size_candidates = min(50, int(candidates_tensor.sum().item() * 0.3))
+            size_candidates = max(50, int(candidates_tensor.sum().item() * 0.8))
             threshold = torch.topk(scores, size_candidates)[0].min().item()
             pred = (scores >= threshold).bool()
 

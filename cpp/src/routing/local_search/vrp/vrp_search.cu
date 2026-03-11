@@ -42,17 +42,17 @@ void collect_executed_vrp_anchors(solution_t<i_t, f_t, REQUEST>& sol,
              vrp.selected_move_indices.data(),
              static_cast<size_t>(n_sel),
              sol.sol_handle->get_stream());
-  std::vector<i_t> h_node_id_1(static_cast<size_t>(nr) * static_cast<size_t>(nr));
-  raft::copy(h_node_id_1.data(),
-             vrp.node_id_1.data(),
+  std::vector<i_t> h_anchor_id(static_cast<size_t>(nr) * static_cast<size_t>(nr));
+  raft::copy(h_anchor_id.data(),
+             vrp.anchor_id.data(),
              static_cast<size_t>(nr) * static_cast<size_t>(nr),
              sol.sol_handle->get_stream());
   sol.sol_handle->sync_stream();
   i_t n_orders = sol.get_num_orders();
   constexpr i_t depot_mult = after_depot_insertion_multiplier;
   for (i_t i = 0; i < n_sel; ++i) {
-    i_t id = h_node_id_1[h_sel[i]];
-    // VRP uses compact depot (n_orders + route_id); expand to full form (n_orders + route_id*4 + 0..3)
+    i_t id = h_anchor_id[h_sel[i]];
+    // anchor_id stores compact depot (n_orders + route_id); expand to full form
     if (id >= n_orders && id < n_orders + nr) {
       i_t route_id = id - n_orders;
       i_t base     = n_orders + route_id * depot_mult;
@@ -512,13 +512,15 @@ DI bool get_work_config(typename solution_t<i_t, f_t, REQUEST>::view_t& solution
     if (gl_thread_id >= (i_t)vrp_move_t::SIZE * searched_nodes.n_sampled_nodes) { return true; }
     move_category  = gl_thread_id % (i_t)vrp_move_t::SIZE;
     int2 node_pair = searched_nodes.recycled_node_pairs[gl_thread_id / (i_t)vrp_move_t::SIZE];
-    search_data.block_node_id = node_pair.x;
-    search_data.node_id_2     = node_pair.y;
+    search_data.block_node_id  = node_pair.x;
+    search_data.node_id_2      = node_pair.y;
+    search_data.anchor_node_id = node_pair.x;
   } else {
     const i_t n_blocks_per_move_type = searched_nodes.n_sampled_nodes;
     node_info     = searched_nodes.sampled_nodes_to_search[blockIdx.x / (i_t)vrp_move_t::SIZE];
     move_category = blockIdx.x % (i_t)vrp_move_t::SIZE;
-    search_data.block_node_id = node_info.node();
+    search_data.block_node_id  = node_info.node();
+    search_data.anchor_node_id = node_info.node();
   }
 
   if (move_category <= (i_t)vrp_move_t::CROSS) {
@@ -689,6 +691,13 @@ __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::vi
     move_candidates.vrp_move_candidates.get_route_pair_idx(r_id_1, r_id_2, solution.n_routes);
 
   if (cost_delta > -EPSILON) return;
+  // mark anchor on pre-swap candidate so it won't be filtered by candidate set
+  i_t anchor = search_data.anchor_node_id;
+  if (anchor >= solution.get_num_orders()) {
+    anchor = solution.get_num_orders() +
+             (anchor - solution.get_num_orders()) / after_depot_insertion_multiplier;
+  }
+  atomicOr(&move_candidates.nodes_to_search.anchor_type_flags[anchor], ANCHOR_VRP);
   // for VRP and sliding kernels we record only negative moves with working weights but execute with
   // the alpha and beta
   move_candidates.vrp_move_candidates.record_candidate(
@@ -700,6 +709,7 @@ __global__ void find_vrp_moves_kernel(typename solution_t<i_t, f_t, REQUEST>::vi
     search_data.move_type,
     search_data.offset,
     selection_delta,
+    anchor,
     move_candidates.nodes_to_search.active_nodes_impacted,
     move_candidates.nodes_to_search.anchor_type_flags);
 }

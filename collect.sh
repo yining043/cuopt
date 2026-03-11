@@ -1,19 +1,29 @@
 #!/bin/bash
 
-# 循环 1 到 128
+# 循环 0 到 127
 for i in {0..127}
 do
-   # 格式化数字为两位数，例如 1 变成 01, 10 保持 10
+   # 格式化数字为三位数，例如 1 变成 001, 10 变成 010
    formatted_index=$(printf "%03d" $i)
+   
+   # 计算要使用的显卡 ID (取模 4 得到: 0, 1, 2, 3)
+   gpu_id=$((i % 4))
 
-   echo "Processing Index: $i ..."
+   echo "Processing Index: $i on GPU $gpu_id ..."
 
-   # 执行你的命令
-   # 注意：--index 使用的是原始数字 $i，重定向文件名使用的是带 0 的 $formatted_index
-   CUDA_VISIBLE_DEVICES=0 python run_cuopt.py \
-      --time_limit 50 \
-      --index $i > "dataset_anchor/instance_${formatted_index}.txt"
+   # 修改 time_limit 为 10，动态分配显卡，并在末尾加上 & 让其在后台运行
+   CUDA_VISIBLE_DEVICES=$gpu_id python run_cuopt.py \
+      --time_limit 10 \
+      --index $i > "dataset_anchor/instance_${formatted_index}.txt" &
 
+   # 每提交 4 个任务就阻塞等待它们全部完成，然后再启动下一批
+   if [ $(( (i + 1) % 4 )) -eq 0 ]; then
+       wait
+   fi
 done
 
-echo "All task done!"
+# 最后的 wait 用于捕获可能未凑满 4 个的剩余任务
+# （虽然 128 能被 4 整除，但保留此行是编写脚本的好习惯）
+wait
+
+echo "All tasks done!"

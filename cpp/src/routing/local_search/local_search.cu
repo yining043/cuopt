@@ -529,7 +529,6 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
   printf("[search #%d] N_nodes_w_dummy: %d, N_nodes: %d\n", global_local_search_iter, N_nodes_w_dummy, N_nodes);
   std::vector<NodeInfo<int>> full_node_to_search(N_nodes_w_dummy), work_node_to_search(N_nodes_w_dummy), best_node_to_search(N_nodes_w_dummy);
   std::mt19937_64 rng(std::random_device{}());
-  double best_score = 1000000000.0;
   bool pred_with_NN = false;
   // Get customize nodes callback
   callbacks::customize_nodes_callback_t<i_t, f_t>* obs_callback = nullptr;
@@ -552,6 +551,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       full_node_to_search = move_candidates.nodes_to_search.h_nodes_to_search;
     }
     iter++;
+    double last_estimated_cost = 1000000000.0;
     // fast loop, insider this sliding, fast vrp search and fast cross search happens
     while (true) { 
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
@@ -646,7 +646,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
         //     }
         //   }
         // }
-        // auto [sol_impacted_nodes, sol_intersection_nodes] = compute_impact_and_intersection(old_edges_undirected, new_edges_undirected, base_node_to_search, sample_size);
+        // auto [sol_impacted_nodes, sol_intersection_nodes] = compute_impact_and_intersection(old_edges_undirected, new_edges_undirected, full_node_to_search, 12);
         // std::set<int> intersection_anchor;
         // for (auto node_id : all_anchor) {
         //   if (sol_impacted_nodes.find(node_id) != sol_impacted_nodes.end()) {
@@ -662,29 +662,124 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
         //   sol_impacted_nodes.size(),
         //   [](i_t x) { return x; });
         //##############################################
-        const auto& anchors = get_last_executed_anchors();
-        const auto& ops    = get_last_executed_anchor_operator();
-        if (!anchors.empty()) {
-          std::set<i_t> by_op[4];
-          for (size_t i = 0; i < anchors.size(); ++i) {
-            int op = (i < ops.size()) ? ops[i] : 0;
-            if (op >= 0 && op <= 3) by_op[op].insert(anchors[i]);
-          }
-          print_collection("[after_search] executed_anchors (sliding): ",
-                           by_op[0], by_op[0].size(), [](i_t x) { return x; });
-          print_collection("[after_search] executed_anchors (vrp): ",
-                           by_op[1], by_op[1].size(), [](i_t x) { return x; });
-          print_collection("[after_search] executed_anchors (recycle_vrp): ",
-                           by_op[2], by_op[2].size(), [](i_t x) { return x; });
-          print_collection("[after_search] executed_anchors (two_opt): ",
-                           by_op[3], by_op[3].size(), [](i_t x) { return x; });
-          excuted_anchor = std::set<i_t>(anchors.begin(), anchors.end());
-          print_collection("[after_search] executed_anchors (all): ",
-            excuted_anchor, excuted_anchor.size(), [](i_t x) { return x; });
-        }
+        // const auto& anchors = get_last_executed_anchors();
+        // const auto& ops    = get_last_executed_anchor_operator();
+        // if (!anchors.empty()) {
+        //   std::set<i_t> by_op[4];
+        //   for (size_t i = 0; i < anchors.size(); ++i) {
+        //     int op = (i < ops.size()) ? ops[i] : 0;
+        //     if (op >= 0 && op <= 3) by_op[op].insert(anchors[i]);
+        //   }
+        //   print_collection("[after_search] executed_anchors (sliding): ",
+        //                    by_op[0], by_op[0].size(), [](i_t x) { return x; });
+        //   print_collection("[after_search] executed_anchors (vrp): ",
+        //                    by_op[1], by_op[1].size(), [](i_t x) { return x; });
+        //   print_collection("[after_search] executed_anchors (recycle_vrp): ",
+        //                    by_op[2], by_op[2].size(), [](i_t x) { return x; });
+        //   print_collection("[after_search] executed_anchors (two_opt): ",
+        //                    by_op[3], by_op[3].size(), [](i_t x) { return x; });
+        //   excuted_anchor = std::set<i_t>(anchors.begin(), anchors.end());
+        //   print_collection("[after_search] executed_anchors (all): ",
+        //     excuted_anchor, excuted_anchor.size(), [](i_t x) { return x; });
+        // }
         //########################################################
-        auto label_nodes = excuted_anchor;
-        print_solution(temp_trail_routes, "[after_search] sol: ");
+        // ##########
+        // std::set<i_t> twenty_anchor_nodes;
+        // // randomly select half of the full_node_to_search into best_node_to_search
+        // std::vector<i_t> anchor_vec(all_anchor.begin(), all_anchor.end());
+        // std::shuffle(anchor_vec.begin(), anchor_vec.end(), rng);
+        // twenty_anchor_nodes = std::set<i_t>(anchor_vec.begin(), 
+        //           anchor_vec.begin() + std::min(anchor_vec.size(), (size_t)20));
+        // ##########
+        
+        //perform look ahead analysis on different subsets of excuted_anchor
+        const int n_trails = 20;
+        const int n_look_ahead = 3;
+        std::vector<double> previous_cost(n_look_ahead + 1);
+        previous_cost[0] = sol.get_cost(true, move_candidates.weights);
+        double best_cost = 1000000000.0;
+        std::set<i_t> best_subset;
+        std::vector<i_t> anchor_vec(all_anchor.begin(), all_anchor.end());
+        if (anchor_vec.empty()) { best_subset = all_anchor; }
+        else {
+          // std::uniform_int_distribution<size_t> size_dist(int(anchor_vec.size() * 1.0), int(anchor_vec.size() * 1.0));
+          bool continue_flag = true;
+          for (int i = 0; ((i < n_trails) || ((i >= n_trails) && continue_flag)) && i < 200; ++i) {
+            std::shuffle(anchor_vec.begin(), anchor_vec.end(), rng);
+            size_t subset_size = std::min(20, (int)anchor_vec.size()); //size_dist(rng);
+            std::set<i_t> work_subset(anchor_vec.begin(), anchor_vec.begin() + subset_size);
+            std::vector<NodeInfo<int>> work_node_list;
+            work_node_list.reserve(work_subset.size());
+            for (const auto& node_info : full_node_to_search) {
+              if (work_subset.count(node_info.node())) work_node_list.push_back(node_info);
+            }
+            std::shuffle(work_node_list.begin(), work_node_list.end(), rng);
+            Sol temp_trail_routes(sol);
+            load_to_device_both(work_node_list);
+            run_fast_search(temp_trail_routes, true, 96, false, false); //!!!
+            std::set<i_t> new_excuted_anchor;
+            int number_of_anchors = 0;
+            bool move_found_here = true;
+            // init anchors_new and ops_new as empty
+            std::vector<i_t> anchors_new;
+            std::vector<int> ops_new;
+            for (int ii = 0; ii < n_look_ahead; ++ii) {
+              if (ii == 0) {
+                anchors_new = get_last_executed_anchors();
+                ops_new    = get_last_executed_anchor_operator();
+                new_excuted_anchor = std::set<i_t>(anchors_new.begin(), anchors_new.end());
+                number_of_anchors = (int)new_excuted_anchor.size();
+              }
+              if (move_found_here){
+                load_to_device_both(full_node_to_search);
+                move_found_here = run_fast_search(temp_trail_routes, true, 96, false, false); //!!!
+              }
+              previous_cost[ii+1] = temp_trail_routes.get_cost(true, move_candidates.weights);
+            }
+            auto cost = temp_trail_routes.get_cost(true, move_candidates.weights);
+            if (cost < best_cost) {
+              best_cost = cost;
+              best_subset = new_excuted_anchor;
+            }
+            if (cost <= last_estimated_cost) { 
+              continue_flag = false; 
+              last_estimated_cost = cost;
+            }
+            printf("[trail #%d] last_estimated_cost: %f, cost: %f\n", i, last_estimated_cost, cost);
+            std::set<i_t> by_op[4];
+            for (size_t k = 0; k < anchors_new.size(); ++k) {
+              int op = (k < ops_new.size()) ? ops_new[k] : 0;
+              if (op >= 0 && op <= 3) by_op[op].insert(anchors_new[k]);
+            }
+            print_collection("executed_anchors (sliding): ",
+                            by_op[0], by_op[0].size(), [](i_t x) { return x; });
+            print_collection("executed_anchors (vrp): ",
+                            by_op[1], by_op[1].size(), [](i_t x) { return x; });
+            print_collection("executed_anchors (recycle_vrp): ",
+                            by_op[2], by_op[2].size(), [](i_t x) { return x; });
+            print_collection("executed_anchors (two_opt): ",
+                            by_op[3], by_op[3].size(), [](i_t x) { return x; });
+            excuted_anchor = std::set<i_t>(anchors_new.begin(), anchors_new.end());
+            print_collection("executed_anchors (all): ",
+              excuted_anchor, excuted_anchor.size(), [](i_t x) { return x; });
+            print_collection(
+              "previous_cost: ", 
+              previous_cost, 
+              n_look_ahead + 1,
+              [](double x) { return x; });
+            printf("[trail #%d] full size: %zu, subset_size: %zu, cost: %f, number_of_anchors: %d, previous_number_of_anchors: %zu, best_cost: %f\n", 
+                         i, all_anchor.size(), work_node_list.size(), cost, number_of_anchors, excuted_anchor.size(), best_cost);
+          }
+          if (continue_flag) {
+            printf("[iter #%d] failed to find a better solution: %f\n", iter - 2, last_estimated_cost);
+            last_estimated_cost = best_cost;
+          }
+        }
+        
+        // ##########
+        auto label_nodes = best_subset;
+        printf("[after_search] label_nodes size: %zu\n", label_nodes.size());
+        print_solution(sol, "[after_search] sol: ");
         print_collection("[after_search] label_nodes: ", 
           label_nodes, 
           label_nodes.size(),
@@ -764,13 +859,11 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       // std::shuffle(full_node_to_search.begin(), full_node_to_search.end(), rng);
       // best_node_to_search.clear();
       // for (size_t i = 0; i < full_node_to_search.size(); ++i) {
-      //   if (i < full_node_to_search.size() / 2) {
+      //   if (i < 40) {
       //     best_node_to_search.push_back(full_node_to_search[i]);
       //   }
       // }
       // ##########
-
-      printf("[iter #%d] size of best nodes to search: %d, size of h_nodes_to_search: %d\n", iter - 2, (int)best_node_to_search.size(), (int)move_candidates.nodes_to_search.h_nodes_to_search.size());
       // end looking ahead
       load_to_device_both(best_node_to_search);
       printf("[iter #%d] size of base nodes to search: %d, size of h_nodes_to_search: %d\n", iter - 2, (int)full_node_to_search.size(), (int)move_candidates.nodes_to_search.h_nodes_to_search.size());

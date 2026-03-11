@@ -40,6 +40,7 @@ class vrp_move_candidates_t {
   vrp_move_candidates_t(i_t n_orders, i_t n_routes, solution_handle_t<i_t, f_t> const* sol_handle_)
     : node_id_1(n_routes * n_routes, sol_handle_->get_stream()),
       node_id_2(n_routes * n_routes, sol_handle_->get_stream()),
+      anchor_id(n_routes * n_routes, sol_handle_->get_stream()),
       frag_size_1(n_routes * n_routes, sol_handle_->get_stream()),
       frag_size_2(n_routes * n_routes, sol_handle_->get_stream()),
       move_type(n_routes * n_routes, sol_handle_->get_stream()),
@@ -67,6 +68,7 @@ class vrp_move_candidates_t {
     async_fill(
       best_cost_delta_per_node, std::numeric_limits<double>::max(), sol_handle->get_stream());
     async_fill(best_id_per_node, -1, sol_handle->get_stream());
+    async_fill(anchor_id, -1, sol_handle->get_stream());
     n_best_route_pair_moves.set_value_to_zero_async(sol_handle->get_stream());
     max_added_size.set_value_async(max_fragment_size, sol_handle->get_stream());
   }
@@ -80,6 +82,7 @@ class vrp_move_candidates_t {
                              i_t move_type_,
                              i_t insert_offset_,
                              double cost_delta_,
+                             i_t anchor_node_id_,
                              raft::device_span<i_t>& active_nodes_impacted,
                              raft::device_span<unsigned int>& anchor_type_flags)
     {
@@ -93,7 +96,6 @@ class vrp_move_candidates_t {
         release_lock(&locks_per_node[node_id_1_]);
       }
       atomicExch(&active_nodes_impacted[node_id_1_], 1);
-      atomicOr(&anchor_type_flags[node_id_1_], ANCHOR_VRP);
 
       if (cost_delta_ > cost_delta[route_pair_idx]) return;
       acquire_lock(&locks_per_route_pair[route_pair_idx]);
@@ -105,6 +107,7 @@ class vrp_move_candidates_t {
         move_type[route_pair_idx]     = move_type_;
         insert_offset[route_pair_idx] = insert_offset_;
         cost_delta[route_pair_idx]    = cost_delta_;
+        anchor_id[route_pair_idx]     = anchor_node_id_;
       }
       release_lock(&locks_per_route_pair[route_pair_idx]);
     }
@@ -130,6 +133,7 @@ class vrp_move_candidates_t {
 
     raft::device_span<i_t> node_id_1;
     raft::device_span<i_t> node_id_2;
+    raft::device_span<i_t> anchor_id;
     raft::device_span<i_t> frag_size_1;
     raft::device_span<i_t> frag_size_2;
     raft::device_span<i_t> move_type;
@@ -151,6 +155,7 @@ class vrp_move_candidates_t {
     view_t v;
     v.node_id_1     = raft::device_span<i_t>{node_id_1.data(), node_id_1.size()};
     v.node_id_2     = raft::device_span<i_t>{node_id_2.data(), node_id_2.size()};
+    v.anchor_id     = raft::device_span<i_t>{anchor_id.data(), anchor_id.size()};
     v.frag_size_1   = raft::device_span<i_t>{frag_size_1.data(), frag_size_1.size()};
     v.frag_size_2   = raft::device_span<i_t>{frag_size_2.data(), frag_size_2.size()};
     v.move_type     = raft::device_span<i_t>{move_type.data(), move_type.size()};
@@ -174,6 +179,7 @@ class vrp_move_candidates_t {
 
   rmm::device_uvector<i_t> node_id_1;
   rmm::device_uvector<i_t> node_id_2;
+  rmm::device_uvector<i_t> anchor_id;
   rmm::device_uvector<i_t> frag_size_1;
   rmm::device_uvector<i_t> frag_size_2;
   rmm::device_uvector<i_t> move_type;
