@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-解析 local_search.cu 输出的日志文件 (适配新格式: Cost Tensor & Agg Size)
+解析 local_search.cu 输出的日志文件 (适配 anchor 格式)
+每个 state (= instance+search+iteration) 保留最多 12 个代表性 trails，
+并分配 state_id 供 GRPO 训练使用。
 """
 
 import re
 import sys
 import os
 import glob
+import gc
 import torch
 from dataclasses import dataclass, field
 from load_nco_data import load_raw_data
@@ -26,12 +29,10 @@ class SearchInfo:
 @dataclass
 class IterationInfo:
     iter_id: int
-    best_node_size: int
-    sample_size: int
-    agg_intersection_size: int = 0  # 新增字段
+    candidate_size: int
+    anchor_nodes: set = field(default_factory=set)
     current_solution: dict = field(default_factory=dict)
     trails: list = field(default_factory=list)
-    executed: dict = field(default_factory=dict)
 
 
 def parse_route_list(route_str):
@@ -42,22 +43,29 @@ def parse_route_list(route_str):
     return routes
 
 
+def parse_int_list(s):
+    """Parse a comma-separated int list string like '1,2,3' into a list of ints."""
+    return [int(x.strip()) for x in s.split(',') if x.strip()]
+
+
 def parse_output_file(file_path):
     results = []
     current_search = None
     current_iter = None
     current_trail = None
-    
+
     with open(file_path, 'r') as f:
         lines = f.readlines()
-    
+
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        
+
         # [search #X] N_nodes_w_dummy: Y, N_nodes: Z
         m = re.match(r'\[search #(\d+)\]\s*N_nodes_w_dummy:\s*(\d+),\s*N_nodes:\s*(\d+)', line)
         if m:
+            if current_iter and current_search:
+                current_search.iterations.append(current_iter)
             if current_search:
                 results.append(current_search)
             current_search = SearchInfo(
@@ -69,31 +77,22 @@ def parse_output_file(file_path):
             current_trail = None
             i += 1
             continue
-        
-        # [iter #X] best_node_size: Y, sample_size: Z
-        m = re.match(r'\[iter #(\d+)\]\s*best_node_size:\s*(\d+),\s*sample_size:\s*(\d+)', line)
+
+        # [iter #X] candidate_size: Y
+        m = re.match(r'\[iter #(\d+)\]\s*candidate_size:\s*(\d+)', line)
         if m and current_search:
             if current_iter:
                 current_search.iterations.append(current_iter)
             current_iter = IterationInfo(
                 iter_id=int(m.group(1)),
-                best_node_size=int(m.group(2)),
-                sample_size=int(m.group(3))
+                candidate_size=int(m.group(2))
             )
             current_trail = None
             i += 1
             continue
-        
-        # [iter #X] aggregated_intersection_nodes_size: Y
-        # 新增解析
-        m = re.match(r'\[iter #(\d+)\]\s*aggregated_intersection_nodes_size:\s*(\d+)', line)
-        if m and current_iter:
-            current_iter.agg_intersection_size = int(m.group(2))
-            i += 1
-            continue
 
-        # [current_solution] sol: [route1] [route2] ...
-        m = re.match(r'\[current_solution\]\s*sol:\s*(.+)', line)
+        # [before_search] sol: [route1] [route2] ...
+        m = re.match(r'\[before_search\]\s*sol:\s*(.+)', line)
         if m and current_iter:
             routes = parse_route_list(m.group(1))
             current_iter.current_solution = {
@@ -102,67 +101,80 @@ def parse_output_file(file_path):
             }
             i += 1
             continue
-        
-        # [trail #X] [before_search] candidates: [...]
-        m = re.match(r'\[trail #(\d+)\]\s*\[before_search\]\s*candidates:\s*\[([^\]]+)\]', line)
-        if m and current_iter:
-            trail_id = int(m.group(1))
-            candidates = [int(x.strip()) for x in m.group(2).split(',') if x.strip()]
-            current_trail = {
-                'trail_id': trail_id,
-                'candidates': candidates,
-                'selected': []
-            }
-            i += 1
-            continue
-        
-        # [after_search] intersection_nodes: [...] -> 映射为 selected
-        m = re.match(r'\[after_search\]\s*intersection_nodes:\s*\[([^\]]+)\]', line)
-        if m and current_trail is not None:
-            selected = [int(x.strip()) for x in m.group(1).split(',') if x.strip()]
-            current_trail['selected'] = selected
+
+        # [before_search] candidates: [...] — skip
+        if line.startswith('[before_search] candidates:'):
             i += 1
             continue
 
-        # score: X best score: Y
-        # 修改：仅作为 Trail 结束标志，不再存储 score 到 data，因为后续要用 cost_before/after 替代
-        m = re.match(r'^score:\s*([\d.]+)\s*best score:\s*([\d.]+)', line)
-        if m and current_trail is not None and current_iter:
-            current_iter.trails.append(current_trail)
-            current_trail = None # Reset
+        # [anchor] types=VRP: [...] / SLIDING: [...] / TWO_OPT: [...]
+        m = re.match(r'\[anchor\]\s*types=\w+:\s*\[([^\]]*)\]', line)
+        if m and current_iter:
+            if m.group(1).strip():
+                nodes = parse_int_list(m.group(1))
+                current_iter.anchor_nodes.update(nodes)
             i += 1
             continue
-        
-        # [executed] cost before: X, cost after: Y, move_found: Z
-        m = re.match(r'\[executed\]\s*cost before:\s*([\d.]+),\s*cost after:\s*([\d.]+),\s*move_found:\s*(\d+)', line)
+
+        # [trail #X] last_estimated_cost: ..., cost: ...
+        m = re.match(r'\[trail #(\d+)\]\s*last_estimated_cost:', line)
         if m and current_iter:
-            current_iter.executed = {
-                'cost_before': float(m.group(1)),
-                'cost_after': float(m.group(2)),
-                'move_found': int(m.group(3)) == 1
+            current_trail = {
+                'trail_id': int(m.group(1)),
+                'executed_anchors_all': [],
+                'previous_cost': [],
+                'number_of_anchors': 0
             }
             i += 1
             continue
-        
+
+        # executed_anchors (all): [...]
+        m = re.match(r'executed_anchors \(all\):\s*\[([^\]]*)\]', line)
+        if m and current_trail is not None:
+            if m.group(1).strip():
+                current_trail['executed_anchors_all'] = parse_int_list(m.group(1))
+            i += 1
+            continue
+
+        # executed_anchors (sliding/vrp/recycle_vrp/two_opt): [...] — skip
+        if line.startswith('executed_anchors ('):
+            i += 1
+            continue
+
+        # previous_cost: [v1,v2,v3,v4]
+        m = re.match(r'previous_cost:\s*\[([^\]]+)\]', line)
+        if m and current_trail is not None:
+            current_trail['previous_cost'] = [float(x.strip()) for x in m.group(1).split(',') if x.strip()]
+            i += 1
+            continue
+
+        # [trail #X] full size: ..., number_of_anchors: Y, ... — trail end marker
+        m = re.match(r'\[trail #(\d+)\]\s*full size:.*number_of_anchors:\s*(\d+)', line)
+        if m and current_trail is not None and current_iter:
+            current_trail['number_of_anchors'] = int(m.group(2))
+            current_iter.trails.append(current_trail)
+            current_trail = None
+            i += 1
+            continue
+
         i += 1
-    
+
     if current_iter and current_search:
         current_search.iterations.append(current_iter)
     if current_search:
         results.append(current_search)
-    
+
     return results
 
 
 if __name__ == '__main__':
     dir_path = sys.argv[1]
     instance_file = sys.argv[2]
-    
+
     all_results = []
     pattern = os.path.join(dir_path, 'instance_*.txt')
     files = sorted(glob.glob(pattern), key=lambda x: int(re.search(r'instance_(\d+)\.txt', x).group(1)))
-    
-    # 解析文件
+
     for file_path in tqdm(files, desc="Parsing files"):
         match = re.search(r'instance_(\d+)\.txt', file_path)
         index = int(match.group(1))
@@ -172,74 +184,71 @@ if __name__ == '__main__':
             search.instance_index = index
             search.instance_data = instance_data
         all_results.extend(results)
-    
+
     results = all_results
-    total = sum(len(r.iterations) for r in results)
+    total_iters = sum(len(r.iterations) for r in results)
+    total_trails = sum(len(it.trails) for r in results for it in r.iterations)
     print(f"Total searches loaded: {len(results)}")
-    print(f"Total data point loaded: {total}")
+    print(f"Total iterations loaded: {total_iters}")
+    print(f"Total trails loaded: {total_trails}")
 
     if len(results) == 0:
         print("No data parsed. Exiting.")
         sys.exit(0)
 
-    max_candidates_length = max([r.n_nodes_w_dummy for r in results])
+    max_candidates_length = max(r.n_nodes_w_dummy for r in results)
     dummy_depot_start = 1001
-    
+
     batch_nodes = []
     batch_demands = []
     batch_current_sol = []
-    batch_candidates = []
+    batch_anchor = []
     batch_selected = []
-    
-    # 新增的 Batch 容器
-    batch_cost_before = []
-    batch_cost_after = []
-    batch_agg_size = []
-    
-    batch_size = 2000 
+    batch_previous_cost = []
+    batch_num_anchors = []
+    batch_state_id = []
 
-    # 自动检测 trail 数量
-    num_trails_per_iter = 1 
-    for r in results:
-        found = False
-        for it in r.iterations:
-            if it.trails:
-                num_trails_per_iter = len(it.trails)
-                found = True
-                break
-        if found: break
-    print(f"Detected trails per iteration: {num_trails_per_iter}")
+    batch_size = 2000
+    state_counter = 0
+    max_trails_per_state = 12
+    skipped_no_anchor = 0
+    skipped_empty_selected = 0
+    skipped_no_improvement = 0
+    skipped_low_std = 0
+    skipped_few_trails = 0
+    kept = 0
 
-    import gc
-    pbar = tqdm(total=len(results), desc="Processing batches (Vectorized)")
-    
+    pbar = tqdm(total=len(results), desc="Processing batches")
+
     while len(results) > 0:
         current_batch_size = min(batch_size, len(results))
         batch_results = results[:current_batch_size]
         del results[:current_batch_size]
-        
+
         ml_data = {
             'nodes_tensor': [],
             'demands_tensor': [],
             'current_sol': [],
-            'candidates': [],
+            'anchor': [],
             'selected': [],
-            'cost_before': [],
-            'cost_after': [],
-            'agg_intersection_size': []
+            'previous_cost': [],
+            'number_of_anchors': [],
+            'state_id': []
         }
-        
+
         for search in batch_results:
             nodes_t, capacities_t, demands_t, costs_t, node_flags_t = search.instance_data
             nodes = nodes_t[0]
             demands = demands_t[0] / capacities_t[0]
-            
+
             for iter_info in search.iterations:
-                # 基础数据完整性检查：只要有 solution 和 trails 即可
                 if not iter_info.current_solution or not iter_info.trails:
                     continue
-                
-                # Solution 构建
+
+                if not iter_info.anchor_nodes:
+                    skipped_no_anchor += len(iter_info.trails)
+                    continue
+
                 current_sol_routes = iter_info.current_solution.get('routes', [])
                 flat_sol = []
                 for route_idx, route in enumerate(current_sol_routes):
@@ -252,51 +261,88 @@ if __name__ == '__main__':
                     flat_sol.extend(route[1:])
                 if len(flat_sol) < max_candidates_length:
                     flat_sol.extend([-1] * (max_candidates_length - len(flat_sol)))
-                
-                ml_data['nodes_tensor'].append(nodes)
-                ml_data['demands_tensor'].append(demands)
-                ml_data['current_sol'].append(flat_sol)
-                
-                # 读取 Cost 和 Agg Size
-                c_before = iter_info.executed.get('cost_before', 0.0)
-                c_after = iter_info.executed.get('cost_after', 0.0)
-                agg_size = iter_info.agg_intersection_size
-                
-                ml_data['cost_before'].append(c_before)
-                ml_data['cost_after'].append(c_after)
-                ml_data['agg_intersection_size'].append(agg_size)
 
+                anchor_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
+                for idx in iter_info.anchor_nodes:
+                    if idx < max_candidates_length:
+                        anchor_tensor[idx] = True
+
+                valid_trails = []
                 for trail in iter_info.trails:
-                    candidates = trail['candidates']
-                    selected = trail['selected']
-                    
-                    c_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
-                    if candidates:
-                        c_tensor[candidates] = True
-                    
+                    anchors_all = trail['executed_anchors_all']
+                    prev_cost = trail['previous_cost']
+                    n_anchors = trail['number_of_anchors']
+
+                    if not anchors_all:
+                        skipped_empty_selected += 1
+                        continue
+
+                    if len(prev_cost) < 2 or prev_cost[0] - prev_cost[-1] <= 0:
+                        skipped_no_improvement += 1
+                        continue
+
+                    cost_tensor = torch.zeros(4, dtype=torch.float32)
+                    for ci, cv in enumerate(prev_cost[:4]):
+                        cost_tensor[ci] = cv
+
+                    if cost_tensor.std(-1).item() <= 1.0:
+                        skipped_low_std += 1
+                        continue
+
                     s_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
-                    if selected:
-                        s_tensor[selected] = True
-                    
-                    ml_data['candidates'].append(c_tensor)
-                    ml_data['selected'].append(s_tensor)
-        
+                    for idx in anchors_all:
+                        if idx < max_candidates_length:
+                            s_tensor[idx] = True
+
+                    ratio = prev_cost[-1] / prev_cost[0]
+                    valid_trails.append({
+                        's_tensor': s_tensor,
+                        'cost_tensor': cost_tensor,
+                        'n_anchors': n_anchors,
+                        'ratio': ratio,
+                    })
+
+                if len(valid_trails) < 2:
+                    skipped_few_trails += len(valid_trails)
+                    continue
+
+                valid_trails.sort(key=lambda x: x['ratio'])
+
+                if len(valid_trails) <= max_trails_per_state:
+                    selected_trails = valid_trails
+                else:
+                    best = valid_trails[0]
+                    worst = valid_trails[-1]
+                    middle = valid_trails[1:-1]
+                    n_mid = max_trails_per_state - 2
+                    indices = [int(i * (len(middle) - 1) / (n_mid - 1)) for i in range(n_mid)]
+                    selected_trails = [best] + [middle[i] for i in indices] + [worst]
+
+                for t in selected_trails:
+                    ml_data['nodes_tensor'].append(nodes)
+                    ml_data['demands_tensor'].append(demands)
+                    ml_data['current_sol'].append(flat_sol)
+                    ml_data['anchor'].append(anchor_tensor)
+                    ml_data['selected'].append(t['s_tensor'])
+                    ml_data['previous_cost'].append(t['cost_tensor'])
+                    ml_data['number_of_anchors'].append(t['n_anchors'])
+                    ml_data['state_id'].append(state_counter)
+                    kept += 1
+
+                state_counter += 1
+
         del batch_results
-        
+
         if len(ml_data['nodes_tensor']) > 0:
-            batch_nodes.append(torch.stack(ml_data['nodes_tensor']).view(-1, 1001, 2))
-            batch_demands.append(torch.stack(ml_data['demands_tensor']).view(-1, 1001, 1))
-            batch_current_sol.append(torch.tensor(ml_data['current_sol']).view(-1, max_candidates_length))
-            
-            # Trails 
-            batch_candidates.append(torch.stack(ml_data['candidates']).view(-1, num_trails_per_iter, max_candidates_length))
-            batch_selected.append(torch.stack(ml_data['selected']).view(-1, num_trails_per_iter, max_candidates_length))
-            
-            # Costs & Agg Size (Shape: [Batch, 1])
-            batch_cost_before.append(torch.tensor(ml_data['cost_before']).view(-1, 1))
-            batch_cost_after.append(torch.tensor(ml_data['cost_after']).view(-1, 1))
-            batch_agg_size.append(torch.tensor(ml_data['agg_intersection_size']).view(-1, 1))
-            
+            batch_nodes.append(torch.stack(ml_data['nodes_tensor']))
+            batch_demands.append(torch.stack(ml_data['demands_tensor']))
+            batch_current_sol.append(torch.tensor(ml_data['current_sol']))
+            batch_anchor.append(torch.stack(ml_data['anchor']))
+            batch_selected.append(torch.stack(ml_data['selected']))
+            batch_previous_cost.append(torch.stack(ml_data['previous_cost']))
+            batch_num_anchors.append(torch.tensor(ml_data['number_of_anchors']))
+            batch_state_id.append(torch.tensor(ml_data['state_id'], dtype=torch.int64))
+
         pbar.update(current_batch_size)
         gc.collect()
 
@@ -304,89 +350,79 @@ if __name__ == '__main__':
     del results
     gc.collect()
 
+    print(f"\nFiltering summary:")
+    print(f"  Kept: {kept}")
+    print(f"  Total states: {state_counter}")
+    print(f"  Avg trails per state: {kept / max(state_counter, 1):.1f}")
+    print(f"  Skipped (anchor union empty): {skipped_no_anchor}")
+    print(f"  Skipped (executed_anchors_all empty): {skipped_empty_selected}")
+    print(f"  Skipped (no improvement): {skipped_no_improvement}")
+    print(f"  Skipped (cost std <= 1): {skipped_low_std}")
+    print(f"  Skipped (fewer than 2 trails per state): {skipped_few_trails}")
+
     def smart_cat(tensor_list, dtype=None):
-        if not tensor_list: return torch.empty(0)
+        if not tensor_list:
+            return torch.empty(0)
         total_rows = sum(t.shape[0] for t in tensor_list)
         shape = (total_rows,) + tensor_list[0].shape[1:]
-        if dtype is None: dtype = tensor_list[0].dtype
+        if dtype is None:
+            dtype = tensor_list[0].dtype
         final_tensor = torch.empty(shape, dtype=dtype)
         start = 0
-        for i in range(len(tensor_list)):
-            t = tensor_list[i]
+        for j in range(len(tensor_list)):
+            t = tensor_list[j]
             end = start + t.shape[0]
             final_tensor[start:end] = t
             start = end
-            tensor_list[i] = None 
+            tensor_list[j] = None
         return final_tensor
 
-    print("Concatenating tensors safely...")
+    print("Concatenating tensors...")
     nodes_tensor = smart_cat(batch_nodes)
     del batch_nodes; gc.collect()
-    
+
     demands_tensor = smart_cat(batch_demands)
     del batch_demands; gc.collect()
-    
+
     current_sol_tensor = smart_cat(batch_current_sol, dtype=torch.int16)
     del batch_current_sol; gc.collect()
-    
-    candidates_tensor = smart_cat(batch_candidates)
-    del batch_candidates; gc.collect()
-    
+
+    anchor_tensor = smart_cat(batch_anchor)
+    del batch_anchor; gc.collect()
+
     selected_tensor = smart_cat(batch_selected)
     del batch_selected; gc.collect()
-    
-    cost_before_tensor = smart_cat(batch_cost_before)
-    del batch_cost_before; gc.collect()
 
-    cost_after_tensor = smart_cat(batch_cost_after)
-    del batch_cost_after; gc.collect()
+    cost_tensor = smart_cat(batch_previous_cost)
+    del batch_previous_cost; gc.collect()
 
-    agg_intersection_size_tensor = smart_cat(batch_agg_size)
-    del batch_agg_size; gc.collect()
+    number_of_anchors_tensor = smart_cat(batch_num_anchors)
+    del batch_num_anchors; gc.collect()
 
-    # 过滤逻辑：
-    candidates_tensor = candidates_tensor[:, :1, :]
+    state_id_tensor = smart_cat(batch_state_id, dtype=torch.int64)
+    del batch_state_id; gc.collect()
 
-    # 2. 定义过滤条件
-    # 条件 A: aggregated_intersection_nodes_size > 0
-    # 条件 B: cost_before - cost_after > 0 (有正向收益)
-    improvement = cost_before_tensor - cost_after_tensor
-    # 注意：这里用 view(-1) 确保变成 1D 的 boolean 数组，方便索引
-    mask = (agg_intersection_size_tensor.view(-1) > 0) & (improvement.view(-1) > 0)
-
-    print(f"Filtering applied: Keeping {mask.sum()} / {len(mask)} samples where (AggSize > 0) & (Improvement > 0)")
-
-    # 3. 应用过滤到所有 Tensor
-    nodes_tensor = nodes_tensor[mask]
-    demands_tensor = demands_tensor[mask]
-    current_sol_tensor = current_sol_tensor[mask]
-    candidates_tensor = candidates_tensor[mask]
-    selected_tensor = selected_tensor[mask]
-    cost_before_tensor = cost_before_tensor[mask]
-    cost_after_tensor = cost_after_tensor[mask]
-    agg_intersection_size_tensor = agg_intersection_size_tensor[mask]
-    
-    print(f"ML Data shapes:")
-    print(f"  nodes_tensor: {nodes_tensor.shape}")
-    print(f"  demands_tensor: {demands_tensor.shape}")
-    print(f"  current_sol_tensor: {current_sol_tensor.shape}")
-    print(f"  candidates_tensor: {candidates_tensor.shape}")
-    print(f"  selected_tensor: {selected_tensor.shape}")
-    print(f"  cost_before_tensor: {cost_before_tensor.shape}")
-    print(f"  cost_after_tensor: {cost_after_tensor.shape}")
-    print(f"  agg_intersection_size_tensor: {agg_intersection_size_tensor.shape}")
-    print(f"  max_candidates_length: {max_candidates_length}")
+    print(f"\nML Data shapes:")
+    print(f"  nodes_tensor:              {nodes_tensor.shape}")
+    print(f"  demands_tensor:            {demands_tensor.shape}")
+    print(f"  current_sol_tensor:        {current_sol_tensor.shape}")
+    print(f"  anchor_tensor:             {anchor_tensor.shape}")
+    print(f"  selected_tensor:           {selected_tensor.shape}")
+    print(f"  cost_tensor:               {cost_tensor.shape}")
+    print(f"  number_of_anchors_tensor:  {number_of_anchors_tensor.shape}")
+    print(f"  state_id_tensor:           {state_id_tensor.shape}")
+    print(f"  max_candidates_length:     {max_candidates_length}")
 
     output_file = sys.argv[3] if len(sys.argv) > 3 else 'ml_data.pt'
     ml_data_dict = {
         'nodes_tensor': nodes_tensor,
         'demands_tensor': demands_tensor,
         'current_sol_tensor': current_sol_tensor,
-        'candidates_tensor': candidates_tensor,
+        'anchor_tensor': anchor_tensor,
         'selected_tensor': selected_tensor,
-        'cost_before_tensor': cost_before_tensor,
-        'cost_after_tensor': cost_after_tensor,
-        'agg_intersection_size_tensor': agg_intersection_size_tensor,
+        'cost_tensor': cost_tensor,
+        'number_of_anchors_tensor': number_of_anchors_tensor,
+        'state_id_tensor': state_id_tensor,
         'max_candidates_length': max_candidates_length
     }
     torch.save(ml_data_dict, output_file)

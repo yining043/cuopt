@@ -8,7 +8,7 @@ gpus=(0 1 2 3)
 total_tasks=16
 
 # 3. 自定义输出文件的前缀名 (例如设置为 "exp_cuopt"，输出就会变成 exp_cuopt_1.txt, exp_cuopt_2.txt...)
-output_prefix="only_onestep"
+output_prefix="final_old_model"
 # =========================================
 
 num_gpus=${#gpus[@]}
@@ -28,7 +28,9 @@ for ((i=1; i<=total_tasks; i++)); do
     CUDA_VISIBLE_DEVICES=$gpu_id python run_cuopt.py \
         --index 1 \
         --time 150 \
-        --policy outputs/node_prediction_largerdata_20260211_004810/checkpoint_epoch_365.pt \
+	--use \
+	--v old \
+        --policy outputs/regression_20260311_204007/checkpoint_epoch_290.pt \
         > ../cuopt-examples/code/${output_prefix}_${i}.txt &
 
     # 分批等待逻辑

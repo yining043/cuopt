@@ -295,7 +295,6 @@ local_search_t<i_t, f_t, REQUEST>::build_solution_flat(solution_t<i_t, f_t, r_t>
 {
   size_t n_nodes = sol.get_num_orders();
   i_t total_nodes = n_nodes + sol.n_routes * 4;
-  
   // Copy data from GPU to CPU
   std::vector<i_t> h_route_ids(n_nodes);
   std::vector<i_t> h_intra_idx(n_nodes);
@@ -751,14 +750,14 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
               int op = (k < ops_new.size()) ? ops_new[k] : 0;
               if (op >= 0 && op <= 3) by_op[op].insert(anchors_new[k]);
             }
-            print_collection("executed_anchors (sliding): ",
-                            by_op[0], by_op[0].size(), [](i_t x) { return x; });
-            print_collection("executed_anchors (vrp): ",
-                            by_op[1], by_op[1].size(), [](i_t x) { return x; });
-            print_collection("executed_anchors (recycle_vrp): ",
-                            by_op[2], by_op[2].size(), [](i_t x) { return x; });
-            print_collection("executed_anchors (two_opt): ",
-                            by_op[3], by_op[3].size(), [](i_t x) { return x; });
+            // print_collection("executed_anchors (sliding): ",
+            //                 by_op[0], by_op[0].size(), [](i_t x) { return x; });
+            // print_collection("executed_anchors (vrp): ",
+            //                 by_op[1], by_op[1].size(), [](i_t x) { return x; });
+            // print_collection("executed_anchors (recycle_vrp): ",
+            //                 by_op[2], by_op[2].size(), [](i_t x) { return x; });
+            // print_collection("executed_anchors (two_opt): ",
+            //                 by_op[3], by_op[3].size(), [](i_t x) { return x; });
             excuted_anchor = std::set<i_t>(anchors_new.begin(), anchors_new.end());
             print_collection("executed_anchors (all): ",
               excuted_anchor, excuted_anchor.size(), [](i_t x) { return x; });
@@ -800,55 +799,98 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (pred_with_NN == true) {
         
         if (obs_callback) {
-          // Sync stream before building solution_flat
-          sol.sol_handle->sync_stream();
-          
-          // Build solution_flat
-          std::vector<i_t> solution_flat = this->build_solution_flat(sol);
-          f_t objective = sol.get_cost(true, move_candidates.weights);
-          
-          // Build candidate_mask from base_node_to_search
-          std::vector<i_t> candidate_mask(N_nodes_w_dummy, 0);
+          // Step 1: Oracle search to discover anchors
+          Sol temp_oracle(sol);
+          work_node_to_search = full_node_to_search;
+          std::shuffle(work_node_to_search.begin(), work_node_to_search.end(), rng);
+          load_to_device_both(work_node_to_search);
+          run_fast_search(temp_oracle, true, 96, false, false);
+
+          auto& nt = move_candidates.nodes_to_search;
+          nt.h_anchor_type_flags.resize(temp_oracle.get_num_orders() + temp_oracle.n_routes);
+          raft::copy(nt.h_anchor_type_flags.data(), nt.anchor_type_flags.data(),
+                    nt.h_anchor_type_flags.size(), temp_oracle.sol_handle->get_stream());
+          temp_oracle.sol_handle->sync_stream();
+
+          std::set<i_t> all_anchor_nn;
+          for (i_t i = 0; i < (i_t)nt.h_anchor_type_flags.size(); ++i) {
+            auto f = nt.h_anchor_type_flags[i];
+            if (f == 0) continue;
+            if (i < temp_oracle.get_num_orders()) {
+              all_anchor_nn.insert(i);
+            } else {
+              i_t route_id = i - temp_oracle.get_num_orders();
+              i_t base = temp_oracle.get_num_orders() + route_id * 4;
+              all_anchor_nn.insert(base + 0);
+              all_anchor_nn.insert(base + 1);
+              all_anchor_nn.insert(base + 2);
+              all_anchor_nn.insert(base + 3);
+            }
+          }
+
+          // Step 2: Run K trails (1 search each, no look-ahead)
+          const int K = 100;
+          std::vector<i_t> anchor_vec_nn(all_anchor_nn.begin(), all_anchor_nn.end());
+          std::vector<i_t> trail_masks_flat(K * N_nodes_w_dummy, 0);
+
           std::unordered_map<i_t, size_t> node_id_to_h_idx;
           node_id_to_h_idx.reserve(full_node_to_search.size());
           for (size_t i = 0; i < full_node_to_search.size(); ++i) {
-            i_t node_id = full_node_to_search[i].node();
-            candidate_mask[node_id] = 1;
-            node_id_to_h_idx[node_id] = i;  // Store index in base_node_to_search
+            node_id_to_h_idx[full_node_to_search[i].node()] = i;
           }
 
-          std::vector<i_t> selection_mask;
-          obs_callback->customize_nodes_to_search(
-              &solution_flat,
-              sol.n_routes,
-              objective,
-              &candidate_mask,
-              &selection_mask,
-              iter
-          );
+          for (int t = 0; t < K; ++t) {
+            std::shuffle(anchor_vec_nn.begin(), anchor_vec_nn.end(), rng);
+            size_t subset_size = std::min(20, (int)anchor_vec_nn.size());
+            std::set<i_t> work_subset(anchor_vec_nn.begin(), anchor_vec_nn.begin() + subset_size);
 
-          if (selection_mask.size() != (size_t)N_nodes_w_dummy) { 
-            printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)N_nodes_w_dummy);
-            exit(1); 
-          }
+            std::vector<NodeInfo<int>> work_node_list;
+            work_node_list.reserve(work_subset.size());
+            for (const auto& node_info : full_node_to_search) {
+              if (work_subset.count(node_info.node())) work_node_list.push_back(node_info);
+            }
+            std::shuffle(work_node_list.begin(), work_node_list.end(), rng);
 
-          // Extract selected nodes from mask and build sampled lists (single pass)
-          best_node_to_search.clear();
-          for (i_t node_id = 0; node_id < N_nodes_w_dummy; ++node_id) {
-            auto it = node_id_to_h_idx.find(node_id);
-            if (it != node_id_to_h_idx.end()) {
-              size_t h_idx = it->second;
-              if (selection_mask[node_id] == 1) {
-                best_node_to_search.insert(best_node_to_search.begin(), full_node_to_search[h_idx]);
+            Sol temp_trail(sol);
+            load_to_device_both(work_node_list);
+            run_fast_search(temp_trail, true, 96, false, false);
+
+            auto anchors_exec = get_last_executed_anchors();
+            for (i_t a : anchors_exec) {
+              if (a < N_nodes_w_dummy) {
+                trail_masks_flat[t * N_nodes_w_dummy + a] = 1;
               }
-              // else {
-              //   best_node_to_search.push_back(base_node_to_search[h_idx]);
-              // }
             }
           }
-        
+
+          // Step 3: Call callback with K trail masks
+          sol.sol_handle->sync_stream();
+          std::vector<i_t> solution_flat = this->build_solution_flat(sol);
+          f_t objective = sol.get_cost(true, move_candidates.weights);
+          std::vector<i_t> selection_mask;
+
+          obs_callback->customize_nodes_to_search(
+              &solution_flat, sol.n_routes, objective,
+              &trail_masks_flat, K, &selection_mask, iter);
+
+          if (selection_mask.size() != (size_t)N_nodes_w_dummy) {
+            printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)N_nodes_w_dummy);
+            exit(1);
+          }
+
+          // Step 4: Build best_node_to_search from selection_mask
+          best_node_to_search.clear();
+          for (i_t node_id = 0; node_id < N_nodes_w_dummy; ++node_id) {
+            if (selection_mask[node_id] == 1) {
+              auto it = node_id_to_h_idx.find(node_id);
+              if (it != node_id_to_h_idx.end()) {
+                best_node_to_search.push_back(full_node_to_search[it->second]);
+              }
+            }
+          }
+          std::shuffle(best_node_to_search.begin(), best_node_to_search.end(), rng);
+
         } else {
-          // No callback available, fall back to base_node_to_search
           best_node_to_search = full_node_to_search;
           printf("No callback available, fall back to full_node_to_search\n");
           exit(1);

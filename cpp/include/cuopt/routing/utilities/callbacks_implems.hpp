@@ -32,47 +32,44 @@ public:
     const std::vector<i_t>* solution_flat,
     i_t num_routes,
     f_t solution_cost,
-    const std::vector<i_t>* candidate_mask,
+    const std::vector<i_t>* trail_masks_flat,
+    i_t num_trails,
     std::vector<i_t>* selection_mask_out,
     i_t iteration
   ) override
   {
     PyObject* pycl = (PyObject*)this->pyCallbackClass;
     
-    // Convert solution_flat to Python list
     PyObject* py_solution_flat = PyList_New(solution_flat->size());
     for (size_t i = 0; i < solution_flat->size(); ++i) {
       PyList_SetItem(py_solution_flat, i, PyLong_FromLong((*solution_flat)[i]));
     }
     
-    // Convert candidate_mask to Python list
-    PyObject* py_candidate_mask = PyList_New(candidate_mask->size());
-    for (size_t i = 0; i < candidate_mask->size(); ++i) {
-      PyList_SetItem(py_candidate_mask, i, PyLong_FromLong((*candidate_mask)[i]));
+    PyObject* py_trail_masks = PyList_New(trail_masks_flat->size());
+    for (size_t i = 0; i < trail_masks_flat->size(); ++i) {
+      PyList_SetItem(py_trail_masks, i, PyLong_FromLong((*trail_masks_flat)[i]));
     }
     
-    // Call Python method
     PyObject* result = PyObject_CallMethod(
       pycl, 
       "customize_nodes_to_search", 
-      "OifOi",
+      "OifOii",
       py_solution_flat,
       (int)num_routes,
       (double)solution_cost,
-      py_candidate_mask,
+      py_trail_masks,
+      (int)num_trails,
       (int)iteration
     );
     
-    // Clean up input arguments
     Py_DECREF(py_solution_flat);
-    Py_DECREF(py_candidate_mask);
+    Py_DECREF(py_trail_masks);
     
     if (result == nullptr) {
       PyErr_Print();
       return;
     }
     
-    // Extract selection_mask from result (should be a list)
     if (PyList_Check(result)) {
       Py_ssize_t size = PyList_Size(result);
       selection_mask_out->resize(size);

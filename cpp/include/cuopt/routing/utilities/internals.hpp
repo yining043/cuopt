@@ -43,17 +43,19 @@ public:
   
   // Customize which nodes to sample based on current search state
   // 
-  // @param solution_flat          Current solution (flat array by route: [route0_dummies, route0_nodes, route1_dummies, ...])
+  // @param solution_flat          Current solution (flat array by route)
   // @param num_routes             Number of routes in current solution
   // @param solution_cost          Current objective cost value
-  // @param candidate_mask          Mask indexed by node_id (candidate_mask[node_id]=1 means node_id is candidate)
-  // @param selection_mask_out     OUTPUT - Selection mask indexed by node_id (selection_mask_out[node_id]=1 means select)
+  // @param trail_masks_flat       K executed_anchor masks flattened: [K * N_nodes_w_dummy]
+  // @param num_trails             Number of trails K
+  // @param selection_mask_out     OUTPUT - Selection mask indexed by node_id
   // @param iteration              Current iteration number
   virtual void customize_nodes_to_search(
     const std::vector<i_t>* solution_flat,
     i_t num_routes,
     f_t solution_cost,
-    const std::vector<i_t>* candidate_mask,
+    const std::vector<i_t>* trail_masks_flat,
+    i_t num_trails,
     std::vector<i_t>* selection_mask_out,
     i_t iteration
   ) = 0;

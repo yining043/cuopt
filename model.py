@@ -1,4 +1,3 @@
-from json import encoder
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,7 +19,7 @@ class NodeFeatureEmbedding(nn.Module):
         return self.embed(x)
 
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, d_model, num_heads, use_sel=False):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -31,6 +30,8 @@ class TransformerLayer(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         self.pos_bias_weight = nn.Parameter(torch.ones(1,4,1,1))
+        if use_sel:
+            self.sel_bias_weight = nn.Parameter(torch.zeros(1,num_heads,1,1))
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_model, bias=False),
             nn.ReLU(inplace=True),
@@ -39,7 +40,7 @@ class TransformerLayer(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
     
-    def forward(self, x, key_padding_mask, pos_scores):
+    def forward(self, x, key_padding_mask, pos_scores, sel_scores=None):
         batch_size, seq_len, _ = x.shape
         
         q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -54,6 +55,8 @@ class TransformerLayer(nn.Module):
             )
 
         total_attn_mask = self.pos_bias_weight * pos_scores + padding_mask_expanded
+        if sel_scores is not None and hasattr(self, 'sel_bias_weight'):
+            total_attn_mask = total_attn_mask + self.sel_bias_weight * sel_scores
 
         attn_out = F.scaled_dot_product_attention(
             query=q,
@@ -73,67 +76,152 @@ class TransformerLayer(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, d_model, num_heads, num_layers):
+    def __init__(self, d_model, num_heads, num_layers, use_sel=False):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // self.num_heads
+        self.use_sel = use_sel
         
         self.layers = nn.ModuleList([
-            TransformerLayer(d_model, num_heads) 
+            TransformerLayer(d_model, num_heads, use_sel=use_sel) 
             for _ in range(num_layers)
         ])
         
         self.pos_q_proj = nn.Linear(d_model, d_model, bias=False)
         self.pos_k_proj = nn.Linear(d_model, d_model, bias=False)
+
+        if use_sel:
+            self.sel_embedding = nn.Parameter(torch.zeros(2, d_model))
+            self.sel_q_proj = nn.Linear(d_model, d_model, bias=False)
+            self.sel_k_proj = nn.Linear(d_model, d_model, bias=False)
     
-    def forward(self, x, key_padding_mask, pos_embedding):
+    def forward(self, x, key_padding_mask, pos_embedding, selected_mask=None):
         batch_size, seq_len, _ = pos_embedding.shape
         q_pos = self.pos_q_proj(pos_embedding).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         k_pos = self.pos_k_proj(pos_embedding).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
         scores_pos = torch.matmul(q_pos, k_pos.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        scores_sel = None
+        if selected_mask is not None and self.use_sel:
+            sel_embed = self.sel_embedding[selected_mask.long()]
+            q_sel = self.sel_q_proj(sel_embed).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            k_sel = self.sel_k_proj(sel_embed).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+            scores_sel = torch.matmul(q_sel, k_sel.transpose(-2, -1)) / math.sqrt(self.head_dim)
         
         for layer in self.layers:
-            x = layer(x, key_padding_mask, scores_pos)
+            x = layer(x, key_padding_mask, scores_pos, scores_sel)
         return x
 
 
 # ============================================================================
-# Decoder
+# Regression Head
 # ============================================================================
 
-class Decoder(nn.Module):
+class RegressionHead(nn.Module):
+    def __init__(self, d_model, use_selected_pool=False):
+        super().__init__()
+        self.use_selected_pool = use_selected_pool
+        self.attn_pool = nn.Linear(d_model, 1)
+        self.cost_embed = nn.Linear(1, d_model)
+        mlp_in = d_model * 3 if use_selected_pool else d_model * 2
+        self.mlp = nn.Sequential(
+            nn.Linear(mlp_in, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Linear(d_model // 2, 1)
+        )
+
+    def forward(self, node_embed, padding_mask, log_cost_0, selected_mask=None):
+        attn_scores = self.attn_pool(node_embed).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        pooled = (attn_weights.unsqueeze(-1) * node_embed).sum(dim=1)
+
+        cost_feat = self.cost_embed(log_cost_0.unsqueeze(-1))
+        if self.use_selected_pool and selected_mask is not None:
+            sel = selected_mask.unsqueeze(-1).float()
+            selected_pool = (node_embed * sel).sum(1) / sel.sum(1).clamp(min=1)
+            combined = torch.cat([pooled, selected_pool, cost_feat], dim=-1)
+        else:
+            combined = torch.cat([pooled, cost_feat], dim=-1)
+        return self.mlp(combined).squeeze(-1)
+
+
+class RegressionHeadV2(nn.Module):
+    """Enhanced regression head with attention-based selected/non-selected pooling,
+    contrastive pooling (sel - nonsel), and selection ratio feature."""
+
     def __init__(self, d_model):
         super().__init__()
         self.d_model = d_model
-        # 将每个节点的embedding映射到选择概率
+        self.attn_pool = nn.Linear(d_model, 1)
+        self.sel_attn_pool = nn.Linear(d_model, 1)
+        self.nonsel_attn_pool = nn.Linear(d_model, 1)
+        self.cost_embed = nn.Linear(1, d_model)
+        self.ratio_embed = nn.Linear(1, d_model // 4)
+
+        mlp_in = d_model * 4 + d_model // 4
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model*2, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model*2, d_model, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(d_model, 1)  # 输出每个节点的选择logit
+            nn.Linear(mlp_in, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
         )
 
-    def forward(self, node_embed):
-        # node_embed: [B, max_length, d_model]
-        # 输出: [B, max_length] - logits（未经过sigmoid）
-        logits = self.mlp(node_embed).squeeze(-1)
-        return logits
+    def forward(self, node_embed, padding_mask, log_cost_0, selected_mask=None):
+        # Global attention pool
+        attn_scores = self.attn_pool(node_embed).squeeze(-1)
+        attn_scores = attn_scores.masked_fill(padding_mask, float('-inf'))
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        pooled = (attn_weights.unsqueeze(-1) * node_embed).sum(dim=1)
+
+        cost_feat = self.cost_embed(log_cost_0.unsqueeze(-1))
+
+        sel = selected_mask.bool()
+        valid = ~padding_mask
+
+        # Learned attention pool over SELECTED nodes only
+        sel_scores = self.sel_attn_pool(node_embed).squeeze(-1)
+        sel_scores = sel_scores.masked_fill(~sel | padding_mask, float('-inf'))
+        sel_weights = F.softmax(sel_scores, dim=-1)
+        sel_pool = (sel_weights.unsqueeze(-1) * node_embed).sum(dim=1)
+
+        # Learned attention pool over NON-SELECTED valid nodes
+        nonsel_mask = valid & ~sel
+        nonsel_scores = self.nonsel_attn_pool(node_embed).squeeze(-1)
+        nonsel_scores = nonsel_scores.masked_fill(~nonsel_mask, float('-inf'))
+        nonsel_weights = F.softmax(nonsel_scores, dim=-1)
+        nonsel_pool = (nonsel_weights.unsqueeze(-1) * node_embed).sum(dim=1)
+
+        # Contrastive: what makes selected region different from the rest
+        contrast = sel_pool - nonsel_pool
+
+        # Selection ratio as explicit feature
+        n_sel = sel.float().sum(dim=1, keepdim=True)
+        n_valid = valid.float().sum(dim=1, keepdim=True).clamp(min=1)
+        ratio_feat = self.ratio_embed(n_sel / n_valid)
+
+        combined = torch.cat([pooled, sel_pool, contrast, cost_feat, ratio_feat], dim=-1)
+        return self.mlp(combined).squeeze(-1)
+
 
 # ============================================================================
 # Complete Policy Network
 # ============================================================================
 
-class Policy(nn.Module):
+class CostPredictor(nn.Module):
     def __init__(self, 
                  d_model=128,
                  num_heads=4,
                  num_encoder_layers=3,
                  max_vehicles=21,
                  N=1001,
-                 device='cpu'):
+                 device='cpu',
+                 mode='v2'):
         super().__init__()
         
         self.d_model = d_model
@@ -141,21 +229,46 @@ class Policy(nn.Module):
         self.max_vehicles = max_vehicles
         self.max_length = N + max_vehicles * 4
         self.device = torch.device(device)
+        self.mode = mode
         
         self.feature_embed = NodeFeatureEmbedding(d_model)
         self.positional_encoding = self._create_positional_encoding(self.max_length, d_model).to(self.device)
 
-        self.encoder = Encoder(d_model, num_heads, num_encoder_layers)
-        self.candidate_bias = nn.Parameter(torch.zeros(2, 1, 1, d_model))
-        self.decoder = Decoder(d_model)
+        if mode == 'v2':
+            self.sel_input_proj = nn.Linear(1, d_model)
+            self.encoder = Encoder(d_model, num_heads, num_encoder_layers, use_sel=True)
+            self.regression_head = RegressionHeadV2(d_model)
+        elif mode == 'new':
+            self.selected_bias = nn.Parameter(torch.zeros(2, 1, 1, d_model))
+            self.encoder = Encoder(d_model, num_heads, num_encoder_layers, use_sel=True)
+            self.regression_head = RegressionHead(d_model, use_selected_pool=True)
+        else:  # 'ratio'
+            self.selected_bias = nn.Parameter(torch.zeros(2, 1, 1, d_model))
+            self.encoder = Encoder(d_model, num_heads, num_encoder_layers, use_sel=False)
+            self.regression_head = RegressionHead(d_model, use_selected_pool=False)
         
         self.to(self.device)
         self.init_parameters()
         
     def init_parameters(self):
-        for param in self.parameters():
-            stdv = 1. / math.sqrt(param.size(-1))
-            param.data.uniform_(-stdv, stdv)
+        is_v2 = (self.mode == 'v2')
+        for name, param in self.named_parameters():
+            if 'ln' in name or 'LayerNorm' in name:
+                if 'weight' in name:
+                    nn.init.ones_(param)
+                elif 'bias' in name:
+                    nn.init.zeros_(param)
+            elif 'sel_input_proj.weight' in name:
+                nn.init.normal_(param, mean=0.0, std=0.3)
+            elif 'sel_input_proj.bias' in name:
+                nn.init.zeros_(param)
+            elif 'sel_embedding' in name:
+                nn.init.normal_(param, mean=0.0, std=0.2 if is_v2 else 0.02)
+            elif 'sel_bias_weight' in name:
+                nn.init.constant_(param, 1.0 if is_v2 else 0.1)
+            else:
+                stdv = 1. / math.sqrt(param.size(-1))
+                param.data.uniform_(-stdv, stdv)
     
     def _create_positional_encoding(self, max_len, d_model):
         position = torch.arange(max_len).unsqueeze(1).float()
@@ -165,16 +278,17 @@ class Policy(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe
     
-    def forward(self, nodes_tensor, demands_tensor, current_sol_tensor, candidates_tensor):
+    def forward(self, nodes_tensor, demands_tensor, current_sol_tensor, selected_tensor, cost_0):
         """
         Args:
-            nodes_tensor: [B, N, 2] - 节点坐标
-            demands_tensor: [B, N, 1] - 节点需求
-            current_sol_tensor: [B, max_length] - 当前解
-            candidates_tensor: [B, 1, max_length] - 候选节点mask
+            nodes_tensor:       [B, N, 2] - node coordinates
+            demands_tensor:     [B, N, 1] - node demands
+            current_sol_tensor: [B, max_length] - current solution
+            selected_tensor:    [B, max_length] - selected anchor nodes mask
+            cost_0:             [B] - initial cost (raw value)
         
         Returns:
-            logits: [B, max_length] - 每个位置/节点的选择logit
+            predicted: [B] - predicted log(cost[0] - cost[-1])
         """
         device = self.device
         batch_size, N, _ = nodes_tensor.shape
@@ -183,37 +297,48 @@ class Policy(nn.Module):
         nodes_tensor = nodes_tensor.to(device)
         demands_tensor = demands_tensor.to(device)
         current_sol_tensor = current_sol_tensor.to(device)
-        candidates_tensor = candidates_tensor.to(device)
+        selected_tensor = selected_tensor.to(device).bool()
+        cost_0 = cost_0.to(device)
         
-        # 特征嵌入：[B, N, d_model]
+        if demands_tensor.dim() == 2:
+            demands_tensor = demands_tensor.unsqueeze(-1)
         node_embeddings = self.feature_embed(torch.cat([nodes_tensor, demands_tensor], dim=-1))
-        # 扩展到 max_length（为 dummy depot 节点复制第一个节点的 embedding）
         node_embeddings = torch.cat([
             node_embeddings, 
             node_embeddings[:, :1, :].repeat(1, max_length - N, 1)
         ], dim=1)
         
-        # 位置编码：基于 current_sol_tensor 中的节点顺序
         pe = self.positional_encoding[:max_length].unsqueeze(0).expand(batch_size, -1, -1)
         sol_indices = current_sol_tensor.clamp(0, node_embeddings.size(1) - 1).unsqueeze(-1).expand(-1, -1, self.d_model)
         pos_embedding_gathered = torch.zeros_like(node_embeddings).to(device)
         pos_embedding_gathered.scatter_add_(1, sol_indices.long(), pe)
         
-        # 候选节点 bias：区分候选节点和非候选节点
-        candidate_bias = self.candidate_bias[0].expand_as(node_embeddings)
-        non_candidate_bias = self.candidate_bias[1].expand_as(node_embeddings)
-        candidates_mask = candidates_tensor.squeeze(1).unsqueeze(-1).expand_as(node_embeddings).float()
-        node_embeddings += candidates_mask * candidate_bias + (1 - candidates_mask) * non_candidate_bias
+        encoder_mask = current_sol_tensor < 0
+        encoder_mask[:, 0] = True
 
-        # Encoder：编码节点特征
-        encoder_mask = current_sol_tensor < 0  # padding mask
-        encoder_mask[:, 0] = True  # mask depot
-        node_embeddings = self.encoder(node_embeddings, encoder_mask, pos_embedding_gathered)
-        
-        # Decoder：对每个节点输出选择 logit
-        logits = self.decoder(node_embeddings)  # [B, max_length]
-        
-        return logits
+        if self.mode == 'v2':
+            sel_signal = self.sel_input_proj(selected_tensor.unsqueeze(-1).float())
+            node_embeddings = node_embeddings + sel_signal
+            node_embeddings = self.encoder(node_embeddings, encoder_mask, pos_embedding_gathered, selected_tensor)
+        elif self.mode == 'new':
+            sel_bias = self.selected_bias[0].expand_as(node_embeddings)
+            non_sel_bias = self.selected_bias[1].expand_as(node_embeddings)
+            sel_mask = selected_tensor.unsqueeze(-1).expand_as(node_embeddings).float()
+            node_embeddings = node_embeddings + sel_mask * sel_bias + (1 - sel_mask) * non_sel_bias
+            node_embeddings = self.encoder(node_embeddings, encoder_mask, pos_embedding_gathered, selected_tensor)
+        else:  # 'ratio'
+            sel_bias = self.selected_bias[0].expand_as(node_embeddings)
+            non_sel_bias = self.selected_bias[1].expand_as(node_embeddings)
+            sel_mask = selected_tensor.unsqueeze(-1).expand_as(node_embeddings).float()
+            node_embeddings = node_embeddings + sel_mask * sel_bias + (1 - sel_mask) * non_sel_bias
+            node_embeddings = self.encoder(node_embeddings, encoder_mask, pos_embedding_gathered)
+
+        log_cost_0 = torch.log(cost_0.float().clamp(min=1.0))
+        if self.mode in ('v2', 'new'):
+            predicted = self.regression_head(node_embeddings, encoder_mask, log_cost_0, selected_tensor)
+        else:
+            predicted = self.regression_head(node_embeddings, encoder_mask, log_cost_0)
+        return predicted
 
 
 
@@ -329,59 +454,30 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
     return checkpoint['epoch'], checkpoint.get('global_step', 0)
 
 def main():
-    model = Policy()
+    model = CostPredictor()
     if len(sys.argv) > 1:
         load_checkpoint(sys.argv[1], model)
-    data = torch.load('ml_data_full_100.pt')
-    # shuffle
+    data = torch.load('ml_data_anchor.pt')
     indices = np.random.permutation(len(data['nodes_tensor']))
-    # indices = range(len(data['nodes_tensor']))
-    nodes_tensor = data['nodes_tensor'][indices[:500]]
-    demands_tensor = data['demands_tensor'][indices[:500]]
-    current_sol_tensor = data['current_sol_tensor'][indices[:500]]
-    candidates_tensor = data['candidates_tensor'][indices[:500]]
-    selected_tensor = data['selected_tensor'][indices[:500]]
-    
-    # 计算 label 的比例
-    candidates_mask = candidates_tensor.squeeze(1).bool()  # [B, max_length]
-    selected_mask = selected_tensor.squeeze(1).bool()      # [B, max_length]
-    
-    # 统计候选节点中被选中的节点比例
-    num_candidates = candidates_mask.sum().item()
-    num_selected = (selected_mask & candidates_mask).sum().item()
-    positive_ratio = num_selected / num_candidates if num_candidates > 0 else 0
-    
-    print(f"Label Statistics:")
-    print(f"  Total candidates: {num_candidates}")
-    print(f"  Selected (positive): {num_selected}")
-    print(f"  Not selected (negative): {num_candidates - num_selected}")
-    print(f"  Positive ratio: {positive_ratio:.4f} ({positive_ratio*100:.2f}%)")
-    print(f"  Negative ratio: {1-positive_ratio:.4f} ({(1-positive_ratio)*100:.2f}%)")
-    print()
+    n = min(500, len(indices))
+    nodes_tensor = data['nodes_tensor'][indices[:n]]
+    demands_tensor = data['demands_tensor'][indices[:n]]
+    current_sol_tensor = data['current_sol_tensor'][indices[:n]]
+    selected_tensor = data['selected_tensor'][indices[:n]]
+    previous_cost = data['cost_tensor'][indices[:n]]
 
-    # 推荐的 pos_weight
-    recommended_pos_weight = (1 - positive_ratio) / positive_ratio
-    print(f"Recommended pos_weight for balanced training: {recommended_pos_weight:.2f}")
-    print(f"  Formula: neg_ratio / pos_ratio = {1-positive_ratio:.4f} / {positive_ratio:.4f}")
-    print()
-    print("Sample logits (first 10):")
-    
-    # 每个样本的统计
-    per_sample_candidates = candidates_mask.sum(dim=1).float()
-    per_sample_selected = (selected_mask & candidates_mask).sum(dim=1).float()
-    per_sample_ratio = per_sample_selected / per_sample_candidates
-    
-    print(f"Per-sample statistics:")
-    print(f"  Avg candidates per sample: {per_sample_candidates.mean().item():.2f}")
-    print(f"  Avg selected per sample: {per_sample_selected.mean().item():.2f}")
-    print(f"  Avg positive ratio per sample: {per_sample_ratio.mean().item():.4f}")
-    print(f"  Min/Max positive ratio: {per_sample_ratio.min().item():.4f} / {per_sample_ratio.max().item():.4f}")
-    print()
-    
-    logits = model(nodes_tensor, demands_tensor, current_sol_tensor, candidates_tensor)
-    torch.set_printoptions(precision=10)
-    import pdb; pdb.set_trace()
-    print(logits[:10])
+    cost_0 = previous_cost[:, 0]
+    target_ratio = previous_cost[:, -1] / previous_cost[:, 0]
+
+    print(f"Samples: {n}")
+    print(f"cost_0: min={cost_0.min():.1f}, max={cost_0.max():.1f}, mean={cost_0.mean():.1f}")
+    print(f"target_ratio: min={target_ratio.min():.4f}, max={target_ratio.max():.4f}, mean={target_ratio.mean():.4f}")
+
+    predicted = model(nodes_tensor, demands_tensor, current_sol_tensor, selected_tensor, cost_0)
+    print(f"predicted_ratio: min={predicted.min():.4f}, max={predicted.max():.4f}, mean={predicted.mean():.4f}")
+    print(f"Sample predictions vs targets (first 10):")
+    for i in range(min(10, n)):
+        print(f"  [{i}] pred={predicted[i].item():.4f}, target={target_ratio[i].item():.4f}, cost_0={cost_0[i].item():.0f}")
 
 if __name__ == "__main__":
     main()
