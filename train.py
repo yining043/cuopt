@@ -168,11 +168,12 @@ def grpo_loss(predicted, target_ratio, state_ids):
     return torch.stack(group_losses).mean()
 
 
-def soft_concordance_loss(predicted, target_ratio, state_ids, temperature=0.01):
+def soft_concordance_loss(predicted, target_ratio, state_ids, temperature=0.01, min_pair_spread=0.0):
     """Pairwise logistic ranking loss: directly optimizes within-state concordance.
     For each ordered pair (i,j) where ratio_i < ratio_j (i is better),
     loss = -log sigmoid((pred_j - pred_i) / temperature).
     Minimizing pushes pred_i < pred_j, aligning with argmin at inference.
+    If min_pair_spread > 0, only pairs with |target_i - target_j| > min_pair_spread are used.
     """
     unique_states = state_ids.unique()
     all_pair_losses = []
@@ -192,6 +193,14 @@ def soft_concordance_loss(predicted, target_ratio, state_ids, temperature=0.01):
         upper = torch.triu(torch.ones(n, n, device=predicted.device), diagonal=1).bool()
         dt = diff_target[upper]
         dp = diff_pred[upper]
+
+        # Only keep pairs with |dt| > min_pair_spread
+        if min_pair_spread > 0:
+            valid = dt.abs() > min_pair_spread
+            if valid.sum() == 0:
+                continue
+            dt = dt[valid]
+            dp = dp[valid]
 
         # dt > 0 means j has higher ratio (j is worse), so we want pred_j > pred_i
         # dt < 0 means j has lower ratio (j is better), so we want pred_j < pred_i
@@ -324,8 +333,8 @@ def compute_metrics(predicted, target, cost_0):
 
 
 def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
-                    loss_type='soft_top1', lambda_rank=1.0, temperature=0.01,
-                    tau=0.1, tau_label=1.0):
+                    loss_type='soft_top1', lambda_rank=1.0, lambda_concordance=0.2,
+                    temperature=0.01, tau=0.1, tau_label=1.0, min_pair_spread=0.0):
     model.train()
     total_loss = 0
     total_components = {}
@@ -349,6 +358,7 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
 
         l_reg_val = None
         l_grpo_val = None
+        l_conc_val = None
         if loss_type == 'reg':
             loss = loss_function(predicted, target_ratio)
             l_reg_val = loss.item()
@@ -356,7 +366,13 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
             loss = grpo_loss(predicted, target_ratio, state_ids)
             l_grpo_val = loss.item()
         elif loss_type == 'concordance':
-            loss = soft_concordance_loss(predicted, target_ratio, state_ids, temperature)
+            loss = soft_concordance_loss(predicted, target_ratio, state_ids, temperature, min_pair_spread)
+        elif loss_type == 'reg_concordance':
+            l_reg = loss_function(predicted, target_ratio)
+            l_conc = soft_concordance_loss(predicted, target_ratio, state_ids, temperature, min_pair_spread)
+            loss = l_reg + lambda_concordance * l_conc
+            l_reg_val = l_reg.item()
+            l_conc_val = l_conc.item()
         elif loss_type == 'top1':
             loss = top1_loss(predicted, target_ratio, state_ids, tau)
         elif loss_type == 'soft_top1':
@@ -378,6 +394,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
             total_components['l_reg'] = total_components.get('l_reg', 0) + l_reg_val
         if l_grpo_val is not None:
             total_components['l_grpo'] = total_components.get('l_grpo', 0) + l_grpo_val
+        if l_conc_val is not None:
+            total_components['l_conc'] = total_components.get('l_conc', 0) + l_conc_val
         num_batches += 1
 
         all_preds.append(predicted.detach())
@@ -397,6 +415,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
                 batch_log["train/batch_l_reg"] = l_reg_val
             if l_grpo_val is not None:
                 batch_log["train/batch_l_grpo"] = l_grpo_val
+            if l_conc_val is not None:
+                batch_log["train/batch_l_conc"] = l_conc_val
             wandb.log(batch_log)
 
     all_preds = torch.cat(all_preds)
@@ -415,9 +435,13 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
 
     print(f"  Train - Loss: {avg_loss:.6f} [{loss_type}]")
     if 'l_reg' in total_components:
-        print(f"          L_reg: {total_components['l_reg']/num_batches:.6f} | L_grpo: {total_components.get('l_grpo',0)/num_batches:.6f}")
+        l_grpo_str = f" | L_grpo: {total_components.get('l_grpo',0)/num_batches:.6f}" if 'l_grpo' in total_components else ""
+        l_conc_str = f" | L_conc: {total_components.get('l_conc',0)/num_batches:.6f}" if 'l_conc' in total_components else ""
+        print(f"          L_reg: {total_components['l_reg']/num_batches:.6f}{l_grpo_str}{l_conc_str}")
     elif 'l_grpo' in total_components:
         print(f"          L_grpo: {total_components['l_grpo']/num_batches:.6f}")
+    elif 'l_conc' in total_components:
+        print(f"          L_conc: {total_components['l_conc']/num_batches:.6f}")
     print(f"          MAE: {metrics['mae']:.6f} | RMSE: {metrics['rmse']:.6f} | R²: {metrics['r2']:.4f}")
     print(f"          MAPE: {metrics['mape']:.2f}% | Cost MAE: {metrics['cost_mae']:.1f} | Imp Corr: {metrics['improvement_corr']:.4f}")
     print(f"          Within-State Concordance: {ws_conc:.4f}")
@@ -447,6 +471,8 @@ def train_one_epoch(model, train_loader, optimizer, device, epoch, global_step,
         epoch_log["train/l_reg"] = total_components['l_reg'] / num_batches
     if 'l_grpo' in total_components:
         epoch_log["train/l_grpo"] = total_components['l_grpo'] / num_batches
+    if 'l_conc' in total_components:
+        epoch_log["train/l_conc"] = total_components['l_conc'] / num_batches
     wandb.log(epoch_log)
 
     return avg_loss, global_step
@@ -534,8 +560,8 @@ def train(data_pattern, checkpoint_dir, num_epochs=1000, lr=5e-5,
           resume_checkpoint=None, load_weights=None, runname=None,
           groups_per_batch=16, trails_per_group=16,
           num_train_batches=800, num_val_batches=100,
-          lambda_rank=1.0, loss_type='soft_top1', temperature=0.01,
-          tau=0.1, tau_label=1.0, min_spread=0.0):
+          lambda_rank=1.0, lambda_concordance=0.2, loss_type='soft_top1', temperature=0.01,
+          tau=0.1, tau_label=1.0, min_spread=0.0, min_pair_spread=0.0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = CostPredictor(device=device)
 
@@ -637,6 +663,7 @@ def train(data_pattern, checkpoint_dir, num_epochs=1000, lr=5e-5,
         "num_train_batches": num_train_batches,
         "num_val_batches": num_val_batches,
         "lambda_rank": lambda_rank,
+        "lambda_concordance": lambda_concordance,
         "learning_rate": lr,
         "num_epochs": num_epochs,
         "train_states": len(train_states_set),
@@ -652,10 +679,13 @@ def train(data_pattern, checkpoint_dir, num_epochs=1000, lr=5e-5,
         "loss": f"{loss_type} (lambda={lambda_rank}, temp={temperature}, tau={tau}, tau_label={tau_label})",
         "target": "cost[-1]/cost[0]",
         "min_spread": min_spread,
+        "min_pair_spread": min_pair_spread,
     })
 
     print(f"Device: {device}")
-    print(f"Loss type: {loss_type} | Lambda rank: {lambda_rank} | Temperature: {temperature} | Tau: {tau} | Tau_label: {tau_label}")
+    print(f"Loss type: {loss_type} | Lambda rank: {lambda_rank} | Lambda concordance: {lambda_concordance} | Temperature: {temperature} | Tau: {tau} | Tau_label: {tau_label}")
+    if loss_type in ('concordance', 'reg_concordance') and min_pair_spread > 0:
+        print(f"  Concordance min_pair_spread: {min_pair_spread} (only pairs with |dt| > {min_pair_spread})")
 
     best_top1_hit = 0.0
 
@@ -667,8 +697,8 @@ def train(data_pattern, checkpoint_dir, num_epochs=1000, lr=5e-5,
 
         avg_train_loss, global_step = train_one_epoch(
             model, train_loader, optimizer, device, epoch, global_step,
-            loss_type=loss_type, lambda_rank=lambda_rank, temperature=temperature,
-            tau=tau, tau_label=tau_label
+            loss_type=loss_type, lambda_rank=lambda_rank, lambda_concordance=lambda_concordance,
+            temperature=temperature, tau=tau, tau_label=tau_label, min_pair_spread=min_pair_spread
         )
 
         avg_val_loss, val_metrics, val_ws_conc, val_top1_hit = evaluate(model, val_loader, device, epoch)
@@ -708,9 +738,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_val_batches", type=int, default=100)
     parser.add_argument("--lambda_rank", type=float, default=1.0,
                         help="Weight for GRPO ranking loss (only used with reg_grpo)")
+    parser.add_argument("--lambda_concordance", type=float, default=0.2,
+                        help="Weight for concordance loss (only used with reg_concordance, default 0.2 for reg dominance)")
     parser.add_argument("--loss", type=str, default="soft_top1",
-                        choices=["reg", "grpo", "reg_grpo", "concordance", "top1", "soft_top1"],
-                        help="Loss type: soft_top1=z-score label-smoothed CE (default), top1=hard CE, reg=Huber, grpo=GRPO, reg_grpo=Huber+GRPO, concordance=pairwise")
+                        choices=["reg", "grpo", "reg_grpo", "reg_concordance", "concordance", "top1", "soft_top1"],
+                        help="Loss type: soft_top1, top1, reg, grpo, reg_grpo, reg_concordance (reg+concordance, reg dominates), concordance")
     parser.add_argument("--temperature", type=float, default=0.01,
                         help="Temperature for soft concordance loss (smaller = sharper)")
     parser.add_argument("--tau", type=float, default=0.1,
@@ -719,6 +751,8 @@ if __name__ == "__main__":
                         help="Temperature for soft_top1 label softmax over z-scored advantage (smaller = more peaked)")
     parser.add_argument("--min_spread", type=float, default=0.0,
                         help="Min ratio spread within state to keep for training (0 = no filter)")
+    parser.add_argument("--min_pair_spread", type=float, default=0.0,
+                        help="For concordance: only use pairs with |target_i - target_j| > this (0 = use all)")
     args = parser.parse_args()
 
     args.runname = args.runname + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -727,4 +761,4 @@ if __name__ == "__main__":
     train(args.data, checkpoint_dir, args.epochs, args.lr, args.resume, args.load_weights, args.runname,
           args.groups_per_batch, args.trails_per_group,
           args.num_train_batches, args.num_val_batches,
-          args.lambda_rank, args.loss, args.temperature, args.tau, args.tau_label, args.min_spread)
+          args.lambda_rank, args.lambda_concordance, args.loss, args.temperature, args.tau, args.tau_label, args.min_spread, args.min_pair_spread)
