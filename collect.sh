@@ -7,17 +7,17 @@ do
    formatted_index=$(printf "%03d" $i)
    
    # 计算要使用的显卡 ID (取模 4 得到: 0, 1, 2, 3)
-   gpu_id=$((i % 4))
+   gpu_id=2
 
    echo "Processing Index: $i on GPU $gpu_id ..."
 
    # 修改 time_limit 为 10，动态分配显卡，并在末尾加上 & 让其在后台运行
    CUDA_VISIBLE_DEVICES=$gpu_id python run_cuopt.py \
-      --time_limit 10 \
-      --index $i > "dataset_anchor/instance_${formatted_index}.txt" &
+      --time_limit 30 \
+      --index 1 > "dataset_sole/instance_${formatted_index}.txt" &
 
    # 每提交 4 个任务就阻塞等待它们全部完成，然后再启动下一批
-   if [ $(( (i + 1) % 4 )) -eq 0 ]; then
+   if [ $(( (i + 1) % 1 )) -eq 0 ]; then
        wait
    fi
 done

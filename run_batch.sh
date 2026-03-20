@@ -2,13 +2,13 @@
 
 # =================配置区域=================
 # 1. 显卡 ID 列表 (例如：4张卡并行)
-gpus=(0 1 2 3)
+gpus=(2)
 
 # 2. 总共要跑的任务数
 total_tasks=16
 
 # 3. 自定义输出文件的前缀名 (例如设置为 "exp_cuopt"，输出就会变成 exp_cuopt_1.txt, exp_cuopt_2.txt...)
-output_prefix="final_old_model"
+output_prefix="test_model"
 # =========================================
 
 num_gpus=${#gpus[@]}
@@ -27,10 +27,10 @@ for ((i=1; i<=total_tasks; i++)); do
     # 执行命令，使用 ${output_prefix} 替换原来的写死的名字
     CUDA_VISIBLE_DEVICES=$gpu_id python run_cuopt.py \
         --index 1 \
-        --time 150 \
+        --time 30 \
 	--use \
-	--v old \
-        --policy outputs/regression_20260311_204007/checkpoint_epoch_290.pt \
+	--v v2 \
+        --policy outputs/new_model_concordance_minspead2_20260319_062050/checkpoint_epoch_30.pt \
         > ../cuopt-examples/code/${output_prefix}_${i}.txt &
 
     # 分批等待逻辑

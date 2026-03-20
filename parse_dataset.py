@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 解析 local_search.cu 输出的日志文件 (适配 anchor 格式)
-每个 state (= instance+search+iteration) 保留最多 12 个代表性 trails，
-并分配 state_id 供 GRPO 训练使用。
+每个 state (= instance+search+iteration) 保留所有 valid trails，
+每 trail 一行，直接输出 .npy 目录供 mmap 训练使用。
 """
 
 import re
@@ -10,6 +10,7 @@ import sys
 import os
 import glob
 import gc
+import numpy as np
 import torch
 from dataclasses import dataclass, field
 from load_nco_data import load_raw_data
@@ -204,19 +205,18 @@ if __name__ == '__main__':
     batch_current_sol = []
     batch_anchor = []
     batch_selected = []
-    batch_previous_cost = []
-    batch_num_anchors = []
+    batch_cost = []
     batch_state_id = []
 
     batch_size = 2000
     state_counter = 0
-    max_trails_per_state = 12
     skipped_no_anchor = 0
     skipped_empty_selected = 0
     skipped_no_improvement = 0
     skipped_low_std = 0
-    skipped_few_trails = 0
-    kept = 0
+    skipped_few_valid = 0
+    kept_states = 0
+    kept_trails = 0
 
     pbar = tqdm(total=len(results), desc="Processing batches")
 
@@ -231,8 +231,7 @@ if __name__ == '__main__':
             'current_sol': [],
             'anchor': [],
             'selected': [],
-            'previous_cost': [],
-            'number_of_anchors': [],
+            'cost': [],
             'state_id': []
         }
 
@@ -271,7 +270,6 @@ if __name__ == '__main__':
                 for trail in iter_info.trails:
                     anchors_all = trail['executed_anchors_all']
                     prev_cost = trail['previous_cost']
-                    n_anchors = trail['number_of_anchors']
 
                     if not anchors_all:
                         skipped_empty_selected += 1
@@ -281,11 +279,8 @@ if __name__ == '__main__':
                         skipped_no_improvement += 1
                         continue
 
-                    cost_tensor = torch.zeros(4, dtype=torch.float32)
-                    for ci, cv in enumerate(prev_cost[:4]):
-                        cost_tensor[ci] = cv
-
-                    if cost_tensor.std(-1).item() <= 1.0:
+                    costs = prev_cost[:4]
+                    if len(costs) >= 2 and torch.tensor(costs).std().item() <= 1.0:
                         skipped_low_std += 1
                         continue
 
@@ -294,41 +289,26 @@ if __name__ == '__main__':
                         if idx < max_candidates_length:
                             s_tensor[idx] = True
 
-                    ratio = prev_cost[-1] / prev_cost[0]
                     valid_trails.append({
                         's_tensor': s_tensor,
-                        'cost_tensor': cost_tensor,
-                        'n_anchors': n_anchors,
-                        'ratio': ratio,
+                        'costs': prev_cost[:4],
                     })
 
                 if len(valid_trails) < 2:
-                    skipped_few_trails += len(valid_trails)
+                    skipped_few_valid += len(valid_trails)
                     continue
 
-                valid_trails.sort(key=lambda x: x['ratio'])
-
-                if len(valid_trails) <= max_trails_per_state:
-                    selected_trails = valid_trails
-                else:
-                    best = valid_trails[0]
-                    worst = valid_trails[-1]
-                    middle = valid_trails[1:-1]
-                    n_mid = max_trails_per_state - 2
-                    indices = [int(i * (len(middle) - 1) / (n_mid - 1)) for i in range(n_mid)]
-                    selected_trails = [best] + [middle[i] for i in indices] + [worst]
-
-                for t in selected_trails:
+                for t in valid_trails:
                     ml_data['nodes_tensor'].append(nodes)
                     ml_data['demands_tensor'].append(demands)
                     ml_data['current_sol'].append(flat_sol)
                     ml_data['anchor'].append(anchor_tensor)
                     ml_data['selected'].append(t['s_tensor'])
-                    ml_data['previous_cost'].append(t['cost_tensor'])
-                    ml_data['number_of_anchors'].append(t['n_anchors'])
+                    ml_data['cost'].append(t['costs'])
                     ml_data['state_id'].append(state_counter)
-                    kept += 1
+                    kept_trails += 1
 
+                kept_states += 1
                 state_counter += 1
 
         del batch_results
@@ -339,8 +319,7 @@ if __name__ == '__main__':
             batch_current_sol.append(torch.tensor(ml_data['current_sol']))
             batch_anchor.append(torch.stack(ml_data['anchor']))
             batch_selected.append(torch.stack(ml_data['selected']))
-            batch_previous_cost.append(torch.stack(ml_data['previous_cost']))
-            batch_num_anchors.append(torch.tensor(ml_data['number_of_anchors']))
+            batch_cost.append(torch.tensor(ml_data['cost'], dtype=torch.float32))
             batch_state_id.append(torch.tensor(ml_data['state_id'], dtype=torch.int64))
 
         pbar.update(current_batch_size)
@@ -351,14 +330,13 @@ if __name__ == '__main__':
     gc.collect()
 
     print(f"\nFiltering summary:")
-    print(f"  Kept: {kept}")
-    print(f"  Total states: {state_counter}")
-    print(f"  Avg trails per state: {kept / max(state_counter, 1):.1f}")
+    print(f"  Kept states: {kept_states}, kept trails: {kept_trails}")
+    print(f"  Avg trails/state: {kept_trails / max(kept_states, 1):.1f}")
     print(f"  Skipped (anchor union empty): {skipped_no_anchor}")
     print(f"  Skipped (executed_anchors_all empty): {skipped_empty_selected}")
     print(f"  Skipped (no improvement): {skipped_no_improvement}")
     print(f"  Skipped (cost std <= 1): {skipped_low_std}")
-    print(f"  Skipped (fewer than 2 trails per state): {skipped_few_trails}")
+    print(f"  Skipped (< 2 valid trails): {skipped_few_valid}")
 
     def smart_cat(tensor_list, dtype=None):
         if not tensor_list:
@@ -377,53 +355,26 @@ if __name__ == '__main__':
             tensor_list[j] = None
         return final_tensor
 
-    print("Concatenating tensors...")
-    nodes_tensor = smart_cat(batch_nodes)
-    del batch_nodes; gc.collect()
+    print("Concatenating and saving as .npy ...")
+    output_dir = sys.argv[3] if len(sys.argv) > 3 else 'ml_data_npy'
+    os.makedirs(output_dir, exist_ok=True)
 
-    demands_tensor = smart_cat(batch_demands)
-    del batch_demands; gc.collect()
+    def save_npy(name, tensor_list, dtype=None):
+        t = smart_cat(tensor_list, dtype=dtype)
+        arr = t.numpy()
+        path = os.path.join(output_dir, f"{name}.npy")
+        np.save(path, arr)
+        print(f"  {name:30s} {str(arr.shape):20s} {arr.dtype}")
+        del t; gc.collect()
+        return arr.shape
 
-    current_sol_tensor = smart_cat(batch_current_sol, dtype=torch.int16)
-    del batch_current_sol; gc.collect()
+    save_npy("nodes_tensor",       batch_nodes)
+    save_npy("demands_tensor",     batch_demands)
+    save_npy("current_sol_tensor", batch_current_sol,  dtype=torch.int16)
+    save_npy("anchor_tensor",      batch_anchor)
+    save_npy("selected_tensor",    batch_selected)
+    save_npy("cost_tensor",        batch_cost)
+    save_npy("state_id_tensor",    batch_state_id,     dtype=torch.int64)
 
-    anchor_tensor = smart_cat(batch_anchor)
-    del batch_anchor; gc.collect()
-
-    selected_tensor = smart_cat(batch_selected)
-    del batch_selected; gc.collect()
-
-    cost_tensor = smart_cat(batch_previous_cost)
-    del batch_previous_cost; gc.collect()
-
-    number_of_anchors_tensor = smart_cat(batch_num_anchors)
-    del batch_num_anchors; gc.collect()
-
-    state_id_tensor = smart_cat(batch_state_id, dtype=torch.int64)
-    del batch_state_id; gc.collect()
-
-    print(f"\nML Data shapes:")
-    print(f"  nodes_tensor:              {nodes_tensor.shape}")
-    print(f"  demands_tensor:            {demands_tensor.shape}")
-    print(f"  current_sol_tensor:        {current_sol_tensor.shape}")
-    print(f"  anchor_tensor:             {anchor_tensor.shape}")
-    print(f"  selected_tensor:           {selected_tensor.shape}")
-    print(f"  cost_tensor:               {cost_tensor.shape}")
-    print(f"  number_of_anchors_tensor:  {number_of_anchors_tensor.shape}")
-    print(f"  state_id_tensor:           {state_id_tensor.shape}")
-    print(f"  max_candidates_length:     {max_candidates_length}")
-
-    output_file = sys.argv[3] if len(sys.argv) > 3 else 'ml_data.pt'
-    ml_data_dict = {
-        'nodes_tensor': nodes_tensor,
-        'demands_tensor': demands_tensor,
-        'current_sol_tensor': current_sol_tensor,
-        'anchor_tensor': anchor_tensor,
-        'selected_tensor': selected_tensor,
-        'cost_tensor': cost_tensor,
-        'number_of_anchors_tensor': number_of_anchors_tensor,
-        'state_id_tensor': state_id_tensor,
-        'max_candidates_length': max_candidates_length
-    }
-    torch.save(ml_data_dict, output_file)
-    print(f"ML data saved to: {output_file}")
+    print(f"\nSaved to: {output_dir}/")
+    print(f"  {kept_trails} trails from {kept_states} states, L={max_candidates_length}")

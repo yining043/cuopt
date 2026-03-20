@@ -1,4 +1,5 @@
 import argparse
+import math
 from gc import set_debug
 from os import pread
 from statistics import mean
@@ -20,12 +21,13 @@ def pairwise_euclidean_distance(x: torch.Tensor) -> torch.Tensor:
 class CostPredictorCallback(CustomizeNodesCallback):
     """Callback that uses CostPredictor to score executed_anchors from K trails."""
     def __init__(self, model, coordinates, demand, vehicle_capacity,
-                 device='cpu'):
+                 device='cpu', top_frac: float = 0.05):
         super().__init__()
         self.model = model.eval()
         self.coordinates = coordinates.to(device)
         self.demand = (demand / vehicle_capacity).to(device)
         self.device = device
+        self.top_frac = top_frac
 
     def customize_nodes_to_search(self, solution_flat, num_routes,
                                   solution_cost, trail_masks_flat, num_trails, iter):
@@ -52,7 +54,14 @@ class CostPredictorCallback(CustomizeNodesCallback):
                 nodes, demands, sol_tensor, trail_masks, cost_0)
 
         predicted_ratios[~non_empty] = float('inf')
-        best_idx = predicted_ratios.argmin().item()
+        valid_idx = torch.where(non_empty)[0]
+        n_valid = int(valid_idx.numel())
+        scores = predicted_ratios[valid_idx]
+        k = max(1, int(math.ceil(self.top_frac * n_valid)))
+        k = min(k, n_valid)
+        _, local_top = torch.topk(scores, k, largest=False)
+        pool = valid_idx[local_top].cpu().tolist()
+        best_idx = random.choice(pool)
         return trail_masks[best_idx].int().cpu().tolist()
 
 def make_cuopt_format(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_vehicles, scale):
@@ -92,6 +101,7 @@ def run_experiment(
     use_callback=False,
     policy_model_path=None,
     mode='new',
+    callback_top_frac: float = 0.3,
 ):
     raw_nodes, raw_cap, raw_demand, raw_cost, raw_flag = load_raw_data(data_path, episode=problem_size, begin_index=index)
     raw_dist = pairwise_euclidean_distance(raw_nodes)
@@ -115,7 +125,10 @@ def run_experiment(
         # 创建 callback（使用当前问题的数据）
         callback = None
         if use_callback:
-            callback = CostPredictorCallback(policy, raw_nodes, raw_demand, raw_cap, device)
+            callback = CostPredictorCallback(
+                policy, raw_nodes, raw_demand, raw_cap, device,
+                top_frac=callback_top_frac,
+            )
         
         model = get_cuopt_model(index, raw_dist, raw_demand, raw_cap, n_vehicles, scale)
         solution = run_cuopt(model, time_limit, callback=callback)
@@ -145,12 +158,23 @@ if __name__ == "__main__":
     parser.add_argument("--scale", type=float, default=1e2, help="Coordinate scale")
     parser.add_argument("--use_callback", action='store_true', help="Use callback for node selection (requires pred_with_NN=true in C++ code)")
     parser.add_argument("--policy_model_path", type=str, default=None, help="Path to Policy model checkpoint (.pt file)")
-    parser.add_argument("--v", type=str, default="new", choices=["old", "new"],
-                        help="Model architecture: old=selected_bias only, new=selected_bias+sel_scores+selected_pool")
+    parser.add_argument("--v", type=str, default="new", choices=["old", "new", "v2"],
+                        help="CostPredictor mode: old=ratio, new=new head, v2=RegressionHeadV2（与 test --mode 一致）")
+    parser.add_argument(
+        "--callback-top-frac",
+        type=float,
+        default=0.3,
+        help="Callback：在 pred 最小的 ceil(frac×K_valid) 条 trail 中随机选一条（默认 0.3=前30%%）",
+    )
 
     args = parser.parse_args()
 
-    mode = 'ratio' if args.v == 'old' else 'new'
+    if args.v == "old":
+        mode = "ratio"
+    elif args.v == "v2":
+        mode = "v2"
+    else:
+        mode = "new"
     run_experiment(
         data_path=args.data_path,
         time_limit=args.time_limit,
@@ -162,4 +186,5 @@ if __name__ == "__main__":
         use_callback=args.use_callback,
         policy_model_path=args.policy_model_path,
         mode=mode,
+        callback_top_frac=args.callback_top_frac,
     )
