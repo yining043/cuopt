@@ -40,7 +40,7 @@ from sklearn.metrics import (
 )
 
 from CVRPEnv import CVRPEnv
-from analyze_checkpoints import build_model, embed_solutions  # reuse model construction logic
+from analyze_checkpoints import _get_encoder_state, _load_embedder, build_model, embed_solutions
 from helper import load_instances_pkl, solution_flat_to_solution
 
 
@@ -87,8 +87,8 @@ def analyze_checkpoint(
 ) -> Dict[str, Any]:
     """Correlation + boundary classification for one checkpoint."""
     ckpt = torch.load(ckpt_path, map_location=device)
-    embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-    embedder.encoder.load_state_dict(ckpt["encoder_state"])
+    embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+    _load_embedder(embedder, ckpt)
     embedder.eval()
 
     env = CVRPEnv(problem_size=args.problem_size, device=device)

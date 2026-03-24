@@ -4,6 +4,44 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from helper import get_solution_with_dummy_depot, sol2rec
 
+_SCALE = int(1e3)
+
+
+def _preprocessing_core(rec: torch.Tensor, demand: torch.Tensor, dummy_size: int) -> Tuple[torch.Tensor, ...]:
+    """Pure function for the recurrence loop; can be torch.compile'd to reduce Python overhead."""
+    device = rec.device
+    batch_size, seq_length = rec.size()
+    arange = torch.arange(batch_size, device=device, dtype=torch.long)
+    pre = torch.zeros(batch_size, device=device, dtype=torch.long)
+    route = torch.zeros(batch_size, device=device, dtype=torch.long)
+    route_plan_visited_time = torch.zeros((batch_size, seq_length), device=device, dtype=torch.long)
+    cum_demand = torch.zeros((batch_size, seq_length), device=device, dtype=demand.dtype)
+    partial_sum_wrt_route_plan = torch.zeros((batch_size, dummy_size), device=device, dtype=demand.dtype)
+
+    for i in range(seq_length):
+        next_ = rec[arange, pre]
+        next_is_dummy = next_ < dummy_size
+        route = route + next_is_dummy.long()
+        val_visited = ((route % dummy_size) * _SCALE + (i + 1) % seq_length).unsqueeze(1)
+        route_plan_visited_time.scatter_(1, next_.unsqueeze(1), val_visited)
+        route_idx = (route % dummy_size).unsqueeze(1)
+        old_partial = partial_sum_wrt_route_plan.gather(1, route_idx).squeeze(1)
+        demand_at_next = demand[arange, next_]
+        new_cum_demand = old_partial + demand_at_next
+        partial_sum_wrt_route_plan.scatter_(1, route_idx, new_cum_demand.unsqueeze(1))
+        cum_val = new_cum_demand * (~next_is_dummy).to(demand.dtype)
+        cum_demand.scatter_(1, next_.unsqueeze(1), cum_val.unsqueeze(1))
+        pre = next_
+
+    route_plan_0x = route_plan_visited_time // _SCALE
+    return route_plan_0x, route_plan_visited_time % _SCALE, cum_demand, partial_sum_wrt_route_plan
+
+
+try:
+    _preprocessing_core_compiled = torch.compile(_preprocessing_core, dynamic=True, fullgraph=False)
+except Exception:
+    _preprocessing_core_compiled = None
+
 class CVRPEnv:
     """Holds dummy xy/demand; load() stores instance+basin_info; prepare_from_hashes(hashes)->context; get_dynamic_feature(context)->(vt, depot_f, node_f)."""
 
@@ -46,40 +84,12 @@ class CVRPEnv:
         return context
     
     def preprocessing(self, rec: torch.Tensor) -> torch.Tensor:
+        """Uses compiled core when available for lower Python overhead."""
+        assert rec.size(1) < 1000
         demand = self._dummy_demand
-        device = rec.device
-
-        batch_size, seq_length = rec.size()
-        assert seq_length < 1000
-        arange = torch.arange(batch_size, device=device)
-
-        pre = torch.zeros(batch_size, device=device).long()
-        route = torch.zeros(batch_size, device=device).long()
-        route_plan_visited_time = torch.zeros((batch_size, seq_length), device=device).long()
-        cum_demand = torch.zeros((batch_size, seq_length), device=device)
-        partial_sum_wrt_route_plan = torch.zeros((batch_size, self._dummy_size), device=device)
-
-        for i in range(seq_length):
-            next_ = rec[arange, pre]
-            next_is_dummy_node = next_ < self._dummy_size
-            route[next_is_dummy_node] += 1
-            route_plan_visited_time[arange, next_] = (route % self._dummy_size) * int(1e3) + (i + 1) % seq_length
-            new_cum_demand = partial_sum_wrt_route_plan[arange, route % self._dummy_size] + demand[arange, next_]
-            partial_sum_wrt_route_plan[arange, route % self._dummy_size] = new_cum_demand.clone()
-            cum_demand[arange, next_] = new_cum_demand * (~next_is_dummy_node)
-
-            pre = next_.clone()
-
-        route_plan_0x = (route_plan_visited_time // int(1e3))
-
-        out = (
-                route_plan_0x,  # route plan 0xxxxx, belongs to which route
-               (route_plan_visited_time % int(1e3)),  # visited time
-               cum_demand.clone(),  # cum_demand (inclusive)
-               partial_sum_wrt_route_plan.clone()# partial_sum_wrt_route_plan
-               )
-
-        return out
+        dummy_size = self._dummy_size
+        fn = _preprocessing_core_compiled if _preprocessing_core_compiled is not None else _preprocessing_core
+        return fn(rec, demand, dummy_size)
 
     def get_dynamic_feature(self, context):
 

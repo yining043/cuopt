@@ -7,13 +7,17 @@ Stage 2: Triplet Margin Loss with perturb data (anchor, positive, negative).
 """
 
 import argparse
+import hashlib
+import math
 import os
+import pickle
 import random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+from scipy.stats import wasserstein_distance
 import torch.nn.functional as F
 from tqdm import tqdm
 import wandb
@@ -23,6 +27,7 @@ from dataloader import (
     TripletBatch,
     build_loader_from_args,
     load_perturb_data,
+    load_training_data_pairs,
     load_val_data_1a1n10d,
     load_val_data_1p1n,
     parse_instance_indices,
@@ -37,6 +42,24 @@ from helper import (
     seed_everything,
     make_triplet_gif,
 )
+
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+) -> Optional[torch.optim.lr_scheduler.LambdaLR]:
+    """Warmup + cosine decay. Returns None if warmup_steps <= 0."""
+    if warmup_steps <= 0:
+        return None
+
+    def lr_lambda(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def embed_solutions(
@@ -58,35 +81,25 @@ def embed_solutions(
     return emb
 
 
-def train_one_triplet_batch(
+def embed_multi_instance(
     embedder: SolutionEmbedder,
-    optimizer: torch.optim.Optimizer,
-    batch: TripletBatch,
+    inst_solutions: List[Tuple[int, List[int]]],
+    instance_data_by_idx: Dict[int, dict],
     env: CVRPEnv,
     basin_info_cache: Dict[str, dict],
-    margin: float,
-) -> Tuple[float, float, float, float]:
-    """Train on one triplet batch. Returns (loss, mean_d_ap, mean_d_an, mean_d_an_over_d_ap)."""
-    embedder.train()
-    optimizer.zero_grad()
-
-    env.load(batch.depot_xy, batch.node_xy_demand, basin_info_cache)
-
-    emb_a = embed_solutions(embedder, batch.anchor_solutions, env, basin_info_cache)
-    emb_p = embed_solutions(embedder, batch.positive_solutions, env, basin_info_cache)
-    emb_n = embed_solutions(embedder, batch.negative_solutions, env, basin_info_cache)
-
-    d_ap = F.pairwise_distance(emb_a, emb_p, p=2)
-    d_an = F.pairwise_distance(emb_a, emb_n, p=2)
-    loss = F.relu(d_ap - d_an + margin).mean()
-
-    loss.backward()
-    optimizer.step()
-
-    mean_d_ap = d_ap.mean().item()
-    mean_d_an = d_an.mean().item()
-    ratio = mean_d_an / (mean_d_ap + 1e-8)
-    return loss.item(), mean_d_ap, mean_d_an, ratio
+) -> torch.Tensor:
+    """Embed solutions from potentially multiple instances, preserving input order."""
+    by_inst: Dict[int, List[Tuple[int, List[int]]]] = {}
+    for i, (idx, sol) in enumerate(inst_solutions):
+        by_inst.setdefault(idx, []).append((i, sol))
+    result: List[Optional[torch.Tensor]] = [None] * len(inst_solutions)
+    for idx, items in by_inst.items():
+        inst = instance_data_by_idx[idx]
+        env.load(inst["depot_xy"], inst["node_xy_demand"], basin_info_cache)
+        emb = embed_solutions(embedder, [sol for _, sol in items], env, basin_info_cache)
+        for j, (orig_i, _) in enumerate(items):
+            result[orig_i] = emb[j]
+    return torch.stack(result)
 
 
 def weighted_infonce_loss(
@@ -139,6 +152,7 @@ def train_one_batch(
     env: CVRPEnv,
     device: torch.device,
     temperature: float,
+    grad_clip: float = 0.0,
 ) -> float:
 
     context = env.prepare_from_hashes(batch.hashes)
@@ -153,8 +167,123 @@ def train_one_batch(
     loss = weighted_infonce_loss(emb, pair_idx, w, temperature, include_mask=include_mask)
 
     loss.backward()
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(embedder.parameters(), grad_clip)
     optimizer.step()
     return loss.item()
+
+
+# ── Shared plotting helpers ──
+
+
+def _log_histogram(
+    list_a: List[float], list_b: List[float],
+    hist_path: str, tag: str,
+    wb_run, global_step: int,
+    hist_key: str, wasserstein_key: str,
+) -> None:
+    """Plot distance/sim histogram, compute Wasserstein, optionally log to wandb."""
+    plot_distance_histogram(list_a, list_b, save_path=hist_path)
+    w = wasserstein_distance(list_a, list_b)
+    print(f"[{tag}] Saved histogram to {hist_path} | Wasserstein={w:.6f}")
+    if wb_run is not None:
+        wandb.log({hist_key: wandb.Image(hist_path), wasserstein_key: w}, step=global_step)
+
+
+def _embed_val_triplets_2d(
+    val_records: List[Tuple[int, dict]],
+    instance_data_by_idx: Dict[int, dict],
+    embedder: SolutionEmbedder,
+    env: CVRPEnv,
+    basin_info_cache: Dict[str, dict],
+    sol_keys: List[str],
+    role_label_map: Dict[int, str],
+    role_color_map: Dict[int, str],
+    epoch_label: str,
+    stage_prefix: str,
+    plot_dir: str,
+    wb_run, global_step: int,
+) -> None:
+    """Embed val records, plot 2D PCA + GIF. Shared by S1 and S2."""
+    basin_cache: Dict[str, dict] = {}
+    all_emb: List[torch.Tensor] = []
+    all_inst_ids: List[int] = []
+    all_groups: List[int] = []
+    all_triplet_ids: List[int] = []
+    embedder.eval()
+    with torch.no_grad():
+        for t_idx, (inst_idx, rec) in enumerate(val_records):
+            inst = instance_data_by_idx[inst_idx]
+            env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
+            for role, key in enumerate(sol_keys):
+                val = rec[key]
+                if isinstance(val, list) and val and isinstance(val[0], list):
+                    sols = val
+                elif isinstance(val, list) and not val:
+                    continue
+                else:
+                    sols = [val]
+                emb = embed_solutions(embedder, sols, env, basin_info_cache)
+                for j in range(emb.size(0)):
+                    all_emb.append(emb[j])
+                    all_inst_ids.append(inst_idx)
+                    all_groups.append(role)
+                    all_triplet_ids.append(t_idx)
+    if not all_emb:
+        return
+    emb_t = torch.stack(all_emb, dim=0)
+    emb_path = os.path.join(plot_dir, f"embedding_2d_{stage_prefix}_{epoch_label}.png")
+    coords = plot_embedding_2d(emb_t, instance_ids=all_inst_ids, group_labels=all_groups, method="pca", save_path=emb_path)
+    print(f"[{stage_prefix.upper()}] Saved embedding 2D to {emb_path}")
+    if wb_run is not None:
+        wandb.log({f"plot_{stage_prefix}/embedding_2d": wandb.Image(emb_path)}, step=global_step)
+    gif_path = os.path.join(plot_dir, f"embedding_2d_{stage_prefix}_{epoch_label}.gif")
+    make_triplet_gif(
+        coords=coords,
+        roles=np.asarray(all_groups, dtype=np.int64),
+        triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
+        role_label_map=role_label_map,
+        role_color_map=role_color_map,
+        title_prefix=f"{stage_prefix.upper()} record",
+        gif_path=gif_path,
+        duration=2.0,
+    )
+
+
+def _collect_s3_sim_hist(
+    pairs_by_inst: Dict[int, List[dict]],
+    instance_data_by_idx: Dict[int, dict],
+    embedder: SolutionEmbedder,
+    env: CVRPEnv,
+    basin_info_cache: Dict[str, dict],
+    batch_size: int,
+    sample_limit: int = 500,
+) -> Tuple[List[float], List[float]]:
+    """Collect pos/neg cosine similarities for S3 histogram (per-instance)."""
+    list_pos: List[float] = []
+    list_neg: List[float] = []
+    sampled = 0
+    for idx, recs in pairs_by_inst.items():
+        if sampled >= sample_limit:
+            break
+        chunk = recs[: sample_limit - sampled]
+        inst = instance_data_by_idx[idx]
+        env.load(inst["depot_xy"], inst["node_xy_demand"], basin_info_cache)
+        for i in range(0, len(chunk), batch_size):
+            sub = chunk[i : i + batch_size]
+            ea = embed_solutions(embedder, [t["anchor_solution"] for t in sub], env, basin_info_cache)
+            ep = embed_solutions(embedder, [t["positive_solution"] for t in sub], env, basin_info_cache)
+            sim_mat = torch.mm(ea, ep.t())
+            list_pos.extend(sim_mat.diag().cpu().tolist())
+            ph = [t["positive_basin_hash"] for t in sub]
+            rs = [t["reachable_basin_hashes"] for t in sub]
+            bsz = ea.size(0)
+            for ii in range(bsz):
+                for jj in range(bsz):
+                    if ii != jj and ph[jj] not in rs[ii]:
+                        list_neg.append(sim_mat[ii, jj].item())
+        sampled += len(chunk)
+    return list_pos, list_neg
 
 
 def run_stage1(
@@ -172,6 +301,8 @@ def run_stage1(
 
     optimizer = torch.optim.AdamW(embedder.parameters(), lr=args.lr1, weight_decay=args.weight_decay)
     loader, basin_data = build_loader_from_args(args, args.device)
+    total_steps_s1 = args.epochs1 * len(loader)
+    scheduler = make_lr_scheduler(optimizer, args.warmup_steps, total_steps_s1)
     env = CVRPEnv(problem_size=args.problem_size, device=args.device)
 
     # Fixed validation set for Stage 1: anchor + neighbour + 10 distant per line
@@ -227,13 +358,10 @@ def run_stage1(
                 {"val_s1/d_ap": val_d_ap, "val_s1/d_an": val_d_an, "val_s1/d_an_over_d_ap": val_ratio},
                 step=global_step,
             )
-        # plots at init
         if val_list_d_ap and val_list_d_an:
-            hist_path = os.path.join(plot_dir, f"distance_hist_s1_epoch0.png")
-            plot_distance_histogram(val_list_d_ap, val_list_d_an, save_path=hist_path)
-            print(f"[S1] Saved plot (val, init) to {hist_path}")
-            if wb_run is not None:
-                wandb.log({"plot_s1/distance_hist": wandb.Image(hist_path)}, step=global_step)
+            _log_histogram(val_list_d_ap, val_list_d_an,
+                           os.path.join(plot_dir, "distance_hist_s1_epoch0.png"), "S1",
+                           wb_run, global_step, "plot_s1/distance_hist", "plot_s1/hist_wasserstein")
         if first_triplet is not None:
             inst_idx, rec, inst = first_triplet
             basin_cache: Dict[str, dict] = {}
@@ -276,7 +404,10 @@ def run_stage1(
             tqdm(loader, desc=f"[S1] Epoch {epoch+1}/{args.epochs1}", unit="batch"), start=1
         ):
             env.load(batch.depot_xy, batch.node_xy_demand, basin_data.basin_info)
-            loss = train_one_batch(embedder, optimizer, batch, env, args.device, args.temperature)
+            loss = train_one_batch(embedder, optimizer, batch, env, args.device, args.temperature,
+                                   grad_clip=args.grad_clip)
+            if scheduler is not None:
+                scheduler.step()
 
             total_loss += loss
             n_batches += 1
@@ -304,74 +435,20 @@ def run_stage1(
                 )
 
             if val_list_d_ap and val_list_d_an:
-                hist_path = os.path.join(plot_dir, f"distance_hist_s1_epoch{epoch+1}.png")
-                plot_distance_histogram(
-                    val_list_d_ap,
-                    val_list_d_an,
-                    save_path=hist_path,
-                )
-                print(f"[S1] Saved plot (val) to {hist_path}")
-                if wb_run is not None:
-                    wandb.log({"plot_s1/distance_hist": wandb.Image(hist_path)}, step=global_step)
+                _log_histogram(val_list_d_ap, val_list_d_an,
+                               os.path.join(plot_dir, f"distance_hist_s1_epoch{epoch+1}.png"), "S1",
+                               wb_run, global_step, "plot_s1/distance_hist", "plot_s1/hist_wasserstein")
 
-            # Embedding 2D: use entire Stage-1 val set (all instances, all anchors/neighbours/distant)
             if val_s1_records:
-                basin_cache: Dict[str, dict] = {}
-                all_emb: List[torch.Tensor] = []
-                all_inst_ids: List[int] = []
-                all_groups: List[int] = []
-                all_triplet_ids: List[int] = []
-                embedder.eval()
-                with torch.no_grad():
-                    for t_idx, (inst_idx, rec) in enumerate(val_s1_records):
-                        inst = val_s1_instance_data_by_idx[inst_idx]
-                        env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
-                        # anchor
-                        emb_a = embed_solutions(embedder, [rec["anchor_solution"]], env, basin_cache)
-                        all_emb.append(emb_a.squeeze(0))
-                        all_inst_ids.append(inst_idx)
-                        all_groups.append(0)
-                        all_triplet_ids.append(t_idx)
-                        # neighbour
-                        emb_p = embed_solutions(embedder, [rec["neighbor_solution"]], env, basin_cache)
-                        all_emb.append(emb_p.squeeze(0))
-                        all_inst_ids.append(inst_idx)
-                        all_groups.append(1)
-                        all_triplet_ids.append(t_idx)
-                        # distant (may be many)
-                        if rec["distant_solutions"]:
-                            emb_d = embed_solutions(embedder, rec["distant_solutions"], env, basin_cache)
-                            for j in range(emb_d.size(0)):
-                                all_emb.append(emb_d[j])
-                                all_inst_ids.append(inst_idx)
-                                all_groups.append(2)
-                                all_triplet_ids.append(t_idx)
-                    if all_emb:
-                        emb = torch.stack(all_emb, dim=0)
-                        emb_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.png")
-                        coords = plot_embedding_2d(
-                            emb,
-                            instance_ids=all_inst_ids,
-                            group_labels=all_groups,
-                            method="pca",
-                            save_path=emb_path,
-                        )
-                        print(f"[S1] Saved plot (val, full S1 val set) to {emb_path}")
-                        if wb_run is not None:
-                            wandb.log({"plot_s1/embedding_2d": wandb.Image(emb_path)}, step=global_step)
-
-                        # GIF: 每一帧高亮一条 (anchor, neighbour, distant) 记录
-                        gif_path = os.path.join(plot_dir, f"embedding_2d_s1_epoch{epoch+1}.gif")
-                        make_triplet_gif(
-                            coords=coords,
-                            roles=np.asarray(all_groups, dtype=np.int64),
-                            triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
-                            role_label_map={0: "anchor", 1: "neighbour", 2: "distant"},
-                            role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:red"},
-                            title_prefix="S1 record",
-                            gif_path=gif_path,
-                            duration=2.0,
-                        )
+                _embed_val_triplets_2d(
+                    val_s1_records, val_s1_instance_data_by_idx,
+                    embedder, env, basin_data.basin_info,
+                    sol_keys=["anchor_solution", "neighbor_solution", "distant_solutions"],
+                    role_label_map={0: "anchor", 1: "neighbour", 2: "distant"},
+                    role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:red"},
+                    epoch_label=f"epoch{epoch+1}", stage_prefix="s1",
+                    plot_dir=plot_dir, wb_run=wb_run, global_step=global_step,
+                )
 
         avg_loss = total_loss / max(n_batches, 1)
         print(f"[S1] Epoch {epoch+1}/{args.epochs1} loss={avg_loss:.6f}")
@@ -380,7 +457,7 @@ def run_stage1(
 
         if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs1:
             ckpt_path = os.path.join(save_dir, f"s1_epoch{epoch+1}.pt")
-            torch.save({"encoder_state": embedder.encoder.state_dict(), "epoch": epoch + 1, "stage": 1}, ckpt_path)
+            torch.save({"embedder_state": embedder.state_dict(), "epoch": epoch + 1, "stage": 1}, ckpt_path)
             print(f"Saved {ckpt_path}")
 
     return global_step
@@ -443,22 +520,21 @@ def run_stage2(
         while batch_start < len(val_triplets):
             batch_items = val_triplets[batch_start : batch_start + args.batch_size2]
             batch_start += args.batch_size2
-            inst_idx = batch_items[0][0]
-            inst = val_instance_data_by_idx[inst_idx]
-            batch = TripletBatch(
-                anchor_solutions=[t["anchor_solution"] for _, t in batch_items],
-                positive_solutions=[t["positive_solution"] for _, t in batch_items],
-                negative_solutions=[t["negative_solution"] for _, t in batch_items],
-                instance_idx=inst_idx,
-                depot_xy=inst["depot_xy"],
-                node_xy_demand=inst["node_xy_demand"],
+            emb_a = embed_multi_instance(
+                embedder,
+                [(idx, t["anchor_solution"]) for idx, t in batch_items],
+                val_instance_data_by_idx, env, basin_info_cache,
             )
-            if first_batch is None:
-                first_batch = batch
-            env.load(batch.depot_xy, batch.node_xy_demand, basin_info_cache)
-            emb_a = embed_solutions(embedder, batch.anchor_solutions, env, basin_info_cache)
-            emb_p = embed_solutions(embedder, batch.positive_solutions, env, basin_info_cache)
-            emb_n = embed_solutions(embedder, batch.negative_solutions, env, basin_info_cache)
+            emb_p = embed_multi_instance(
+                embedder,
+                [(idx, t["positive_solution"]) for idx, t in batch_items],
+                val_instance_data_by_idx, env, basin_info_cache,
+            )
+            emb_n = embed_multi_instance(
+                embedder,
+                [(idx, t["negative_solution"]) for idx, t in batch_items],
+                val_instance_data_by_idx, env, basin_info_cache,
+            )
             d_ap = F.pairwise_distance(emb_a, emb_p, p=2)
             d_an = F.pairwise_distance(emb_a, emb_n, p=2)
             list_d_ap.extend(d_ap.cpu().tolist())
@@ -466,6 +542,17 @@ def run_stage2(
             mean_ap, mean_an = d_ap.mean().item(), d_an.mean().item()
             sum_ratio += mean_an / (mean_ap + 1e-8)
             n += 1
+            if first_batch is None:
+                inst_idx = batch_items[0][0]
+                inst = val_instance_data_by_idx[inst_idx]
+                first_batch = TripletBatch(
+                    anchor_solutions=[t["anchor_solution"] for _, t in batch_items],
+                    positive_solutions=[t["positive_solution"] for _, t in batch_items],
+                    negative_solutions=[t["negative_solution"] for _, t in batch_items],
+                    instance_idx=inst_idx,
+                    depot_xy=inst["depot_xy"],
+                    node_xy_demand=inst["node_xy_demand"],
+                )
         mean_d_ap = sum(list_d_ap) / len(list_d_ap) if list_d_ap else 0.0
         mean_d_an = sum(list_d_an) / len(list_d_an) if list_d_an else 0.0
         mean_ratio = sum_ratio / n if n else 0.0
@@ -484,66 +571,31 @@ def run_stage2(
                 step=global_step,
             )
         if val_list_d_ap and val_list_d_an:
-            hist_path = os.path.join(plot_dir, f"distance_hist_epoch0.png")
-            plot_distance_histogram(val_list_d_ap, val_list_d_an, save_path=hist_path)
-            print(f"[S2] Saved plot (val, init) to {hist_path}")
-            if wb_run is not None:
-                wandb.log({"plot_s2/distance_hist": wandb.Image(hist_path)}, step=global_step)
+            _log_histogram(val_list_d_ap, val_list_d_an,
+                           os.path.join(plot_dir, "distance_hist_s2_epoch0.png"), "S2",
+                           wb_run, global_step, "plot_s2/distance_hist", "plot_s2/hist_wasserstein")
         if val_triplets:
-            basin_cache: Dict[str, dict] = {}
-            all_emb: List[torch.Tensor] = []
-            all_inst_ids: List[int] = []
-            all_groups: List[int] = []
-            all_triplet_ids: List[int] = []
-            embedder.eval()
-            with torch.no_grad():
-                for t_idx, (inst_idx, rec) in enumerate(val_triplets):
-                    inst = val_instance_data_by_idx[inst_idx]
-                    env.load(inst["depot_xy"], inst["node_xy_demand"], basin_cache)
-                    sols = [
-                        rec["anchor_solution"],
-                        rec["positive_solution"],
-                        rec["negative_solution"],
-                    ]
-                    for role, sol in enumerate(sols):
-                        emb = embed_solutions(embedder, [sol], env, basin_info_cache)
-                        all_emb.append(emb.squeeze(0))
-                        all_inst_ids.append(inst_idx)
-                        all_groups.append(role)
-                        all_triplet_ids.append(t_idx)
-            if all_emb:
-                emb = torch.stack(all_emb, dim=0)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch0.png")
-                coords = plot_embedding_2d(
-                    emb,
-                    instance_ids=all_inst_ids,
-                    group_labels=all_groups,
-                    method="pca",
-                    save_path=emb_path,
-                )
-                print(f"[S2] Saved plot (val, init, full S2 val set) to {emb_path}")
-                if wb_run is not None:
-                    wandb.log({"plot_s2/embedding_2d": wandb.Image(emb_path)}, step=global_step)
-
-                gif_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch0.gif")
-                make_triplet_gif(
-                    coords=coords,
-                    roles=np.asarray(all_groups, dtype=np.int64),
-                    triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
-                    role_label_map={0: "anchor", 1: "positive", 2: "negative"},
-                    role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
-                    title_prefix="S2 triplet",
-                    gif_path=gif_path,
-                    duration=2.0,
-                )
+            _embed_val_triplets_2d(
+                val_triplets, val_instance_data_by_idx,
+                embedder, env, basin_info_cache,
+                sol_keys=["anchor_solution", "positive_solution", "negative_solution"],
+                role_label_map={0: "anchor", 1: "positive", 2: "negative"},
+                role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
+                epoch_label="epoch0", stage_prefix="s2",
+                plot_dir=plot_dir, wb_run=wb_run, global_step=global_step,
+            )
             embedder.train()
+
+    n_batches_per_epoch = (len(all_triplets) + args.batch_size2 - 1) // args.batch_size2
+    total_steps_s2 = args.epochs2 * n_batches_per_epoch
+    scheduler = make_lr_scheduler(optimizer, args.warmup_steps, total_steps_s2)
 
     for epoch in range(args.epochs2):
         random.shuffle(all_triplets)
         total_loss, total_d_ap, total_d_an, total_ratio = 0.0, 0.0, 0.0, 0.0
         n_batches = 0
 
-        pbar = tqdm(total=(len(all_triplets) + args.batch_size2 - 1) // args.batch_size2,
+        pbar = tqdm(total=n_batches_per_epoch,
                     desc=f"[S2] Epoch {epoch+1}/{args.epochs2}", unit="batch")
         batch_start = 0
 
@@ -551,30 +603,48 @@ def run_stage2(
             batch_items = all_triplets[batch_start : batch_start + args.batch_size2]
             batch_start += args.batch_size2
 
-            inst_idx = batch_items[0][0]
-            triplets_only = [item[1] for item in batch_items]
-            inst = instance_data_by_idx[inst_idx]
-            batch = TripletBatch(
-                anchor_solutions=[t["anchor_solution"] for t in triplets_only],
-                positive_solutions=[t["positive_solution"] for t in triplets_only],
-                negative_solutions=[t["negative_solution"] for t in triplets_only],
-                instance_idx=inst_idx,
-                depot_xy=inst["depot_xy"],
-                node_xy_demand=inst["node_xy_demand"],
+            embedder.train()
+            optimizer.zero_grad()
+
+            emb_a = embed_multi_instance(
+                embedder,
+                [(idx, t["anchor_solution"]) for idx, t in batch_items],
+                instance_data_by_idx, env, basin_info_cache,
+            )
+            emb_p = embed_multi_instance(
+                embedder,
+                [(idx, t["positive_solution"]) for idx, t in batch_items],
+                instance_data_by_idx, env, basin_info_cache,
+            )
+            emb_n = embed_multi_instance(
+                embedder,
+                [(idx, t["negative_solution"]) for idx, t in batch_items],
+                instance_data_by_idx, env, basin_info_cache,
             )
 
-            loss, d_ap, d_an, ratio = train_one_triplet_batch(
-                embedder, optimizer, batch, env, basin_info_cache, args.margin
-            )
+            d_ap = F.pairwise_distance(emb_a, emb_p, p=2)
+            d_an = F.pairwise_distance(emb_a, emb_n, p=2)
+            loss = F.relu(d_ap - d_an + args.margin).mean()
 
-            total_loss += loss
-            total_d_ap += d_ap
-            total_d_an += d_an
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(embedder.parameters(), args.grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            mean_d_ap = d_ap.mean().item()
+            mean_d_an = d_an.mean().item()
+            ratio = mean_d_an / (mean_d_ap + 1e-8)
+
+            total_loss += loss.item()
+            total_d_ap += mean_d_ap
+            total_d_an += mean_d_an
             total_ratio += ratio
             n_batches += 1
 
             if wb_run is not None:
-                wandb.log({"s2/step_loss": loss, "s2/step_d_ap": d_ap, "s2/step_d_an": d_an, "s2/step_d_an_over_d_ap": ratio}, step=global_step)
+                wandb.log({"s2/step_loss": loss.item(), "s2/step_d_ap": mean_d_ap, "s2/step_d_an": mean_d_an, "s2/step_d_an_over_d_ap": ratio}, step=global_step)
             pbar.update(1)
             global_step += 1
 
@@ -602,69 +672,565 @@ def run_stage2(
                     step=global_step,
                 )
 
-            # Distance histogram from fixed val set
             if val_list_d_ap and val_list_d_an:
-                hist_path = os.path.join(plot_dir, f"distance_hist_epoch{epoch+1}.png")
-                plot_distance_histogram(
-                    val_list_d_ap,
-                    val_list_d_an,
-                    save_path=hist_path,
-                )
-                print(f"[S2] Saved plot (val) to {hist_path}")
-                if wb_run is not None:
-                    wandb.log({"plot_s2/distance_hist": wandb.Image(hist_path)}, step=global_step)
+                _log_histogram(val_list_d_ap, val_list_d_an,
+                               os.path.join(plot_dir, f"distance_hist_s2_epoch{epoch+1}.png"), "S2",
+                               wb_run, global_step, "plot_s2/distance_hist", "plot_s2/hist_wasserstein")
 
-            # Embedding 2D & GIF: entire Stage-2 val set (all instances, all anchor/pos/neg)
-            basin_cache: Dict[str, dict] = {}
-            all_emb: List[torch.Tensor] = []
-            all_inst_ids: List[int] = []
-            all_groups: List[int] = []
-            all_triplet_ids: List[int] = []
-            embedder.eval()
-            with torch.no_grad():
-                for t_idx, (inst_idx, rec) in enumerate(val_triplets):
-                    inst = val_instance_data_by_idx[inst_idx]
-                    env.load(inst["depot_xy"], inst["node_xy_demand"], basin_info_cache)
-                    sols = [
-                        rec["anchor_solution"],
-                        rec["positive_solution"],
-                        rec["negative_solution"],
-                    ]
-                    for role, sol in enumerate(sols):
-                        emb = embed_solutions(embedder, [sol], env, basin_info_cache)
-                        all_emb.append(emb.squeeze(0))
-                        all_inst_ids.append(inst_idx)
-                        all_groups.append(role)
-                        all_triplet_ids.append(t_idx)
-            if all_emb:
-                emb_all = torch.stack(all_emb, dim=0)
-                emb_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.png")
-                coords = plot_embedding_2d(
-                    emb_all,
-                    instance_ids=all_inst_ids,
-                    group_labels=all_groups,
-                    method="pca",
-                    save_path=emb_path,
-                )
-                print(f"[S2] Saved plot (val, full S2 val set) to {emb_path}")
-                if wb_run is not None:
-                    wandb.log({"plot_s2/embedding_2d": wandb.Image(emb_path)}, step=global_step)
-
-                gif_path = os.path.join(plot_dir, f"embedding_2d_s2_epoch{epoch+1}.gif")
-                make_triplet_gif(
-                    coords=coords,
-                    roles=np.asarray(all_groups, dtype=np.int64),
-                    triplet_ids=np.asarray(all_triplet_ids, dtype=np.int64),
-                    role_label_map={0: "anchor", 1: "positive", 2: "negative"},
-                    role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
-                    title_prefix="S2 triplet",
-                    gif_path=gif_path,
-                    duration=2.0,
-                )
+            _embed_val_triplets_2d(
+                val_triplets, val_instance_data_by_idx,
+                embedder, env, basin_info_cache,
+                sol_keys=["anchor_solution", "positive_solution", "negative_solution"],
+                role_label_map={0: "anchor", 1: "positive", 2: "negative"},
+                role_color_map={0: "tab:blue", 1: "tab:orange", 2: "tab:green"},
+                epoch_label=f"epoch{epoch+1}", stage_prefix="s2",
+                plot_dir=plot_dir, wb_run=wb_run, global_step=global_step,
+            )
 
         if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs2:
             ckpt_path = os.path.join(save_dir, f"s2_epoch{epoch+1}.pt")
-            torch.save({"encoder_state": embedder.encoder.state_dict(), "epoch": epoch + 1, "stage": 2}, ckpt_path)
+            torch.save({"embedder_state": embedder.state_dict(), "epoch": epoch + 1, "stage": 2}, ckpt_path)
+            print(f"Saved {ckpt_path}")
+
+    return global_step
+
+
+class PmaxHead(torch.nn.Module):
+    """Predict P_max (basin certainty) from solution embedding."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(embed_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, 1),
+            torch.nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+ADVANTAGE_THRESHOLDS = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.5, 5.0, 8.0, 10.0, 25.0]
+ADVANTAGE_OVERFLOW_MIDPOINT = 35.0
+
+
+
+
+class AdvantageOrdinalHead(torch.nn.Module):
+    """CORAL-style ordinal regression for gap% = (cost_int - cost_opt) / cost_opt * 100.
+
+    Uses shared latent score + ordered biases to guarantee monotonicity:
+      logit_k = z - b_k,  b_k = cumsum(softplus(delta_k))
+    This ensures P(gap% > t_k) is non-increasing as t_k increases.
+    """
+
+    def __init__(self, embed_dim: int, n_thresholds: int = 13, hidden_dim: int = 64):
+        super().__init__()
+        self.feature_net = torch.nn.Sequential(
+            torch.nn.Linear(embed_dim, hidden_dim),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim, 1),
+        )
+        self.bias_deltas = torch.nn.Parameter(torch.zeros(n_thresholds))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        z = self.feature_net(x)  # (B, 1)
+        biases = torch.cumsum(F.softplus(self.bias_deltas), dim=0)  # (K,) non-decreasing
+        return z - biases.unsqueeze(0)  # (B, K)
+
+
+def _compute_bin_midpoints() -> List[float]:
+    """Derive bin midpoints from ADVANTAGE_THRESHOLDS automatically.
+
+    Bins: [0, t_0], (t_0, t_1], ..., (t_{K-1}, inf).
+    Midpoints: t/2 for first bin, (t_k + t_{k+1})/2, OVERFLOW for last.
+    """
+    t = ADVANTAGE_THRESHOLDS
+    mids = [t[0] / 2.0]
+    for i in range(len(t) - 1):
+        mids.append((t[i] + t[i + 1]) / 2.0)
+    mids.append(ADVANTAGE_OVERFLOW_MIDPOINT)
+    return mids
+
+
+_ADVANTAGE_BIN_MIDPOINTS = _compute_bin_midpoints()
+
+
+def ordinal_probs_to_gap_pct(probs: torch.Tensor) -> torch.Tensor:
+    """Convert cumulative ordinal probabilities to predicted gap%.
+
+    Args:
+        probs: (B, K) where probs[:, k] ≈ P(gap% > THRESHOLDS[k]).
+    Returns:
+        (B,) predicted gap% via bin midpoint expectation.
+    """
+    midpoints = torch.tensor(_ADVANTAGE_BIN_MIDPOINTS, device=probs.device, dtype=probs.dtype)
+    ones = torch.ones(probs.shape[0], 1, device=probs.device, dtype=probs.dtype)
+    zeros = torch.zeros(probs.shape[0], 1, device=probs.device, dtype=probs.dtype)
+    extended = torch.cat([ones, probs, zeros], dim=1)  # (B, K+2)
+    bin_probs = (extended[:, :-1] - extended[:, 1:]).clamp(min=0)  # (B, K+1)
+    return (bin_probs * midpoints.unsqueeze(0)).sum(dim=1)
+
+
+def run_stage3(
+    args: argparse.Namespace,
+    embedder: SolutionEmbedder,
+    save_dir: str,
+    plot_dir: str,
+    wb_run,
+    global_step: int,
+) -> int:
+    """Stage 3: InfoNCE contrastive + multi-task training. Returns updated global_step.
+
+    Data: training_data.jsonl (100-run basin distribution per intermediate solution).
+
+    Main contrastive loss: In-batch masked InfoNCE (cosine sim, masked by basin reachability).
+    Optional auxiliary heads (independently toggled):
+      - P_max regression:        --use_regression          (predict basin certainty)
+      - Advantage ordinal reg:   --quality_reg_weight > 0  (ordinal BCE on gap% bins)
+    """
+    print("\n" + "=" * 60)
+    print("Stage 3: InfoNCE Contrastive + Multi-Task Training")
+    print("=" * 60)
+
+    indices = parse_instance_indices(args.instance_indices) if args.instance_indices else [0]
+    basin_info_cache: Dict[str, dict] = {}
+    instance_data_list = load_instances_pkl(args.instance_pkl, args.device, indices, basin_info_cache)
+    instance_data_by_idx = dict(zip(indices, instance_data_list))
+    print(f"Loaded {len(instance_data_list)} instances")
+
+    env = CVRPEnv(problem_size=args.problem_size, device=args.device)
+
+    # ── Data loading (training_data.jsonl only, with disk cache) ──
+    chaotic_samples: List[Tuple[int, dict]] = []
+    td_paths = [
+        os.path.join(args.training_data_root, f"{args.instance_prefix}{idx}", "training_data.jsonl")
+        for idx in indices
+    ]
+    cache_key_dict = {
+        "td_paths": sorted(td_paths),
+        "certainty_threshold": args.certainty_threshold,
+        "seed": args.seed,
+        "max_runs": args.max_traj_runs,
+    }
+    cache_hash = hashlib.md5(repr(sorted(cache_key_dict.items())).encode()).hexdigest()[:12]
+    cache_dir = getattr(args, "s3_cache_dir", "s3_data_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"s3_pairs_{cache_hash}.pkl")
+
+    if os.path.isfile(cache_path):
+        print(f"[S3] Loading cached data from {cache_path} ...")
+        with open(cache_path, "rb") as f:
+            cached = pickle.load(f)
+        if cached.get("key") == cache_key_dict:
+            contrastive_pairs = cached["contrastive"]
+            chaotic_samples = cached["chaotic"]
+            print(f"[S3] Cache hit: {len(contrastive_pairs)} contrastive, {len(chaotic_samples)} chaotic")
+        else:
+            print("[S3] Cache key mismatch, regenerating ...")
+            cached = None
+    else:
+        cached = None
+
+    if cached is None:
+        contrastive_pairs, chaotic_samples = load_training_data_pairs(
+            td_paths,
+            certainty_threshold=args.certainty_threshold,
+            seed=args.seed,
+            max_runs=args.max_traj_runs,
+        )
+        print(f"Contrastive pairs (P_max >= {args.certainty_threshold}): {len(contrastive_pairs)}")
+        print(f"Chaotic regression samples (P_max < {args.certainty_threshold}): {len(chaotic_samples)}")
+        print(f"[S3] Saving cache to {cache_path} ...")
+        with open(cache_path, "wb") as f:
+            pickle.dump({
+                "key": cache_key_dict,
+                "contrastive": contrastive_pairs,
+                "chaotic": chaotic_samples,
+            }, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[S3] Cache saved ({os.path.getsize(cache_path) / 1024 / 1024:.1f} MB)")
+
+    if not contrastive_pairs:
+        print("[S3] No contrastive pairs found, skipping Stage 3.")
+        return global_step
+
+    # ── Model & optimizer ──
+    pmax_head: Optional[PmaxHead] = None
+    advantage_head: Optional[AdvantageOrdinalHead] = None
+    params = list(embedder.parameters())
+
+    if args.use_regression:
+        pmax_head = PmaxHead(args.embedding_dim).to(args.device)
+        params += list(pmax_head.parameters())
+        print(f"[S3] P_max regression head enabled (λ={args.regression_weight})")
+
+    if args.quality_reg_weight > 0:
+        n_thresh = len(ADVANTAGE_THRESHOLDS)
+        advantage_head = AdvantageOrdinalHead(args.embedding_dim, n_thresholds=n_thresh).to(args.device)
+        params += list(advantage_head.parameters())
+        print(f"[S3] Advantage ordinal head enabled (λ={args.quality_reg_weight}, {n_thresh} thresholds)")
+
+    print(f"[S3] InfoNCE contrastive loss (λ={args.infonce_weight}, T={args.infonce_temperature})")
+
+    optimizer = torch.optim.AdamW(params, lr=args.lr3, weight_decay=args.weight_decay)
+
+    # Group by instance: same instance per batch (consistent with S1 GroupByInstanceBatchSampler)
+    pairs_by_inst: Dict[int, List[dict]] = {}
+    for idx, rec in contrastive_pairs:
+        pairs_by_inst.setdefault(idx, []).append(rec)
+
+    chaotic_by_inst: Dict[int, List[dict]] = {}
+    for idx, rec in chaotic_samples:
+        chaotic_by_inst.setdefault(idx, []).append(rec)
+
+    if args.plot_interval > 0:
+        embedder.eval()
+        with torch.no_grad():
+            list_pos_init, list_neg_init = _collect_s3_sim_hist(
+                pairs_by_inst, instance_data_by_idx, embedder, env, basin_info_cache, args.batch_size3)
+        embedder.train()
+        if list_pos_init and list_neg_init:
+            _log_histogram(list_pos_init, list_neg_init,
+                           os.path.join(plot_dir, "sim_hist_s3_epoch0.png"), "S3",
+                           wb_run, global_step, "plot_s3/sim_hist_epoch0", "plot_s3/hist_wasserstein")
+
+    n_batches_per_epoch = sum(
+        (len(recs) + args.batch_size3 - 1) // args.batch_size3
+        for recs in pairs_by_inst.values()
+    )
+    total_steps_s3 = args.epochs3 * n_batches_per_epoch
+    scheduler = make_lr_scheduler(optimizer, args.warmup_steps, total_steps_s3)
+
+    # ── Training loop ──
+    for epoch in range(args.epochs3):
+        epoch_batches: List[Tuple[int, List[dict]]] = []
+        for idx, recs in pairs_by_inst.items():
+            random.shuffle(recs)
+            for i in range(0, len(recs), args.batch_size3):
+                epoch_batches.append((idx, recs[i:i + args.batch_size3]))
+        random.shuffle(epoch_batches)
+
+        total_infonce_loss, total_pmax_reg, total_adv_loss = 0.0, 0.0, 0.0
+        total_pos_sim, total_neg_sim = 0.0, 0.0
+        total_n_valid_neg = 0.0
+        total_anchor_cost, total_optima_cost = 0.0, 0.0
+        total_adv_gt, total_adv_pred, total_adv_mae = 0.0, 0.0, 0.0
+        total_n_over, total_n_under = 0, 0
+        total_over_amount, total_under_amount = 0.0, 0.0
+        total_n_adv_samples = 0
+        total_pmax_gt, total_pmax_pred, total_pmax_mae = 0.0, 0.0, 0.0
+        n_batches = 0
+        n_adv_batches, n_pmax_batches = 0, 0
+
+        chaotic_iters: Dict[int, int] = {}
+        for idx in chaotic_by_inst:
+            random.shuffle(chaotic_by_inst[idx])
+            chaotic_iters[idx] = 0
+
+        pbar = tqdm(total=len(epoch_batches), desc=f"[S3] Epoch {epoch+1}/{args.epochs3}", unit="batch")
+
+        for inst_idx, batch_records in epoch_batches:
+            inst = instance_data_by_idx[inst_idx]
+
+            embedder.train()
+            if pmax_head is not None:
+                pmax_head.train()
+            if advantage_head is not None:
+                advantage_head.train()
+            optimizer.zero_grad()
+
+            env.load(inst["depot_xy"], inst["node_xy_demand"], basin_info_cache)
+
+            # ── Embed anchor / positive (single instance) ──
+            emb_a = embed_solutions(embedder, [t["anchor_solution"] for t in batch_records], env, basin_info_cache)
+            emb_p = embed_solutions(embedder, [t["positive_solution"] for t in batch_records], env, basin_info_cache)
+
+            # ── InfoNCE with in-batch masked negatives (vectorized) ──
+            B = emb_a.size(0)
+            pos_hashes = [t["positive_basin_hash"] for t in batch_records]
+            reachable_sets = [t["reachable_basin_hashes"] for t in batch_records]
+
+            all_hashes: set = set(pos_hashes)
+            for rs in reachable_sets:
+                all_hashes.update(rs)
+            hash_to_id = {h: i for i, h in enumerate(all_hashes)}
+
+            pos_hash_ids = torch.tensor([hash_to_id[ph] for ph in pos_hashes], device=emb_a.device)
+            reachable_mat = torch.zeros(B, len(all_hashes), dtype=torch.bool, device=emb_a.device)
+            for i, rs in enumerate(reachable_sets):
+                for rh in rs:
+                    reachable_mat[i, hash_to_id[rh]] = True
+            valid_neg = ~reachable_mat[:, pos_hash_ids]
+            valid_neg.fill_diagonal_(False)
+
+            sim_raw = torch.mm(emb_a, emb_p.t())
+            sim = sim_raw / args.infonce_temperature
+
+            logit_mask = valid_neg.clone()
+            logit_mask.fill_diagonal_(True)
+            sim = sim.masked_fill(~logit_mask, -1e9)
+
+            labels = torch.arange(B, device=emb_a.device)
+            infonce_loss = F.cross_entropy(sim, labels)
+            loss = args.infonce_weight * infonce_loss
+            infonce_val = infonce_loss.item()
+
+            with torch.no_grad():
+                batch_n_valid_neg = valid_neg.float().sum(dim=1).mean().item()
+                batch_pos_sim = sim_raw.diag().mean().item()
+                neg_sims = sim_raw.masked_fill(~valid_neg, 0.0)
+                n_neg_total = valid_neg.float().sum()
+                batch_neg_sim = (neg_sims.sum() / n_neg_total).item() if n_neg_total > 0 else 0.0
+            total_n_valid_neg += batch_n_valid_neg
+
+            # ── P_max regression (certainty) ──
+            pmax_reg_val = 0.0
+            batch_pmax_gt, batch_pmax_pred = 0.0, 0.0
+            batch_pmax_mae = 0.0
+            if args.use_regression and pmax_head is not None and "p_max" in batch_records[0]:
+                p_max_targets = torch.tensor(
+                    [t["p_max"] for t in batch_records],
+                    dtype=torch.float32, device=emb_a.device,
+                )
+                emb_for_pmax = emb_a.detach() if not args.regression_grad_encoder else emb_a
+                p_max_pred_con = pmax_head(emb_for_pmax)
+                pmax_reg_con = F.mse_loss(p_max_pred_con, p_max_targets)
+
+                with torch.no_grad():
+                    batch_pmax_gt = p_max_targets.mean().item()
+                    batch_pmax_pred = p_max_pred_con.mean().item()
+                    batch_pmax_mae = (p_max_pred_con - p_max_targets).abs().mean().item()
+
+                pmax_reg_chaotic = torch.tensor(0.0, device=emb_a.device)
+                if inst_idx in chaotic_by_inst and chaotic_by_inst[inst_idx]:
+                    c_pool = chaotic_by_inst[inst_idx]
+                    c_start = chaotic_iters.get(inst_idx, 0)
+                    c_batch = c_pool[c_start : c_start + args.batch_size3]
+                    if not c_batch:
+                        chaotic_iters[inst_idx] = 0
+                        c_batch = c_pool[: args.batch_size3]
+                    chaotic_iters[inst_idx] = (c_start + len(c_batch)) % max(len(c_pool), 1)
+
+                    if args.regression_grad_encoder:
+                        emb_chaotic = embed_solutions(
+                            embedder, [r["anchor_solution"] for r in c_batch], env, basin_info_cache,
+                        )
+                    else:
+                        with torch.no_grad():
+                            emb_chaotic = embed_solutions(
+                                embedder, [r["anchor_solution"] for r in c_batch], env, basin_info_cache,
+                            )
+                    p_max_chaotic_t = torch.tensor(
+                        [r["p_max"] for r in c_batch],
+                        dtype=torch.float32, device=emb_chaotic.device,
+                    )
+                    emb_ch = emb_chaotic if args.regression_grad_encoder else emb_chaotic.detach()
+                    pmax_reg_chaotic = F.mse_loss(pmax_head(emb_ch), p_max_chaotic_t)
+
+                pmax_reg_total = pmax_reg_con + pmax_reg_chaotic
+                loss = loss + args.regression_weight * pmax_reg_total
+                pmax_reg_val = pmax_reg_total.item()
+                n_pmax_batches += 1
+                total_pmax_gt += batch_pmax_gt
+                total_pmax_pred += batch_pmax_pred
+                total_pmax_mae += batch_pmax_mae
+
+            # ── Advantage ordinal regression: gap% = (cost_int - cost_opt) / cost_opt * 100 ──
+            adv_val = 0.0
+            batch_gap_gt, batch_gap_pred, batch_gap_mae = 0.0, 0.0, 0.0
+            batch_anchor_cost, batch_optima_cost = 0.0, 0.0
+            batch_over_ratio, batch_under_ratio = 0.0, 0.0
+            batch_over_mean_pct, batch_under_mean_pct = 0.0, 0.0
+            if advantage_head is not None and args.quality_reg_weight > 0:
+                c_int = torch.tensor(
+                    [t["anchor_cost"] for t in batch_records],
+                    dtype=torch.float32, device=emb_a.device,
+                )
+                c_opt = torch.tensor(
+                    [t["positive_cost"] for t in batch_records],
+                    dtype=torch.float32, device=emb_a.device,
+                )
+                gap_pct = ((c_int - c_opt) / c_opt.clamp(min=1e-8) * 100.0).clamp(min=0.0)
+
+                thresholds_t = torch.tensor(
+                    ADVANTAGE_THRESHOLDS, dtype=torch.float32, device=emb_a.device,
+                ).unsqueeze(0)
+                ordinal_targets = (gap_pct.unsqueeze(1) > thresholds_t).float()
+
+                emb_for_adv = emb_a.detach() if not args.advantage_grad_encoder else emb_a
+                logits = advantage_head(emb_for_adv)
+                adv_loss = F.binary_cross_entropy_with_logits(logits, ordinal_targets)
+                loss = loss + args.quality_reg_weight * adv_loss
+                adv_val = adv_loss.item()
+
+                with torch.no_grad():
+                    probs = torch.sigmoid(logits)
+                    pred_gap = ordinal_probs_to_gap_pct(probs)
+                    batch_anchor_cost = c_int.mean().item()
+                    batch_optima_cost = c_opt.mean().item()
+                    batch_gap_gt = gap_pct.mean().item()
+                    batch_gap_pred = pred_gap.mean().item()
+                    batch_gap_mae = (pred_gap - gap_pct).abs().mean().item()
+
+                    over_mask = pred_gap > gap_pct
+                    under_mask = pred_gap < gap_pct
+                    n_b = pred_gap.numel()
+                    n_over = over_mask.sum().item()
+                    n_under = under_mask.sum().item()
+                    batch_over_ratio = n_over / n_b if n_b else 0.0
+                    batch_under_ratio = n_under / n_b if n_b else 0.0
+                    batch_over_mean_pct = (pred_gap[over_mask] - gap_pct[over_mask]).mean().item() if n_over > 0 else 0.0
+                    batch_under_mean_pct = (gap_pct[under_mask] - pred_gap[under_mask]).mean().item() if n_under > 0 else 0.0
+
+                    total_n_adv_samples += n_b
+                    total_n_over += n_over
+                    total_n_under += n_under
+                    total_over_amount += (pred_gap[over_mask] - gap_pct[over_mask]).sum().item()
+                    total_under_amount += (gap_pct[under_mask] - pred_gap[under_mask]).sum().item()
+                n_adv_batches += 1
+                total_anchor_cost += batch_anchor_cost
+                total_optima_cost += batch_optima_cost
+                total_adv_gt += batch_gap_gt
+                total_adv_pred += batch_gap_pred
+                total_adv_mae += batch_gap_mae
+
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            total_infonce_loss += infonce_val
+            total_pos_sim += batch_pos_sim
+            total_neg_sim += batch_neg_sim
+            total_pmax_reg += pmax_reg_val
+            total_adv_loss += adv_val
+            n_batches += 1
+
+            if n_batches % 10 == 0:
+                msg = (
+                    f"[S3 Epoch {epoch+1}] batch {n_batches} "
+                    f"infonce={infonce_val:.6f} pos_sim={batch_pos_sim:.4f} neg_sim={batch_neg_sim:.4f} n_neg={batch_n_valid_neg:.1f}\n"
+                )
+                if args.use_regression and pmax_head is not None:
+                    msg += f" pmax_loss={pmax_reg_val:.6f} pmax_gt={batch_pmax_gt:.3f} pmax_pred={batch_pmax_pred:.3f}\n"
+                if args.quality_reg_weight > 0 and advantage_head is not None:
+                    msg += f" adv_bce={adv_val:.6f} gap_gt={batch_gap_gt:.3f}% gap_pred={batch_gap_pred:.3f}%\n"
+                print(msg)
+
+            if wb_run is not None:
+                log_dict = {
+                    "s3/step_infonce_loss": infonce_val,
+                    "s3/step_pos_sim": batch_pos_sim,
+                    "s3/step_neg_sim": batch_neg_sim,
+                    "s3/step_n_valid_neg": batch_n_valid_neg,
+                }
+                if args.use_regression:
+                    log_dict["s3/step_pmax_loss"] = pmax_reg_val
+                    log_dict["s3/step_pmax_gt"] = batch_pmax_gt
+                    log_dict["s3/step_pmax_pred"] = batch_pmax_pred
+                    log_dict["s3/step_pmax_mae"] = batch_pmax_mae
+                if args.quality_reg_weight > 0:
+                    log_dict["s3/step_adv_loss"] = adv_val
+                    log_dict["s3/step_anchor_cost"] = batch_anchor_cost
+                    log_dict["s3/step_optima_cost"] = batch_optima_cost
+                    log_dict["s3/step_gap_gt_pct"] = batch_gap_gt
+                    log_dict["s3/step_gap_pred_pct"] = batch_gap_pred
+                    log_dict["s3/step_gap_mae_pct"] = batch_gap_mae
+                    log_dict["s3/step_over_ratio"] = batch_over_ratio
+                    log_dict["s3/step_under_ratio"] = batch_under_ratio
+                    log_dict["s3/step_over_mean_pct"] = batch_over_mean_pct
+                    log_dict["s3/step_under_mean_pct"] = batch_under_mean_pct
+                wandb.log(log_dict, step=global_step)
+            pbar.update(1)
+            global_step += 1
+
+        pbar.close()
+        n = max(n_batches, 1)
+        parts = [
+            f"[S3] Epoch {epoch+1}/{args.epochs3}",
+            f"infonce={total_infonce_loss/n:.6f}",
+            f"pos_sim={total_pos_sim/n:.4f} neg_sim={total_neg_sim/n:.4f} n_neg={total_n_valid_neg/n:.1f}",
+        ]
+        if args.use_regression and n_pmax_batches > 0:
+            np_ = n_pmax_batches
+            parts.append(
+                f"pmax_loss={total_pmax_reg/n:.6f} "
+                f"pmax_gt={total_pmax_gt/np_:.3f} pred={total_pmax_pred/np_:.3f} mae={total_pmax_mae/np_:.4f}"
+            )
+        if args.quality_reg_weight > 0 and n_adv_batches > 0:
+            na = n_adv_batches
+            n_adv = max(total_n_adv_samples, 1)
+            over_ratio = total_n_over / n_adv
+            under_ratio = total_n_under / n_adv
+            over_mean_pct = total_over_amount / max(total_n_over, 1)
+            under_mean_pct = total_under_amount / max(total_n_under, 1)
+            parts.append(
+                f"adv_bce={total_adv_loss/n:.6f} "
+                f"gap_gt={total_adv_gt/na:.3f}% pred={total_adv_pred/na:.3f}% mae={total_adv_mae/na:.3f}% "
+                f"over_ratio={over_ratio:.3f} over_mean={over_mean_pct:.3f}% "
+                f"under_ratio={under_ratio:.3f} under_mean={under_mean_pct:.3f}% "
+                f"cost_int={total_anchor_cost/na:.1f} cost_opt={total_optima_cost/na:.1f}"
+            )
+        print(" ".join(parts))
+
+        if wb_run is not None:
+            log_dict = {
+                "s3/epoch_infonce_loss": total_infonce_loss / n,
+                "s3/epoch_pos_sim": total_pos_sim / n,
+                "s3/epoch_neg_sim": total_neg_sim / n,
+                "s3/epoch_n_valid_neg": total_n_valid_neg / n,
+            }
+            if args.use_regression and n_pmax_batches > 0:
+                np_ = n_pmax_batches
+                log_dict.update({
+                    "s3/epoch_pmax_loss": total_pmax_reg / n,
+                    "s3/epoch_pmax_gt": total_pmax_gt / np_,
+                    "s3/epoch_pmax_pred": total_pmax_pred / np_,
+                    "s3/epoch_pmax_mae": total_pmax_mae / np_,
+                })
+            if args.quality_reg_weight > 0 and n_adv_batches > 0:
+                na = n_adv_batches
+                n_adv = max(total_n_adv_samples, 1)
+                log_dict.update({
+                    "s3/epoch_adv_bce": total_adv_loss / n,
+                    "s3/epoch_anchor_cost": total_anchor_cost / na,
+                    "s3/epoch_optima_cost": total_optima_cost / na,
+                    "s3/epoch_gap_gt_pct": total_adv_gt / na,
+                    "s3/epoch_gap_pred_pct": total_adv_pred / na,
+                    "s3/epoch_gap_mae_pct": total_adv_mae / na,
+                    "s3/epoch_over_ratio": total_n_over / n_adv,
+                    "s3/epoch_under_ratio": total_n_under / n_adv,
+                    "s3/epoch_over_mean_pct": total_over_amount / max(total_n_over, 1),
+                    "s3/epoch_under_mean_pct": total_under_amount / max(total_n_under, 1),
+                })
+            wandb.log(log_dict, step=global_step)
+
+        if (epoch + 1) % args.plot_interval == 0:
+            embedder.eval()
+            with torch.no_grad():
+                list_pos_sim, list_neg_sim = _collect_s3_sim_hist(
+                    pairs_by_inst, instance_data_by_idx, embedder, env, basin_info_cache, args.batch_size3)
+            embedder.train()
+            if list_pos_sim and list_neg_sim:
+                _log_histogram(list_pos_sim, list_neg_sim,
+                               os.path.join(plot_dir, f"sim_hist_s3_epoch{epoch+1}.png"), "S3",
+                               wb_run, global_step, "plot_s3/sim_hist", "plot_s3/hist_wasserstein")
+
+        if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == args.epochs3:
+            ckpt_path = os.path.join(save_dir, f"s3_epoch{epoch+1}.pt")
+            save_dict = {
+                "embedder_state": embedder.state_dict(),
+                "epoch": epoch + 1,
+                "stage": 3,
+            }
+            if pmax_head is not None:
+                save_dict["pmax_head_state"] = pmax_head.state_dict()
+            if advantage_head is not None:
+                save_dict["advantage_head_state"] = advantage_head.state_dict()
+            torch.save(save_dict, ckpt_path)
             print(f"Saved {ckpt_path}")
 
     return global_step
@@ -704,17 +1270,24 @@ def trainer(args: argparse.Namespace) -> None:
     # Load checkpoint if provided (for stage 2 only mode)
     if args.load_checkpoint:
         ckpt = torch.load(args.load_checkpoint, map_location=args.device)
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        if "embedder_state" in ckpt:
+            embedder.load_state_dict(ckpt["embedder_state"])
+        elif "encoder_state" in ckpt:
+            embedder.encoder.load_state_dict(ckpt["encoder_state"])
+            print("WARNING: legacy checkpoint has encoder_state only; pos_encoder weights are randomly initialized")
         print(f"Loaded checkpoint: {args.load_checkpoint} (epoch {ckpt.get('epoch', '?')}, stage {ckpt.get('stage', '?')})")
 
     global_step = 0
 
     # Run stages
-    if args.stage in ("1", "both"):
+    if args.stage in ("1", "both", "all"):
         global_step = run_stage1(args, embedder, save_dir, plot_dir, wb_run, global_step)
 
-    if args.stage in ("2", "both"):
+    if args.stage in ("2", "both", "all"):
         global_step = run_stage2(args, embedder, save_dir, plot_dir, wb_run, global_step)
+
+    if args.stage in ("3", "all"):
+        global_step = run_stage3(args, embedder, save_dir, plot_dir, wb_run, global_step)
 
     if wb_run is not None:
         wandb.finish()
@@ -743,7 +1316,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_l2_normalize", action="store_true", default=True, help="L2-normalize pooled embeddings in SolutionEmbedder.forward (default: True).")
 
     # stage selection
-    parser.add_argument("--stage", type=str, choices=["1", "2", "both"], default="both", help="Training stage: 1=InfoNCE only, 2=Triplet only, both=run stage1 then stage2.")
+    parser.add_argument("--stage", type=str, choices=["1", "2", "3", "both", "all"], default="both", help="Training stage: 1/2/3=single stage, both=S1+S2, all=S1+S2+S3.")
     parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load before training.")
 
     # stage 1 specific
@@ -758,13 +1331,31 @@ if __name__ == "__main__":
     parser.add_argument("--epochs2", type=int, default=100, help="Epochs for stage 2.")
     parser.add_argument("--batch_size2", type=int, default=128, help="Batch size for stage 2.")
     parser.add_argument("--lr2", type=float, default=5e-5, help="Learning rate for stage 2.")
-    parser.add_argument("--margin", type=float, default=0.1, help="Triplet margin (stage 2).")
+    parser.add_argument("--margin", type=float, default=0.1, help="Triplet margin (stage 2). With L2-normalized embeddings, max distance is 2.0.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW (both stages).")
     parser.add_argument("--perturb_root", type=str, default="perturb_k1_collect", help="Root dir for perturb_data.jsonl files (stage 2).")
     parser.add_argument("--val_data_1a1n10d", type=str, default="/home/jieyi/cuopt/basin_datasets0_analyze/val_data_1a1n10d.jsonl", help="Stage-1 fixed validation set (anchor, neighbour, 10 distant basins).")
     parser.add_argument("--val_data_1p1n", type=str, default="/home/jieyi/cuopt/perturb_k1_collect/val_data_1p1n.jsonl", help="Fixed validation set for stage 2 (1 anchor, 1 positive, 1 negative per line); instance_index maps to pkl.")
 
+    # stage 3 specific
+    parser.add_argument("--epochs3", type=int, default=50, help="Epochs for stage 3.")
+    parser.add_argument("--batch_size3", type=int, default=128, help="Batch size for stage 3.")
+    parser.add_argument("--lr3", type=float, default=5e-5, help="Learning rate for stage 3.")
+    parser.add_argument("--max_traj_runs", type=int, default=10, help="Max runs to load per instance from training_data.jsonl (stage 3).")
+    parser.add_argument("--training_data_root", type=str, default="basin_datasets0_analyze", help="Root dir for training_data.jsonl files.")
+    parser.add_argument("--s3_cache_dir", type=str, default="s3_data_cache", help="Dir to cache Stage 3 processed pairs (avoids re-parsing on repeated runs).")
+    parser.add_argument("--certainty_threshold", type=float, default=0.8, help="P_max >= this -> contrastive pair; below -> regression only.")
+    parser.add_argument("--use_regression", action="store_true", help="Enable Task 2: regress P_max from embedding.")
+    parser.add_argument("--regression_weight", type=float, default=1.0, help="Lambda weight for regression loss.")
+    parser.add_argument("--regression_grad_encoder", action="store_true", help="Let regression loss backprop into encoder (default: detach).")
+    parser.add_argument("--infonce_weight", type=float, default=1.0, help="Lambda for InfoNCE contrastive loss (stage 3).")
+    parser.add_argument("--infonce_temperature", type=float, default=0.07, help="Temperature for InfoNCE loss (stage 3). Independent from --temperature (stage 1).")
+    parser.add_argument("--quality_reg_weight", type=float, default=0.0, help="Lambda for advantage ordinal BCE loss: predict gap%% bins. 0=disabled.")
+    parser.add_argument("--advantage_grad_encoder", action="store_true", help="Let advantage loss backprop into encoder (default: detach).")
+
     # common
+    parser.add_argument("--warmup_steps", type=int, default=0, help="LR warmup steps then cosine decay. 0=no scheduling.")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Max gradient norm for clipping. 0=disabled.")
     parser.add_argument("--gpu_id", type=str, default="0", help="GPU ID.")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed.")
     parser.add_argument("--save", type=str, default="out", help="Root dir for checkpoints.")

@@ -23,8 +23,8 @@ SPHINXPROJ    = cuOpt
 SOURCEDIR     = source
 BUILDDIR      = build
 
-# Default target: build documentation and run link check
-all: html linkcheck
+# Default target: build HTML only (run 'make linkcheck' separately to check links)
+all: html
 
 # Build HTML documentation
 html:

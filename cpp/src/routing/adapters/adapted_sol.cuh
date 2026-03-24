@@ -30,6 +30,10 @@
 
 #include <raft/util/cudart_utils.hpp>
 
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
 namespace cuopt::routing::detail {
 
 static inline infeasible_cost_t get_cuopt_cost(costs cpu_cost)
@@ -247,7 +251,21 @@ struct adapted_sol_t {
     return success;
   }
 
-  double calculate_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  static bool use_landscape_similarity_metric()
+  {
+    const char* metric = std::getenv("CUOPT_DIVERSITY_METRIC");
+    return metric != nullptr && std::strcmp(metric, "landscape") == 0;
+  }
+
+  static double get_landscape_similarity_tau()
+  {
+    const char* value = std::getenv("CUOPT_LANDSCAPE_DISTANCE_TAU");
+    if (value == nullptr) { return 0.15; }
+    const double tau = std::atof(value);
+    return std::max(tau, 1e-6);
+  }
+
+  double calculate_legacy_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
   {
     // always do symmetric measure if it is a CVRP or if there are unserviced nodes
     if (problem->is_tsp || problem->is_cvrp() || this->has_unserviced_nodes ||
@@ -257,6 +275,22 @@ struct adapted_sol_t {
     }
 
     return calculate_similarity_radius_asymetric(second);
+  }
+
+  double calculate_landscape_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  {
+    // This is the A-scheme conversion point: distance -> similarity.
+    // Replace the proxy distance with model distance when model inference is wired in C++.
+    const double proxy_similarity = calculate_legacy_similarity_radius(second);
+    const double proxy_distance   = 1.0 - proxy_similarity;
+    const double tau              = get_landscape_similarity_tau();
+    return std::exp(-proxy_distance / tau);
+  }
+
+  double calculate_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  {
+    if (use_landscape_similarity_metric()) { return calculate_landscape_similarity_radius(second); }
+    return calculate_legacy_similarity_radius(second);
   }
 
   double calculate_similarity_radius_asymetric(const adapted_sol_t<i_t, f_t, REQUEST>& second) const

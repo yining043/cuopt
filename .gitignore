@@ -76,6 +76,7 @@ perturb_k1_collect/
 *.txt
 *.xlsx
 *.jsonl
+*.gif
 
 # docs
 docs/cuopt/source/cuopt-c/lp-milp/cuopt-cli-help.txt

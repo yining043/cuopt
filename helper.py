@@ -44,15 +44,14 @@ def dummify(input: torch.Tensor, dummy_size: int, dim: int = 1) -> torch.Tensor:
 
 def solution_flat_to_solution(solution_flat: List[int]) -> List[int]:
     """Convert basin `solution_flat` to a route-like visit sequence with depot=0."""
-    customer_count = int(solution_flat[0]) - 1
-    mapped = [0 if int(x) > customer_count else int(x) for x in solution_flat]
-    seq = [0] + mapped + [0]
-    out: List[int] = []
-    for x in seq:
-        if x == 0 and out and out[-1] == 0:
-            continue
-        out.append(x)
-    return out
+    arr = np.asarray(solution_flat, dtype=np.int64)
+    customer_count = int(arr[0]) - 1
+    mapped = np.where(arr > customer_count, 0, arr)
+    seq = np.concatenate([[0], mapped, [0]])
+    # Drop 0 when previous element is 0 (remove consecutive duplicate zeros)
+    keep = np.ones(len(seq), dtype=bool)
+    keep[1:] = (seq[:-1] != 0) | (seq[1:] != 0)
+    return seq[keep].tolist()
 
 
 def hamming_distance(solution_a: List[int], solution_b: List[int]) -> int:
@@ -95,15 +94,24 @@ def _routes_to_adjacent_pairs(routes: List[List[int]]) -> Set[Tuple[int, int]]:
     return pairs
 
 
+def solution_to_pairs(solution: List[int]) -> Set[Tuple[int, int]]:
+    """Route-like solution -> set of adjacent (undirected) pairs. For caching in structure early stop."""
+    return _routes_to_adjacent_pairs(solution_to_routes(solution))
+
+
 def broken_pairs_ratio(solution_a: List[int], solution_b: List[int]) -> float:
     """
     Broken pairs ratio: fraction of adjacent pairs in solution_a that are not adjacent in solution_b.
     In [0, 1]; 0 = identical structure, 1 = no shared adjacent pairs.
     """
-    routes_a = solution_to_routes(solution_a)
-    routes_b = solution_to_routes(solution_b)
-    pairs_a = _routes_to_adjacent_pairs(routes_a)
-    pairs_b = _routes_to_adjacent_pairs(routes_b)
+    pairs_a = solution_to_pairs(solution_a)
+    pairs_b = solution_to_pairs(solution_b)
+    broken = pairs_a - pairs_b
+    return len(broken) / len(pairs_a) if pairs_a else 0.0
+
+
+def broken_pairs_ratio_from_pairs(pairs_a: Set[Tuple[int, int]], pairs_b: Set[Tuple[int, int]]) -> float:
+    """Ratio when pairs are precomputed (avoids repeated solution_to_routes)."""
     broken = pairs_a - pairs_b
     return len(broken) / len(pairs_a) if pairs_a else 0.0
 

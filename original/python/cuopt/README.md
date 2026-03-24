@@ -1,1 +1,0 @@
-cuOpt - GPU Combinatorial Optimization

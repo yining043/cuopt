@@ -145,6 +145,9 @@ class SolutionEmbedder(nn.Module):
         self.pos_encoder = MultiHeadPosCompat(self.embedding_dim, self.head_num, qkv_dim)
         # Whether to L2-normalize pooled embeddings
         self.use_l2_normalize: bool = bool(model_params.get("use_l2_normalize", False))
+        # Cache position encoding pattern by n_position (CPU); then per-device to avoid .to(device) copy
+        self._pos_pattern_cache: dict = {}
+        self._pos_pattern_on_device: dict = {}
 
     def basesin(self, x, T, fai=0):
         return np.sin(2 * np.pi / T * np.abs(np.mod(x, 2 * T) - T) + fai)
@@ -153,6 +156,9 @@ class SolutionEmbedder(nn.Module):
         return np.cos(2 * np.pi / T * np.abs(np.mod(x, 2 * T) - T) + fai)
 
     def cyclic_position_encoding_pattern(self, n_position, emb_dim, mean_pooling=True):
+        cache_key = (n_position, emb_dim, mean_pooling)
+        if cache_key in self._pos_pattern_cache:
+            return self._pos_pattern_cache[cache_key]
 
         Td_set = np.linspace(np.power(n_position, 1 / (emb_dim // 2)), n_position, emb_dim // 2, dtype='int')
         x = np.zeros((n_position, emb_dim))
@@ -180,8 +186,19 @@ class SolutionEmbedder(nn.Module):
             index = (arange + i + n_position) % n_position
             pattern_sum += pattern.gather(0, index.view(-1, 1).expand_as(pattern))
         pattern = 1. / time * pattern_sum - pattern.mean(0)
-
+        self._pos_pattern_cache[cache_key] = pattern
         return pattern
+
+    def _get_pos_pattern_on_device(self, n_position: int, device: torch.device) -> torch.Tensor:
+        """Return position pattern on the given device; use per-device cache to avoid repeated .to(device)."""
+        cache_key = (n_position, self.embedding_dim, True)
+        device_key = (*cache_key, device)
+        if device_key in self._pos_pattern_on_device:
+            return self._pos_pattern_on_device[device_key]
+        base = self.cyclic_position_encoding_pattern(n_position, self.embedding_dim)
+        on_dev = base.to(device, non_blocking=True)
+        self._pos_pattern_on_device[device_key] = on_dev
+        return on_dev
 
     def _position_encoding(self, base: torch.Tensor, embedding_dim: int, order_vector: torch.Tensor) -> torch.Tensor:
         batch_size, seq_length = order_vector.size()
@@ -193,8 +210,8 @@ class SolutionEmbedder(nn.Module):
         visited_time, depot_feature, node_feature = env.get_dynamic_feature(context)
         _, solution_size = visited_time.size()
 
-        # positional features encoding (cyclic position encoding)
-        pattern = self.cyclic_position_encoding_pattern(solution_size, self.embedding_dim).to(visited_time.device)
+        # positional features encoding (cyclic position encoding); use device cache to avoid .to() every time
+        pattern = self._get_pos_pattern_on_device(solution_size, visited_time.device)
         h_pos = self._position_encoding(pattern, self.embedding_dim, visited_time)
         aux_scores = self.pos_encoder(h_pos) # (B, N+dummy, E)
 
@@ -204,5 +221,8 @@ class SolutionEmbedder(nn.Module):
         # mean pooling; optional L2 normalization controlled by model_params["use_l2_normalize"]
         pooled = h.mean(dim=1)  # (B, E)
         if self.use_l2_normalize:
-            return F.normalize(pooled, p=2, dim=-1)
-        return pooled
+            out = F.normalize(pooled, p=2, dim=-1)
+        else:
+            out = pooled
+        # Clone so CUDA graph / torch.compile reuse does not overwrite the returned buffer
+        return out.clone()

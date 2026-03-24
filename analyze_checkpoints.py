@@ -69,6 +69,23 @@ def embed_solutions(
     return emb
 
 
+def _get_encoder_state(ckpt: dict) -> Optional[Dict[str, torch.Tensor]]:
+    """Extract encoder-only state dict from either new (embedder_state) or legacy (encoder_state) format."""
+    if "embedder_state" in ckpt:
+        prefix = "encoder."
+        return {k[len(prefix):]: v for k, v in ckpt["embedder_state"].items() if k.startswith(prefix)}
+    return ckpt.get("encoder_state")
+
+
+def _load_embedder(embedder: SolutionEmbedder, ckpt: dict) -> None:
+    """Load weights into embedder from either new (embedder_state) or legacy (encoder_state) format."""
+    if "embedder_state" in ckpt:
+        embedder.load_state_dict(ckpt["embedder_state"])
+    elif "encoder_state" in ckpt:
+        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        print("WARNING: legacy checkpoint has encoder_state only; pos_encoder weights are randomly initialized")
+
+
 def build_model(
     args: argparse.Namespace,
     device: torch.device,
@@ -669,8 +686,8 @@ def analyze_stage1(args: argparse.Namespace, device: torch.device) -> None:
     for ckpt_path in ckpts:
         print(f"[S1] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+        _load_embedder(embedder, ckpt)
 
         mean_d_ap, mean_d_ad, ratio, d_ap_list, d_ad_list, first_triplet = eval_stage1_on_val(
             embedder, env, val_records, val_instance_data_by_idx, device
@@ -790,8 +807,8 @@ def analyze_stage2(args: argparse.Namespace, device: torch.device) -> None:
     for ckpt_path in ckpts:
         print(f"[S2] Analyzing {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+        _load_embedder(embedder, ckpt)
 
         mean_d_ap, mean_d_an, ratio, d_ap_list, d_an_list, first_batch = eval_stage2_on_val(
             embedder, env, val_triplets, val_instance_data_by_idx, device, args.batch_size2
@@ -1137,8 +1154,8 @@ def analyze_trajectory_embedding(args: argparse.Namespace, device: torch.device)
         stage, epoch = parse_stage_epoch(base)
         print(f"[Trajectory] Epoch {base}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+        _load_embedder(embedder, ckpt)
         embedder.eval()
 
         with torch.no_grad():
@@ -1648,8 +1665,8 @@ def analyze_multi_run_diversity(args: argparse.Namespace, device: torch.device) 
         base = os.path.splitext(os.path.basename(ckpt_path))[0]
         print(f"[MultiRunDiv] Checkpoint {base}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+        _load_embedder(embedder, ckpt)
         embedder.eval()
 
         # Embed all runs, track per-run ranges
@@ -1905,8 +1922,8 @@ def analyze_run_trajectory_embedding(args: argparse.Namespace, device: torch.dev
         base = os.path.splitext(os.path.basename(ckpt_path))[0]
         print(f"[RunTrajectory] Checkpoint {base}")
         ckpt = torch.load(ckpt_path, map_location=device)
-        embedder = build_model(args, device, encoder_state=ckpt.get("encoder_state"))
-        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        embedder = build_model(args, device, encoder_state=_get_encoder_state(ckpt))
+        _load_embedder(embedder, ckpt)
         embedder.eval()
 
         with torch.no_grad():

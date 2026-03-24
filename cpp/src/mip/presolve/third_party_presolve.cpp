@@ -340,7 +340,6 @@ void set_presolve_methods(papilo::Presolve<f_t>& presolver,
   presolver.addPresolveMethod(uptr(new papilo::SingletonStuffing<f_t>()));
   presolver.addPresolveMethod(uptr(new papilo::DualFix<f_t>()));
   presolver.addPresolveMethod(uptr(new papilo::SimplifyInequalities<f_t>()));
-  presolver.addPresolveMethod(uptr(new papilo::CliqueMerging<f_t>()));
 
   // exhaustive presolvers
   presolver.addPresolveMethod(uptr(new papilo::ImplIntDetection<f_t>()));
