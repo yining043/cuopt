@@ -1,0 +1,539 @@
+[Device] Using cuda
+[Callback] Loading CostPredictor model from outputs/regression_20260311_204007/checkpoint_epoch_290.pt
+[search #0] N_nodes_w_dummy: 1085, N_nodes: 1022
+[callback] selected trial #35
+[iter #0] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 707 ms
+[executed] cost before: 13784.838159, cost after: 13337.559137, move_found: 1
+
+[callback] selected trial #30
+[iter #1] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 477 ms
+[executed] cost before: 13337.559137, cost after: 12799.971866, move_found: 1
+
+[callback] selected trial #78
+[iter #2] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 527 ms
+[executed] cost before: 12799.971866, cost after: 12365.946510, move_found: 1
+
+[callback] selected trial #28
+[iter #3] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 598 ms
+[executed] cost before: 12365.946510, cost after: 11814.267395, move_found: 1
+
+[callback] selected trial #92
+[iter #4] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 440 ms
+[executed] cost before: 11814.267395, cost after: 11504.669344, move_found: 1
+
+[callback] selected trial #36
+[iter #5] size of base nodes to search: 1084, size of h_nodes_to_search: 23
+offset: 443 ms
+[executed] cost before: 11504.669344, cost after: 11275.773733, move_found: 1
+
+[callback] selected trial #47
+[iter #6] size of base nodes to search: 1084, size of h_nodes_to_search: 27
+offset: 437 ms
+[executed] cost before: 11275.773733, cost after: 10742.185931, move_found: 1
+
+[callback] selected trial #80
+[iter #7] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 453 ms
+[executed] cost before: 10742.185931, cost after: 10483.738907, move_found: 1
+
+[callback] selected trial #78
+[iter #8] size of base nodes to search: 1084, size of h_nodes_to_search: 20
+offset: 452 ms
+[executed] cost before: 10483.738907, cost after: 10179.336464, move_found: 1
+
+[callback] selected trial #60
+[iter #9] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 445 ms
+[executed] cost before: 10179.336464, cost after: 9868.327348, move_found: 1
+
+[callback] selected trial #56
+[iter #10] size of base nodes to search: 1084, size of h_nodes_to_search: 22
+offset: 434 ms
+[executed] cost before: 9868.327348, cost after: 9613.699228, move_found: 1
+
+[callback] selected trial #45
+[iter #11] size of base nodes to search: 1084, size of h_nodes_to_search: 21
+offset: 441 ms
+[executed] cost before: 9613.699228, cost after: 9322.982919, move_found: 1
+
+[callback] selected trial #6
+[iter #12] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 432 ms
+[executed] cost before: 9322.982919, cost after: 9110.189960, move_found: 1
+
+[callback] selected trial #38
+[iter #13] size of base nodes to search: 1084, size of h_nodes_to_search: 22
+offset: 443 ms
+[executed] cost before: 9110.189960, cost after: 8930.445425, move_found: 1
+
+[callback] selected trial #41
+[iter #14] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 437 ms
+[executed] cost before: 8930.445425, cost after: 8756.404284, move_found: 1
+
+[callback] selected trial #25
+[iter #15] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 444 ms
+[executed] cost before: 8756.404284, cost after: 8593.683553, move_found: 1
+
+[callback] selected trial #87
+[iter #16] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 443 ms
+[executed] cost before: 8593.683553, cost after: 8407.620679, move_found: 1
+
+[callback] selected trial #59
+[iter #17] size of base nodes to search: 1084, size of h_nodes_to_search: 20
+offset: 437 ms
+[executed] cost before: 8407.620679, cost after: 8240.459480, move_found: 1
+
+[callback] selected trial #62
+[iter #18] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 441 ms
+[executed] cost before: 8240.459480, cost after: 8056.968801, move_found: 1
+
+[callback] selected trial #90
+[iter #19] size of base nodes to search: 1084, size of h_nodes_to_search: 20
+offset: 442 ms
+[executed] cost before: 8056.968801, cost after: 7870.830909, move_found: 1
+
+[callback] selected trial #99
+[iter #20] size of base nodes to search: 1084, size of h_nodes_to_search: 21
+offset: 433 ms
+[executed] cost before: 7870.830909, cost after: 7748.494059, move_found: 1
+
+[callback] selected trial #5
+[iter #21] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 435 ms
+[executed] cost before: 7748.494059, cost after: 7591.172224, move_found: 1
+
+[callback] selected trial #46
+[iter #22] size of base nodes to search: 1084, size of h_nodes_to_search: 24
+offset: 432 ms
+[executed] cost before: 7591.172224, cost after: 7494.185956, move_found: 1
+
+[callback] selected trial #20
+[iter #23] size of base nodes to search: 1084, size of h_nodes_to_search: 19
+offset: 444 ms
+[executed] cost before: 7494.185956, cost after: 7358.784244, move_found: 1
+
+[callback] selected trial #92
+[iter #24] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 435 ms
+[executed] cost before: 7358.784244, cost after: 7253.229460, move_found: 1
+
+[callback] selected trial #75
+[iter #25] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 442 ms
+[executed] cost before: 7253.229460, cost after: 7138.670153, move_found: 1
+
+[callback] selected trial #47
+[iter #26] size of base nodes to search: 1084, size of h_nodes_to_search: 21
+offset: 447 ms
+[executed] cost before: 7138.670153, cost after: 6963.140295, move_found: 1
+
+[callback] selected trial #62
+[iter #27] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 436 ms
+[executed] cost before: 6963.140295, cost after: 6865.591789, move_found: 1
+
+[callback] selected trial #64
+[iter #28] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 430 ms
+[executed] cost before: 6865.591789, cost after: 6771.258643, move_found: 1
+
+[callback] selected trial #92
+[iter #29] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 440 ms
+[executed] cost before: 6771.258643, cost after: 6654.901098, move_found: 1
+
+[callback] selected trial #0
+[iter #30] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 431 ms
+[executed] cost before: 6654.901098, cost after: 6520.529732, move_found: 1
+
+[callback] selected trial #66
+[iter #31] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 432 ms
+[executed] cost before: 6520.529732, cost after: 6453.154111, move_found: 1
+
+[callback] selected trial #64
+[iter #32] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 429 ms
+[executed] cost before: 6453.154111, cost after: 6390.030541, move_found: 1
+
+[callback] selected trial #64
+[iter #33] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 429 ms
+[executed] cost before: 6390.030541, cost after: 6260.629143, move_found: 1
+
+[callback] selected trial #67
+[iter #34] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 427 ms
+[executed] cost before: 6260.629143, cost after: 6172.455033, move_found: 1
+
+[callback] selected trial #4
+[iter #35] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 426 ms
+[executed] cost before: 6172.455033, cost after: 6116.322040, move_found: 1
+
+[callback] selected trial #83
+[iter #36] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 430 ms
+[executed] cost before: 6116.322040, cost after: 6068.328202, move_found: 1
+
+[callback] selected trial #56
+[iter #37] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 426 ms
+[executed] cost before: 6068.328202, cost after: 5962.300310, move_found: 1
+
+[callback] selected trial #56
+[iter #38] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 432 ms
+[executed] cost before: 5962.300310, cost after: 5880.061291, move_found: 1
+
+[callback] selected trial #97
+[iter #39] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 424 ms
+[executed] cost before: 5880.061291, cost after: 5821.565492, move_found: 1
+
+[callback] selected trial #87
+[iter #40] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 431 ms
+[executed] cost before: 5821.565492, cost after: 5764.061852, move_found: 1
+
+[callback] selected trial #51
+[iter #41] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 432 ms
+[executed] cost before: 5764.061852, cost after: 5679.336005, move_found: 1
+
+[callback] selected trial #38
+[iter #42] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 421 ms
+[executed] cost before: 5679.336005, cost after: 5637.505879, move_found: 1
+
+[callback] selected trial #40
+[iter #43] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 429 ms
+[executed] cost before: 5637.505879, cost after: 5583.313724, move_found: 1
+
+[callback] selected trial #25
+[iter #44] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 423 ms
+[executed] cost before: 5583.313724, cost after: 5524.665407, move_found: 1
+
+[callback] selected trial #82
+[iter #45] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 436 ms
+[executed] cost before: 5524.665407, cost after: 5480.986839, move_found: 1
+
+[callback] selected trial #35
+[iter #46] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 437 ms
+[executed] cost before: 5480.986839, cost after: 5445.718292, move_found: 1
+
+[callback] selected trial #0
+[iter #47] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 436 ms
+[executed] cost before: 5445.718292, cost after: 5403.038921, move_found: 1
+
+[callback] selected trial #81
+[iter #48] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 435 ms
+[executed] cost before: 5403.038921, cost after: 5342.812446, move_found: 1
+
+[callback] selected trial #21
+[iter #49] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 426 ms
+[executed] cost before: 5342.812446, cost after: 5296.006455, move_found: 1
+
+[callback] selected trial #42
+[iter #50] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 423 ms
+[executed] cost before: 5296.006455, cost after: 5233.034335, move_found: 1
+
+[callback] selected trial #98
+[iter #51] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 423 ms
+[executed] cost before: 5233.034335, cost after: 5194.142745, move_found: 1
+
+[callback] selected trial #11
+[iter #52] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 426 ms
+[executed] cost before: 5194.142745, cost after: 5163.812902, move_found: 1
+
+[callback] selected trial #76
+[iter #53] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 422 ms
+[executed] cost before: 5163.812902, cost after: 5142.109658, move_found: 1
+
+[callback] selected trial #68
+[iter #54] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 422 ms
+[executed] cost before: 5142.109658, cost after: 5119.590730, move_found: 1
+
+[callback] selected trial #61
+[iter #55] size of base nodes to search: 1084, size of h_nodes_to_search: 21
+offset: 419 ms
+[executed] cost before: 5119.590730, cost after: 5098.242534, move_found: 1
+
+[callback] selected trial #11
+[iter #56] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 421 ms
+[executed] cost before: 5098.242534, cost after: 5071.001077, move_found: 1
+
+[callback] selected trial #44
+[iter #57] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 419 ms
+[executed] cost before: 5071.001077, cost after: 5036.831191, move_found: 1
+
+[callback] selected trial #83
+[iter #58] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 419 ms
+[executed] cost before: 5036.831191, cost after: 5004.457707, move_found: 1
+
+[callback] selected trial #47
+[iter #59] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 424 ms
+[executed] cost before: 5004.457707, cost after: 4971.942001, move_found: 1
+
+[callback] selected trial #31
+[iter #60] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 418 ms
+[executed] cost before: 4971.942001, cost after: 4941.102515, move_found: 1
+
+[callback] selected trial #41
+[iter #61] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 418 ms
+[executed] cost before: 4941.102515, cost after: 4908.055963, move_found: 1
+
+[callback] selected trial #84
+[iter #62] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 419 ms
+[executed] cost before: 4908.055963, cost after: 4880.088197, move_found: 1
+
+[callback] selected trial #78
+[iter #63] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 428 ms
+[executed] cost before: 4880.088197, cost after: 4854.287153, move_found: 1
+
+[callback] selected trial #1
+[iter #64] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 425 ms
+[executed] cost before: 4854.287153, cost after: 4822.359840, move_found: 1
+
+[callback] selected trial #97
+[iter #65] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 416 ms
+[executed] cost before: 4822.359840, cost after: 4801.332746, move_found: 1
+
+[callback] selected trial #46
+[iter #66] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 419 ms
+[executed] cost before: 4801.332746, cost after: 4759.449519, move_found: 1
+
+[callback] selected trial #14
+[iter #67] size of base nodes to search: 1084, size of h_nodes_to_search: 18
+offset: 420 ms
+[executed] cost before: 4759.449519, cost after: 4738.849675, move_found: 1
+
+[callback] selected trial #13
+[iter #68] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 417 ms
+[executed] cost before: 4738.849675, cost after: 4711.104714, move_found: 1
+
+[callback] selected trial #43
+[iter #69] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 419 ms
+[executed] cost before: 4711.104714, cost after: 4679.590992, move_found: 1
+
+[callback] selected trial #82
+[iter #70] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 416 ms
+[executed] cost before: 4679.590992, cost after: 4649.085641, move_found: 1
+
+[callback] selected trial #40
+[iter #71] size of base nodes to search: 1084, size of h_nodes_to_search: 17
+offset: 420 ms
+[executed] cost before: 4649.085641, cost after: 4620.706254, move_found: 1
+
+[callback] selected trial #56
+[iter #72] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 418 ms
+[executed] cost before: 4620.706254, cost after: 4585.392699, move_found: 1
+
+[callback] selected trial #19
+[iter #73] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 420 ms
+[executed] cost before: 4585.392699, cost after: 4572.164636, move_found: 1
+
+[callback] selected trial #15
+[iter #74] size of base nodes to search: 1084, size of h_nodes_to_search: 11
+offset: 432 ms
+[executed] cost before: 4572.164636, cost after: 4539.654168, move_found: 1
+
+[callback] selected trial #6
+[iter #75] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 422 ms
+[executed] cost before: 4539.654168, cost after: 4517.763315, move_found: 1
+
+[callback] selected trial #37
+[iter #76] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 421 ms
+[executed] cost before: 4517.763315, cost after: 4489.961963, move_found: 1
+
+[callback] selected trial #68
+[iter #77] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 418 ms
+[executed] cost before: 4489.961963, cost after: 4481.315503, move_found: 1
+
+[callback] selected trial #3
+[iter #78] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 423 ms
+[executed] cost before: 4481.315503, cost after: 4459.267725, move_found: 1
+
+[callback] selected trial #45
+[iter #79] size of base nodes to search: 1084, size of h_nodes_to_search: 11
+offset: 422 ms
+[executed] cost before: 4459.267725, cost after: 4427.393413, move_found: 1
+
+[callback] selected trial #66
+[iter #80] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 426 ms
+[executed] cost before: 4427.393413, cost after: 4398.746768, move_found: 1
+
+[callback] selected trial #26
+[iter #81] size of base nodes to search: 1084, size of h_nodes_to_search: 16
+offset: 423 ms
+[executed] cost before: 4398.746768, cost after: 4386.924390, move_found: 1
+
+[callback] selected trial #31
+[iter #82] size of base nodes to search: 1084, size of h_nodes_to_search: 20
+offset: 423 ms
+[executed] cost before: 4386.924390, cost after: 4368.673327, move_found: 1
+
+[callback] selected trial #31
+[iter #83] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 428 ms
+[executed] cost before: 4368.673327, cost after: 4355.867338, move_found: 1
+
+[callback] selected trial #81
+[iter #84] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 431 ms
+[executed] cost before: 4355.867338, cost after: 4337.318178, move_found: 1
+
+[callback] selected trial #84
+[iter #85] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 437 ms
+[executed] cost before: 4337.318178, cost after: 4318.500789, move_found: 1
+
+[callback] selected trial #17
+[iter #86] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 422 ms
+[executed] cost before: 4318.500789, cost after: 4302.521571, move_found: 1
+
+[callback] selected trial #8
+[iter #87] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 424 ms
+[executed] cost before: 4302.521571, cost after: 4291.440658, move_found: 1
+
+[callback] selected trial #90
+[iter #88] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 444 ms
+[executed] cost before: 4291.440658, cost after: 4256.997509, move_found: 1
+
+[callback] selected trial #39
+[iter #89] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 425 ms
+[executed] cost before: 4256.997509, cost after: 4240.289027, move_found: 1
+
+[callback] selected trial #3
+[iter #90] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 436 ms
+[executed] cost before: 4240.289027, cost after: 4214.207835, move_found: 1
+
+[callback] selected trial #42
+[iter #91] size of base nodes to search: 1084, size of h_nodes_to_search: 9
+offset: 435 ms
+[executed] cost before: 4214.207835, cost after: 4199.597987, move_found: 1
+
+[callback] selected trial #8
+[iter #92] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 423 ms
+[executed] cost before: 4199.597987, cost after: 4183.225960, move_found: 1
+
+[callback] selected trial #28
+[iter #93] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 437 ms
+[executed] cost before: 4183.225960, cost after: 4168.273204, move_found: 1
+
+[callback] selected trial #13
+[iter #94] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 423 ms
+[executed] cost before: 4168.273204, cost after: 4155.933400, move_found: 1
+
+[callback] selected trial #12
+[iter #95] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 424 ms
+[executed] cost before: 4155.933400, cost after: 4143.031664, move_found: 1
+
+[callback] selected trial #92
+[iter #96] size of base nodes to search: 1084, size of h_nodes_to_search: 10
+offset: 438 ms
+[executed] cost before: 4143.031664, cost after: 4131.235384, move_found: 1
+
+[callback] selected trial #99
+[iter #97] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 439 ms
+[executed] cost before: 4131.235384, cost after: 4119.246712, move_found: 1
+
+[callback] selected trial #66
+[iter #98] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 437 ms
+[executed] cost before: 4119.246712, cost after: 4109.544924, move_found: 1
+
+[callback] selected trial #20
+[iter #99] size of base nodes to search: 1084, size of h_nodes_to_search: 11
+offset: 432 ms
+[executed] cost before: 4109.544924, cost after: 4085.200772, move_found: 1
+
+[callback] selected trial #94
+[iter #100] size of base nodes to search: 1084, size of h_nodes_to_search: 12
+offset: 420 ms
+[executed] cost before: 4085.200772, cost after: 4077.873909, move_found: 1
+
+[callback] selected trial #93
+[iter #101] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 420 ms
+[executed] cost before: 4077.873909, cost after: 4069.843181, move_found: 1
+
+[callback] selected trial #58
+[iter #102] size of base nodes to search: 1084, size of h_nodes_to_search: 15
+offset: 419 ms
+[executed] cost before: 4069.843181, cost after: 4059.290119, move_found: 1
+
+[callback] selected trial #41
+[iter #103] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 420 ms
+[executed] cost before: 4059.290119, cost after: 4047.239254, move_found: 1
+
+[callback] selected trial #75
+[iter #104] size of base nodes to search: 1084, size of h_nodes_to_search: 14
+offset: 410 ms
+[executed] cost before: 4047.239254, cost after: 4034.837932, move_found: 1
+
+[callback] selected trial #43
+[iter #105] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 414 ms
+[executed] cost before: 4034.837932, cost after: 4012.411683, move_found: 1
+
+[callback] selected trial #84
+[iter #106] size of base nodes to search: 1084, size of h_nodes_to_search: 13
+offset: 410 ms
+[executed] cost before: 4012.411683, cost after: 4006.297125, move_found: 1
+
+Selection mask size mismatch: 0 != 1085

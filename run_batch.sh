@@ -2,13 +2,13 @@
 
 # =================配置区域=================
 # 1. 显卡 ID 列表 (例如：4张卡并行)
-gpus=(2)
+gpus=(0 1 2 3)
 
 # 2. 总共要跑的任务数
 total_tasks=16
 
 # 3. 自定义输出文件的前缀名 (例如设置为 "exp_cuopt"，输出就会变成 exp_cuopt_1.txt, exp_cuopt_2.txt...)
-output_prefix="test_model"
+output_prefix="test_new_model"
 # =========================================
 
 num_gpus=${#gpus[@]}
@@ -30,7 +30,7 @@ for ((i=1; i<=total_tasks; i++)); do
         --time 30 \
 	--use \
 	--v v2 \
-        --policy outputs/new_model_concordance_minspead2_20260319_062050/checkpoint_epoch_30.pt \
+        --policy outputs/conc_only_new_20260324_085704/checkpoint_epoch_70.pt\
         > ../cuopt-examples/code/${output_prefix}_${i}.txt &
 
     # 分批等待逻辑

@@ -92,7 +92,7 @@ class Encoder(nn.Module):
         self.pos_k_proj = nn.Linear(d_model, d_model, bias=False)
 
         if use_sel:
-            self.sel_embedding = nn.Parameter(torch.zeros(2, d_model))
+            self.sel_linear = nn.Linear(4, d_model, bias=False)
             self.sel_q_proj = nn.Linear(d_model, d_model, bias=False)
             self.sel_k_proj = nn.Linear(d_model, d_model, bias=False)
     
@@ -105,7 +105,8 @@ class Encoder(nn.Module):
 
         scores_sel = None
         if selected_mask is not None and self.use_sel:
-            sel_embed = self.sel_embedding[selected_mask.long()]
+            sel_4ch = RegressionHeadV2.decode_bitmask(selected_mask)  # [B, L, 4]
+            sel_embed = self.sel_linear(sel_4ch)
             q_sel = self.sel_q_proj(sel_embed).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
             k_sel = self.sel_k_proj(sel_embed).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
             scores_sel = torch.matmul(q_sel, k_sel.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -152,7 +153,10 @@ class RegressionHead(nn.Module):
 
 class RegressionHeadV2(nn.Module):
     """Enhanced regression head with attention-based selected/non-selected pooling,
-    contrastive pooling (sel - nonsel), and selection ratio feature."""
+    contrastive pooling (sel - nonsel), selection ratio, and type distribution features.
+    selected_mask is a bitmask: bit0=sliding(1), bit1=vrp(2), bit2=recycle_vrp(4), bit3=two_opt(8)."""
+
+    NUM_ANCHOR_TYPES = 4
 
     def __init__(self, d_model):
         super().__init__()
@@ -162,8 +166,9 @@ class RegressionHeadV2(nn.Module):
         self.nonsel_attn_pool = nn.Linear(d_model, 1)
         self.cost_embed = nn.Linear(1, d_model)
         self.ratio_embed = nn.Linear(1, d_model // 4)
+        self.type_ratio_embed = nn.Linear(self.NUM_ANCHOR_TYPES, d_model // 4)
 
-        mlp_in = d_model * 4 + d_model // 4
+        mlp_in = d_model * 4 + d_model // 4 + d_model // 4
         self.mlp = nn.Sequential(
             nn.Linear(mlp_in, d_model * 2),
             nn.GELU(),
@@ -171,6 +176,17 @@ class RegressionHeadV2(nn.Module):
             nn.GELU(),
             nn.Linear(d_model, 1),
         )
+
+    @staticmethod
+    def decode_bitmask(selected_mask):
+        """Decode bitmask int to 4 float channels: [B, L, 4]."""
+        sel_int = selected_mask.long()
+        return torch.stack([
+            (sel_int & 1).float(),
+            ((sel_int >> 1) & 1).float(),
+            ((sel_int >> 2) & 1).float(),
+            ((sel_int >> 3) & 1).float(),
+        ], dim=-1)
 
     def forward(self, node_embed, padding_mask, log_cost_0, selected_mask=None):
         # Global attention pool
@@ -181,31 +197,35 @@ class RegressionHeadV2(nn.Module):
 
         cost_feat = self.cost_embed(log_cost_0.unsqueeze(-1))
 
-        sel = selected_mask.bool()
+        sel = (selected_mask > 0)
         valid = ~padding_mask
 
         # Learned attention pool over SELECTED nodes only
         sel_scores = self.sel_attn_pool(node_embed).squeeze(-1)
         sel_scores = sel_scores.masked_fill(~sel | padding_mask, float('-inf'))
-        sel_weights = F.softmax(sel_scores, dim=-1)
+        sel_weights = F.softmax(sel_scores, dim=-1).nan_to_num(0.0)
         sel_pool = (sel_weights.unsqueeze(-1) * node_embed).sum(dim=1)
 
         # Learned attention pool over NON-SELECTED valid nodes
         nonsel_mask = valid & ~sel
         nonsel_scores = self.nonsel_attn_pool(node_embed).squeeze(-1)
         nonsel_scores = nonsel_scores.masked_fill(~nonsel_mask, float('-inf'))
-        nonsel_weights = F.softmax(nonsel_scores, dim=-1)
+        nonsel_weights = F.softmax(nonsel_scores, dim=-1).nan_to_num(0.0)
         nonsel_pool = (nonsel_weights.unsqueeze(-1) * node_embed).sum(dim=1)
 
-        # Contrastive: what makes selected region different from the rest
         contrast = sel_pool - nonsel_pool
 
-        # Selection ratio as explicit feature
         n_sel = sel.float().sum(dim=1, keepdim=True)
         n_valid = valid.float().sum(dim=1, keepdim=True).clamp(min=1)
         ratio_feat = self.ratio_embed(n_sel / n_valid)
 
-        combined = torch.cat([pooled, sel_pool, contrast, cost_feat, ratio_feat], dim=-1)
+        # Per-type count ratios: how many anchors of each type
+        sel_4ch = self.decode_bitmask(selected_mask)  # [B, L, 4]
+        type_counts = sel_4ch.sum(dim=1)              # [B, 4]
+        type_ratios = type_counts / n_valid.clamp(min=1)
+        type_feat = self.type_ratio_embed(type_ratios) # [B, d_model//4]
+
+        combined = torch.cat([pooled, sel_pool, contrast, cost_feat, ratio_feat, type_feat], dim=-1)
         return self.mlp(combined).squeeze(-1)
 
 
@@ -235,7 +255,7 @@ class CostPredictor(nn.Module):
         self.positional_encoding = self._create_positional_encoding(self.max_length, d_model).to(self.device)
 
         if mode == 'v2':
-            self.sel_input_proj = nn.Linear(1, d_model)
+            self.sel_input_proj = nn.Linear(4, d_model)
             self.encoder = Encoder(d_model, num_heads, num_encoder_layers, use_sel=True)
             self.regression_head = RegressionHeadV2(d_model)
         elif mode == 'new':
@@ -262,7 +282,7 @@ class CostPredictor(nn.Module):
                 nn.init.normal_(param, mean=0.0, std=0.3)
             elif 'sel_input_proj.bias' in name:
                 nn.init.zeros_(param)
-            elif 'sel_embedding' in name:
+            elif 'sel_embedding' in name or 'sel_linear' in name:
                 nn.init.normal_(param, mean=0.0, std=0.2 if is_v2 else 0.02)
             elif 'sel_bias_weight' in name:
                 nn.init.constant_(param, 1.0 if is_v2 else 0.1)
@@ -284,7 +304,7 @@ class CostPredictor(nn.Module):
             nodes_tensor:       [B, N, 2] - node coordinates
             demands_tensor:     [B, N, 1] - node demands
             current_sol_tensor: [B, max_length] - current solution
-            selected_tensor:    [B, max_length] - selected anchor nodes mask
+            selected_tensor:    [B, max_length] - anchor type bitmask (0-15: bit0=sliding, bit1=vrp, bit2=recycle_vrp, bit3=two_opt)
             cost_0:             [B] - initial cost (raw value)
         
         Returns:
@@ -297,7 +317,7 @@ class CostPredictor(nn.Module):
         nodes_tensor = nodes_tensor.to(device)
         demands_tensor = demands_tensor.to(device)
         current_sol_tensor = current_sol_tensor.to(device)
-        selected_tensor = selected_tensor.to(device).bool()
+        selected_tensor = selected_tensor.to(device).long()
         cost_0 = cost_0.to(device)
         
         if demands_tensor.dim() == 2:
@@ -317,7 +337,8 @@ class CostPredictor(nn.Module):
         encoder_mask[:, 0] = True
 
         if self.mode == 'v2':
-            sel_signal = self.sel_input_proj(selected_tensor.unsqueeze(-1).float())
+            sel_4ch = RegressionHeadV2.decode_bitmask(selected_tensor)  # [B, L, 4]
+            sel_signal = self.sel_input_proj(sel_4ch)
             node_embeddings = node_embeddings + sel_signal
             node_embeddings = self.encoder(node_embeddings, encoder_mask, pos_embedding_gathered, selected_tensor)
         elif self.mode == 'new':

@@ -855,11 +855,19 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
             load_to_device_both(work_node_list);
             run_fast_search(temp_trail, true, 96, false, false);
 
+            // Store bitmask per anchor: bit0=sliding(1), bit1=vrp(2), bit2=recycle_vrp(4), bit3=two_opt(8)
             auto anchors_exec = get_last_executed_anchors();
-            for (i_t a : anchors_exec) {
-              if (a < N_nodes_w_dummy) {
-                trail_masks_flat[t * N_nodes_w_dummy + a] = 1;
-              }
+            auto ops_exec = get_last_executed_anchor_operator();
+            for (size_t k = 0; k < anchors_exec.size(); ++k) {
+              i_t a = anchors_exec[k];
+              if (a >= N_nodes_w_dummy) continue;
+              int op = (k < ops_exec.size()) ? ops_exec[k] : -1;
+              i_t mask = 0;
+              if (op == 0) mask = 1;   // sliding
+              if (op == 1) mask = 2;   // vrp
+              if (op == 2) mask = 4;   // recycle_vrp
+              if (op == 3) mask = 8;   // two_opt
+              trail_masks_flat[t * N_nodes_w_dummy + a] |= mask;
             }
           }
 
@@ -878,10 +886,10 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
             exit(1);
           }
 
-          // Step 4: Build best_node_to_search from selection_mask
+          // Step 4: Build best_node_to_search from selection_mask (bitmask, >0 means selected)
           best_node_to_search.clear();
           for (i_t node_id = 0; node_id < N_nodes_w_dummy; ++node_id) {
-            if (selection_mask[node_id] == 1) {
+            if (selection_mask[node_id] > 0) {
               auto it = node_id_to_h_idx.find(node_id);
               if (it != node_id_to_h_idx.end()) {
                 best_node_to_search.push_back(full_node_to_search[it->second]);

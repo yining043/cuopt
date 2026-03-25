@@ -33,10 +33,11 @@ class CostPredictorCallback(CustomizeNodesCallback):
                                   solution_cost, trail_masks_flat, num_trails, iter):
         max_length = len(trail_masks_flat) // num_trails
         K = num_trails
-        trail_masks = torch.tensor(trail_masks_flat, dtype=torch.bool, device=self.device
+        # trail_masks_flat contains bitmask ints (0-15), not bools
+        trail_masks = torch.tensor(trail_masks_flat, dtype=torch.long, device=self.device
                                    ).reshape(K, max_length)
 
-        non_empty = trail_masks.any(dim=1)
+        non_empty = (trail_masks > 0).any(dim=1)
         if not non_empty.any():
             return [0] * max_length
 

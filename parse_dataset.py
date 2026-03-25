@@ -123,22 +123,26 @@ def parse_output_file(file_path):
             current_trail = {
                 'trail_id': int(m.group(1)),
                 'executed_anchors_all': [],
+                'executed_anchors_sliding': [],
+                'executed_anchors_vrp': [],
+                'executed_anchors_recycle_vrp': [],
+                'executed_anchors_two_opt': [],
                 'previous_cost': [],
                 'number_of_anchors': 0
             }
             i += 1
             continue
 
-        # executed_anchors (all): [...]
-        m = re.match(r'executed_anchors \(all\):\s*\[([^\]]*)\]', line)
+        # executed_anchors (type): [...]
+        m = re.match(r'executed_anchors \((\w+)\):\s*\[([^\]]*)\]', line)
         if m and current_trail is not None:
-            if m.group(1).strip():
-                current_trail['executed_anchors_all'] = parse_int_list(m.group(1))
-            i += 1
-            continue
-
-        # executed_anchors (sliding/vrp/recycle_vrp/two_opt): [...] — skip
-        if line.startswith('executed_anchors ('):
+            op_type = m.group(1)
+            nodes = parse_int_list(m.group(2)) if m.group(2).strip() else []
+            key = f'executed_anchors_{op_type}'
+            if key in current_trail:
+                current_trail[key] = nodes
+            elif op_type == 'all':
+                current_trail['executed_anchors_all'] = nodes
             i += 1
             continue
 
@@ -284,10 +288,16 @@ if __name__ == '__main__':
                         skipped_low_std += 1
                         continue
 
-                    s_tensor = torch.zeros(max_candidates_length, dtype=torch.bool)
-                    for idx in anchors_all:
-                        if idx < max_candidates_length:
-                            s_tensor[idx] = True
+                    # bitmask: bit0=sliding(1), bit1=vrp(2), bit2=recycle_vrp(4), bit3=two_opt(8)
+                    s_tensor = torch.zeros(max_candidates_length, dtype=torch.uint8)
+                    for idx in trail.get('executed_anchors_sliding', []):
+                        if idx < max_candidates_length: s_tensor[idx] |= 1
+                    for idx in trail.get('executed_anchors_vrp', []):
+                        if idx < max_candidates_length: s_tensor[idx] |= 2
+                    for idx in trail.get('executed_anchors_recycle_vrp', []):
+                        if idx < max_candidates_length: s_tensor[idx] |= 4
+                    for idx in trail.get('executed_anchors_two_opt', []):
+                        if idx < max_candidates_length: s_tensor[idx] |= 8
 
                     valid_trails.append({
                         's_tensor': s_tensor,
@@ -372,7 +382,7 @@ if __name__ == '__main__':
     save_npy("demands_tensor",     batch_demands)
     save_npy("current_sol_tensor", batch_current_sol,  dtype=torch.int16)
     save_npy("anchor_tensor",      batch_anchor)
-    save_npy("selected_tensor",    batch_selected)
+    save_npy("selected_tensor",    batch_selected,     dtype=torch.uint8)
     save_npy("cost_tensor",        batch_cost)
     save_npy("state_id_tensor",    batch_state_id,     dtype=torch.int64)
 
