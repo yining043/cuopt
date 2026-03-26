@@ -146,6 +146,172 @@ def load_val_data_1a1n10d(path: str) -> List[Tuple[int, dict]]:
     return data
 
 
+def _parse_instance_index_from_path(path: str) -> int:
+    """Infer instance index from parent dir, e.g. .../cvrp100_uniform.pkl#3/foo.jsonl -> 3."""
+    parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    try:
+        return int(parent.split("#")[-1].strip())
+    except ValueError:
+        return 0
+
+
+def load_training_data_pairs(
+    training_data_paths: List[str],
+    certainty_threshold: float = 0.8,
+    seed: int = 42,
+    max_runs: Optional[int] = 10,
+) -> Tuple[List[Tuple[int, dict]], List[Tuple[int, dict]]]:
+    """Build contrastive pairs from training_data.jsonl with certainty-based routing.
+
+    Each record has initial_solution + basin_distribution (100-run LS results).
+    Negatives are handled in-batch by InfoNCE (not pre-sampled here).
+
+    Routing:
+      A) P_max >= certainty_threshold  (high certainty)
+         -> contrastive pair: (anchor, Basin_max) + metadata for in-batch masking
+      B) P_max < certainty_threshold   (chaotic)
+         -> regression target only (anchor + p_max); NO contrastive pair
+
+    Two-pass approach:
+      Pass 1: collect all unique basin solutions into a global pool.
+      Pass 2: route each record into contrastive or regression-only.
+
+    Returns:
+      (contrastive_pairs, chaotic_regression_samples)
+      - contrastive_pairs: List[(inst_idx, dict)] with keys
+          anchor_solution, positive_solution,
+          anchor_cost, positive_cost, p_max,
+          positive_basin_hash, reachable_basin_hashes (frozenset).
+      - chaotic_regression_samples: List[(inst_idx, dict)] with keys
+          anchor_solution, anchor_cost, p_max.
+    """
+    rng = random.Random(seed)
+    all_contrastive: List[Tuple[int, dict]] = []
+    all_chaotic: List[Tuple[int, dict]] = []
+
+    for td_path in training_data_paths:
+        if not os.path.isfile(td_path):
+            print(f"  [load_td] skip (not found): {td_path}")
+            continue
+
+        inst_idx = _parse_instance_index_from_path(td_path)
+
+        ordered_runs: List[str] = []
+        seen_run_set: set = set()
+        with open(td_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rid = rec.get("run_id")
+                if rid and rid not in seen_run_set:
+                    ordered_runs.append(rid)
+                    seen_run_set.add(rid)
+        allowed_runs = set(ordered_runs[:max_runs]) if (max_runs and max_runs > 0) else seen_run_set
+        print(f"  [load_td] instance {inst_idx}: using {len(allowed_runs)}/{len(ordered_runs)} runs")
+
+        # Pass 1: global basin pool  {hash -> (solution_flat, mean_cost)}
+        global_basin_pool: Dict[str, Tuple[List[int], float]] = {}
+        with open(td_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("run_id") not in allowed_runs:
+                    continue
+                for bh, feat in rec.get("basin_features", {}).items():
+                    if bh not in global_basin_pool and feat.get("solution_flat"):
+                        global_basin_pool[bh] = (
+                            feat["solution_flat"],
+                            float(feat.get("mean_cost", 0)),
+                        )
+        global_basin_hashes = list(global_basin_pool.keys())
+        print(f"  [load_td] instance {inst_idx}: global basin pool = {len(global_basin_hashes)} basins")
+
+        # Pass 2: route records
+        n_records = 0
+        n_certain = 0
+        n_chaotic = 0
+        n_contrastive = 0
+
+        with open(td_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("run_id") not in allowed_runs:
+                    continue
+
+                bd = rec.get("basin_distribution", {})
+                init_info = rec.get("initial_solution", {})
+                init_flat = init_info.get("solution_flat")
+                if not init_flat or not bd:
+                    continue
+                n_records += 1
+
+                # Find Basin_max and P_max
+                best_hash, best_prob = max(bd.items(), key=lambda x: float(x[1]))
+                p_max = float(best_prob)
+
+                anchor_sol = solution_flat_to_solution(init_flat)
+                anchor_cost = float(init_info.get("cost", 0) or 0)
+
+                if p_max >= certainty_threshold:
+                    # Route A: high certainty -> contrastive pair
+                    n_certain += 1
+                    if best_hash not in global_basin_pool:
+                        all_chaotic.append((inst_idx, {
+                            "anchor_solution": anchor_sol,
+                            "anchor_cost": anchor_cost,
+                            "p_max": p_max,
+                        }))
+                        n_chaotic += 1
+                        continue
+
+                    pos_flat, pos_cost = global_basin_pool[best_hash]
+                    pos_sol = solution_flat_to_solution(pos_flat)
+                    reachable = frozenset(bd.keys())
+
+                    all_contrastive.append((inst_idx, {
+                        "anchor_solution": anchor_sol,
+                        "positive_solution": pos_sol,
+                        "anchor_cost": anchor_cost,
+                        "positive_cost": pos_cost,
+                        "p_max": p_max,
+                        "positive_basin_hash": best_hash,
+                        "reachable_basin_hashes": reachable,
+                    }))
+                    n_contrastive += 1
+                else:
+                    # Route B: chaotic -> regression only, skip contrastive
+                    all_chaotic.append((inst_idx, {
+                        "anchor_solution": anchor_sol,
+                        "anchor_cost": anchor_cost,
+                        "p_max": p_max,
+                    }))
+                    n_chaotic += 1
+
+        print(
+            f"  [load_td] instance {inst_idx}: {n_records} records, "
+            f"certain={n_certain} (contrastive pairs={n_contrastive}), "
+            f"chaotic={n_chaotic}"
+        )
+
+    return all_contrastive, all_chaotic
+
+
 def load_val_data_1p1n(path: str) -> List[Tuple[int, dict]]:
     """Load val_data_1p1n.jsonl: each line has instance_index, anchor, positive_sample, negative_sample.
     Returns list of (instance_index, triplet_dict) for fixed validation set.
