@@ -66,6 +66,7 @@ basin_stat/
 basin_stat*/
 plot/
 plots_*/
+plott_CaR/
 wandb/
 .idea/
 *.backup
@@ -91,3 +92,9 @@ docs/cuopt/build
 cpp/include/cuopt/semantic_version.hpp
 !datasets/quadratic_programming
 !datasets/quadratic_programming/**
+
+# Large local cache/archive files
+s3_data_cache/
+*.partial
+cuopt_code_only.tar*
+wandb_runtime_merged_backup_*/
