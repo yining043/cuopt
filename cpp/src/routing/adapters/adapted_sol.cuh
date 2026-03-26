@@ -30,7 +30,127 @@
 
 #include <raft/util/cudart_utils.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
 namespace cuopt::routing::detail {
+
+// ---------------------------------------------------------------------------
+// Embedding socket client (singleton) for landscape-aware diversity metric.
+// Connects to the Python embedding_server.py via Unix domain socket.
+// ---------------------------------------------------------------------------
+class EmbeddingSocketClient {
+ public:
+  static EmbeddingSocketClient& instance()
+  {
+    static EmbeddingSocketClient inst;
+    return inst;
+  }
+
+  bool is_available() const { return fd_ >= 0; }
+
+  std::vector<float> request_embedding(const std::vector<int>& route_solution)
+  {
+    if (fd_ < 0) {
+      reconnect();
+      if (fd_ < 0) return {};
+    }
+
+    // Build request: "0 5 3 0 7 2 0\n"
+    std::string msg;
+    msg.reserve(route_solution.size() * 4);
+    for (size_t i = 0; i < route_solution.size(); ++i) {
+      if (i > 0) msg += ' ';
+      msg += std::to_string(route_solution[i]);
+    }
+    msg += '\n';
+
+    // Send
+    {
+      const char* ptr  = msg.c_str();
+      ssize_t remaining = static_cast<ssize_t>(msg.size());
+      while (remaining > 0) {
+        ssize_t n = ::write(fd_, ptr, remaining);
+        if (n <= 0) { reconnect(); return {}; }
+        ptr += n;
+        remaining -= n;
+      }
+    }
+
+    // Read response until newline
+    std::string response;
+    char buf[8192];
+    while (true) {
+      ssize_t n = ::read(fd_, buf, sizeof(buf) - 1);
+      if (n <= 0) { reconnect(); return {}; }
+      response.append(buf, n);
+      if (response.find('\n') != std::string::npos) break;
+    }
+
+    // Parse: "0.123 -0.456 ...\n"
+    if (response.rfind("ERROR", 0) == 0) return {};
+    std::vector<float> emb;
+    emb.reserve(128);
+    std::istringstream iss(response);
+    float val;
+    while (iss >> val) { emb.push_back(val); }
+    return emb;
+  }
+
+ private:
+  int fd_ = -1;
+  std::string socket_path_;
+
+  EmbeddingSocketClient()
+  {
+    const char* path = std::getenv("CUOPT_EMBEDDING_SOCKET");
+    if (path == nullptr) return;
+    socket_path_ = path;
+    do_connect();
+  }
+
+  ~EmbeddingSocketClient()
+  {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  void do_connect()
+  {
+    fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd_ < 0) return;
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, socket_path_.c_str(), sizeof(addr.sun_path) - 1);
+    if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+  void reconnect()
+  {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+    // Re-read env var: socket path may change when switching instances
+    const char* path = std::getenv("CUOPT_EMBEDDING_SOCKET");
+    if (path != nullptr) {
+      socket_path_ = path;
+    }
+    if (!socket_path_.empty()) do_connect();
+  }
+
+  EmbeddingSocketClient(const EmbeddingSocketClient&) = delete;
+  EmbeddingSocketClient& operator=(const EmbeddingSocketClient&) = delete;
+};
 
 static inline infeasible_cost_t get_cuopt_cost(costs cpu_cost)
 {
@@ -101,6 +221,7 @@ struct adapted_sol_t {
   std::vector<adapted_node_t<i_t, f_t>> nodes;
   std::vector<adapted_route_t<i_t, f_t>> routes;
   bool has_unserviced_nodes = false;
+  mutable std::vector<float> embedding_;
 
   adapted_sol_t(solution_t<i_t, f_t, REQUEST> sol_, const problem_t<i_t, f_t>* problem_)
     : sol(sol_), problem(problem_)
@@ -136,6 +257,7 @@ struct adapted_sol_t {
     nodes                = other_sol.nodes;
     routes               = other_sol.routes;
     has_unserviced_nodes = other_sol.has_unserviced_nodes;
+    embedding_           = other_sol.embedding_;
     sol.copy_device_solution(const_cast<solution_t<i_t, f_t, REQUEST>&>(other_sol.sol));
     cuopt_assert(routes.size() == sol.n_routes, "Route count mismatch!");
     return *this;
@@ -247,7 +369,13 @@ struct adapted_sol_t {
     return success;
   }
 
-  double calculate_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  static bool use_landscape_similarity_metric()
+  {
+    const char* metric = std::getenv("CUOPT_DIVERSITY_METRIC");
+    return metric != nullptr && std::strcmp(metric, "landscape") == 0;
+  }
+
+  double calculate_legacy_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
   {
     // always do symmetric measure if it is a CVRP or if there are unserviced nodes
     if (problem->is_tsp || problem->is_cvrp() || this->has_unserviced_nodes ||
@@ -257,6 +385,74 @@ struct adapted_sol_t {
     }
 
     return calculate_similarity_radius_asymetric(second);
+  }
+
+  std::vector<int> get_solution_route_format() const
+  {
+    std::vector<int> sol_flat;
+    sol_flat.push_back(0);
+    for (const auto& r : routes) {
+      if (r.is_empty()) continue;
+      NodeInfo<> current = r.start;
+      while (!current.is_depot()) {
+        sol_flat.push_back(current.node());
+        current = succ[current.node()];
+      }
+      sol_flat.push_back(0);
+    }
+    return sol_flat;
+  }
+
+  static void l2_normalize_inplace(std::vector<float>& v)
+  {
+    double norm = 0.0;
+    for (float x : v) norm += static_cast<double>(x) * x;
+    norm = std::sqrt(norm);
+    if (norm > 1e-12) {
+      float inv = static_cast<float>(1.0 / norm);
+      for (float& x : v) x *= inv;
+    }
+  }
+
+  void ensure_embedding() const
+  {
+    if (!embedding_.empty()) return;
+    auto sol_flat = get_solution_route_format();
+    embedding_    = EmbeddingSocketClient::instance().request_embedding(sol_flat);
+    if (!embedding_.empty()) { l2_normalize_inplace(embedding_); }
+  }
+
+  static double l2_distance(const std::vector<float>& a, const std::vector<float>& b)
+  {
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size() && i < b.size(); ++i) {
+      double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+      sum += diff * diff;
+    }
+    return std::sqrt(sum);
+  }
+
+  double calculate_landscape_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  {
+    ensure_embedding();
+    second.ensure_embedding();
+
+    if (embedding_.empty() || second.embedding_.empty()) {
+      const char* socket_path = std::getenv("CUOPT_EMBEDDING_SOCKET");
+      throw std::runtime_error(
+        std::string("Landscape diversity requires embedding inference, but embedding retrieval failed. ")
+        + "Please ensure embedding_server.py is running and reachable at CUOPT_EMBEDDING_SOCKET="
+        + (socket_path != nullptr ? socket_path : "<unset>"));
+    }
+
+    const double distance = l2_distance(embedding_, second.embedding_);
+    return std::clamp(1.0 - 0.5 * distance, 0.0, 1.0);
+  }
+
+  double calculate_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
+  {
+    if (use_landscape_similarity_metric()) { return calculate_landscape_similarity_radius(second); }
+    return calculate_legacy_similarity_radius(second);
   }
 
   double calculate_similarity_radius_asymetric(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
@@ -489,6 +685,7 @@ struct adapted_sol_t {
   void populate_host_data(bool copy_all = false, bool skip_route_copy = false)
   {
     raft::common::nvtx::range fun_scope("populate_host_data");
+    embedding_.clear();
     sol.compute_cost();
     cuopt_func_call(sol.check_cost_coherence(default_weights));
     sol.sol_handle->sync_stream();

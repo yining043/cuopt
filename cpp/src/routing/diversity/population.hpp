@@ -24,6 +24,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -277,6 +278,7 @@ struct population {
         printf("[POP] add_solution: REJECTED (cost=%.2f >= worst=%.2f, pop full=%zu)%s\n",
                sol_cost, indices.back().second, current_size(),
                updated_best_feasible ? " [but updated best feasible]" : "");
+        fflush(stdout);
       }
       dump_results(elapsed_time);
       return -1;
@@ -297,6 +299,7 @@ struct population {
         if (verbose) {
           printf("[POP] add_solution: INSERTED (no similar, evicted worst=%.2f) cost=%.2f pop_size=%zu\n",
                  indices.back().second, sol_cost, current_size());
+          fflush(stdout);
         }
         indices.pop_back();
         solutions[hint].first = false;
@@ -304,6 +307,7 @@ struct population {
         if (verbose) {
           printf("[POP] add_solution: INSERTED (no similar, pop not full) cost=%.2f pop_size=%zu→%zu\n",
                  sol_cost, current_size(), current_size() + 1);
+          fflush(stdout);
         }
       }
 
@@ -317,6 +321,7 @@ struct population {
       if (verbose) {
         printf("[POP]   → rank=%d/%zu best=%.2f\n", inserted_pos, current_size(),
                indices[1].second);
+        fflush(stdout);
       }
       RUNTIME_TEST(test_invariant());
       dump_results(elapsed_time);
@@ -329,6 +334,7 @@ struct population {
                indices[index].second, sol_cost);
         eradicate_similar(index, sol);
         printf("pop_size=%zu→%zu\n", before_size, current_size());
+        fflush(stdout);
       } else {
         eradicate_similar(index, sol);
       }
@@ -343,6 +349,7 @@ struct population {
       if (verbose) {
         printf("[POP]   → rank=%d/%zu best=%.2f\n", inserted_pos, current_size(),
                indices[1].second);
+        fflush(stdout);
       }
       RUNTIME_TEST(test_invariant());
       dump_results(elapsed_time);
@@ -352,6 +359,7 @@ struct population {
     if (verbose) {
       printf("[POP] add_solution: REJECTED (similar exists at cost=%.2f ≤ new=%.2f) pop_size=%zu\n",
              indices[index].second, sol_cost, current_size());
+      fflush(stdout);
     }
     dump_results(elapsed_time);
     return -1;

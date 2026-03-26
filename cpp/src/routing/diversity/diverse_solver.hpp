@@ -35,9 +35,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace cuopt::routing {
@@ -229,6 +231,9 @@ struct solve {
   std::pair<solution, solution> temp_pair;
   // buffer changer struct in raii style
   file_buffer_t f;
+  // trace file for evolution visualization (weights + routes)
+  FILE* trace_file{nullptr};
+  int trace_step{0};
   // random number generator
   std::mt19937 rng;
   // control variable to limit GES time for prize collection
@@ -297,6 +302,23 @@ struct solve {
     if (injection_info.has_info()) { injection_info.load_solutions(); }
     // When we have prize collection, don't spend too much time on ges
     if (p->has_prize_collection()) { ges_time_fraction = 0.1; }
+
+    // Open trace file if CUOPT_TRACE_DIR is set
+    const char* trace_dir = std::getenv("CUOPT_TRACE_DIR");
+    if (trace_dir && trace_dir[0]) {
+      std::string trace_path = std::string(trace_dir) + "/trace.csv";
+      trace_file = fopen(trace_path.c_str(), "w");
+      if (trace_file) {
+        fprintf(trace_file, "# CUOPT evolution trace\n");
+        fprintf(trace_file, "# W,step,phase,DIST,TIME,CAP,PRIZE,TASKS,SVCT,MISMATCH,BREAK,VFCOST,coeff\n");
+        fprintf(trace_file, "# R,step,role,cost,feasible,n_routes,route_id,vehicle_id,node1;node2;...\\n");
+        fflush(trace_file);
+      }
+    }
+  }
+
+  ~solve() {
+    if (trace_file) { fclose(trace_file); trace_file = nullptr; }
   }
 
   void benchmark_print([[maybe_unused]] const char* format, ...)
@@ -356,6 +378,12 @@ struct solve {
     initial_reserve_threshold = reserve_population.threshold;
   }
 
+  bool use_landscape_similarity_metric() const
+  {
+    const char* metric = std::getenv("CUOPT_DIVERSITY_METRIC");
+    return metric != nullptr && std::string(metric) == "landscape";
+  }
+
   void adjust_reserve_threshold()
   {
     const double max_diversity_threshold = 0.99;
@@ -375,9 +403,13 @@ struct solve {
 
     auto from_islands = load_sols_from_islands();
     if (initial_islands.size() > 1) {
-      int threshold_index = p->is_cvrp() ? std::max(3, find_initial_diversity(from_islands, true))
-                                         : find_initial_diversity(from_islands, true);
-      reserve_population.threshold = std::max<double>(0.8, diversity_levels[threshold_index]);
+      const bool landscape_metric = use_landscape_similarity_metric();
+      int threshold_index         = (p->is_cvrp() && !landscape_metric)
+                                      ? std::max(3, find_initial_diversity(from_islands, true))
+                                      : find_initial_diversity(from_islands, true);
+      reserve_population.threshold = landscape_metric
+                                       ? diversity_levels[threshold_index]
+                                       : std::max<double>(0.8, diversity_levels[threshold_index]);
       benchmark_print("Resetting the reserve diversity level %d reserve treshold %f: \n",
                       threshold_index,
                       reserve_population.threshold);
@@ -411,7 +443,12 @@ struct solve {
   void generate_from_dir(std::string path)
   {
     auto solutions                   = load_all_solutions_from_dir(target_vehicles_, path);
-    reserve_population.threshold     = 0.85;
+    double reserve_threshold         = 0.85;
+    if (use_landscape_similarity_metric() && !solutions.empty()) {
+      int threshold_index = find_initial_diversity(solutions, true);
+      reserve_threshold   = diversity_levels[threshold_index];
+    }
+    reserve_population.threshold     = reserve_threshold;
     reserve_population.max_solutions = default_reserve_population_size;
     working_population.max_solutions = default_reserve_population_size;
     reserve_population.clear();
@@ -428,7 +465,7 @@ struct solve {
     auto sampled_solutions        = reserve_population.get_n_random(n_sampled_solutions, false);
     benchmark_print("%d solutions selected\n", n_sampled_solutions);
     reserve_population.clear();
-    reserve_population.threshold     = 0.85;
+    reserve_population.threshold     = reserve_threshold;
     reserve_population.max_solutions = default_reserve_population_size;
     for (auto& sol : best_solutions) {
       reserve_population.add_solution(timer.elapsed_time(), sol);
@@ -664,7 +701,9 @@ struct solve {
       // select the reserved solutions to put into working (70%: random; 30%: best)
       populate_working_vector(); 
       constexpr bool use_average = false;
-      int threshold_index = p->is_cvrp() ? 1 : find_initial_diversity(working_vector, use_average);
+      int threshold_index = (p->is_cvrp() && !use_landscape_similarity_metric())
+                              ? 1
+                              : find_initial_diversity(working_vector, use_average);
       working_population.threshold = diversity_levels[threshold_index];
       if (!p->is_cvrp()) { threshold_index = std::min(4, std::max(2, threshold_index)); }
       populate_working_population();
@@ -729,7 +768,23 @@ struct solve {
       }
 
       // adjust working weights
-      adjust_weights(best_before_improvement);
+      {
+        static const char* dim_names[NDIM] = {
+          "DIST","TIME","CAP","PRIZE","TASKS","SVCT","MISMATCH","BREAK","VFCOST"};
+        printf("[WEIGHTS] before adjust (best_before=%.4f):", best_before_improvement);
+        for (int _wi = 0; _wi < NDIM; ++_wi) printf(" %s=%.6f", dim_names[_wi], weights[_wi]);
+        printf("\n");
+        trace_weights("before");
+
+        adjust_weights(best_before_improvement);
+
+        printf("[WEIGHTS] after  adjust (coeff=%.6f):", adjust_coeff_weights);
+        for (int _wi = 0; _wi < NDIM; ++_wi) printf(" %s=%.6f", dim_names[_wi], weights[_wi]);
+        printf("\n");
+        fflush(stdout);
+        trace_weights("after");
+      }
+
       print_working_weights();
       if (working_population.verbose) {
         printf("[WLOOP] propagating working→reserve (reserve before: size=%zu best=%.2f)\n",
@@ -771,13 +826,9 @@ struct solve {
     feasible_only    = feasible_only_;
     target_vehicles_ = routes_number;
 
-    // Enable verbose logging when an early-stop callback is registered
-    bool has_callback = p->solver_settings_ptr &&
-      std::any_of(p->solver_settings_ptr->get_routing_callbacks().begin(),
-                  p->solver_settings_ptr->get_routing_callbacks().end(),
-                  [](auto* cb) { return cb->get_type() == callbacks::callback_type_t::CUSTOMIZE_EARLY_STOP; });
-    reserve_population.verbose = has_callback;
-    working_population.verbose = has_callback;
+    // Always enable verbose population logging
+    reserve_population.verbose = true;
+    working_population.verbose = true;
 
     if (target_vehicles_ > 0) {
       target_vehicle_ids_.resize(target_vehicles_);
@@ -1189,7 +1240,13 @@ struct solve {
           double sim = temp_pair.first.calculate_similarity_radius(temp_pair.second);
           printf("[EVOLVE] step=%d parents: basin_A=%.2f basin_B=%.2f similarity=%.4f\n",
                  step, cost_first, cost_second, sim);
+          fflush(stdout);
         }
+
+        trace_step++;
+        trace_routes(temp_pair.first, "parent1");
+        trace_routes(temp_pair.second, "parent2");
+
         bool guiding       = false;
         // reset the routes to search before hand so that we can mark the routes
         // that can be searched
@@ -1199,12 +1256,14 @@ struct solve {
         if (recombine(temp_pair.first, temp_pair.second, guiding, run_expensive_recombiners)) {
           auto& offspring = guiding == false ? temp_pair.first : temp_pair.second;
           double cost_after_recombine = offspring.get_cost(weights);
+          trace_routes(offspring, "offspring_pre_ls");
           if (!feasible_only || offspring.is_feasible()) {
             auto offset = lm.improve(offspring, weights, improvement_timer.remaining_time(), run_cycle_finder, true);
             timer.add_offset(offset);
             improvement_timer.add_offset(offset);
             double cost_after_ls = offspring.get_cost(weights);
             recombine_stats.update_improve_stats(cost_after_ls, cost_first, cost_second);
+            trace_routes(offspring, "offspring_post_ls");
             if (p.verbose) {
               printf("[EVOLVE]   crossover→%.2f  LS→new_basin=%.2f  feasible=%d",
                      cost_after_recombine, cost_after_ls, offspring.is_feasible());
@@ -1215,14 +1274,17 @@ struct solve {
               else
                 printf(" ✗worse_than_both");
               printf("\n");
+              fflush(stdout);
             }
             working_insertion_index = p.add_solution(timer.elapsed_time(), offspring);
           } else if (p.verbose) {
             printf("[EVOLVE]   recombine→%.2f  SKIPPED (infeasible, feasible_only mode)\n",
                    cost_after_recombine);
+            fflush(stdout);
           }
         } else if (p.verbose) {
           printf("[EVOLVE]   recombine FAILED\n");
+          fflush(stdout);
         }
         temp_pair.first.set_routes_to_search();
         temp_pair.second.set_routes_to_search();
@@ -1516,6 +1578,37 @@ struct solve {
     }
     fprintf(f.file_ptr, " -------------- \n");
     fflush(f.file_ptr);
+  }
+
+  void trace_weights(const char* phase)
+  {
+    if (!trace_file) return;
+    fprintf(trace_file, "W,%d,%s", trace_step, phase);
+    for (int i = 0; i < NDIM; ++i) fprintf(trace_file, ",%.8f", weights[i]);
+    fprintf(trace_file, ",%.8f\n", adjust_coeff_weights);
+    fflush(trace_file);
+  }
+
+  void trace_routes(solution& S, const char* role)
+  {
+    if (!trace_file) return;
+    auto w_copy = weights;
+    double cost = S.get_cost(w_copy);
+    int n_routes = (int)S.get_routes().size();
+    bool feasible = S.is_feasible();
+    for (int i = 0; i < n_routes; ++i) {
+      if (S.routes[i].is_empty()) continue;
+      fprintf(trace_file, "R,%d,%s,%.4f,%d,%d,%d,%d",
+              trace_step, role, cost, (int)feasible, n_routes,
+              i, S.routes[i].vehicle_id);
+      auto start = S.routes[i].start;
+      while (start.node_type() != node_type_t::DEPOT) {
+        fprintf(trace_file, ",%d", start.node());
+        start = S.succ[start.node()];
+      }
+      fprintf(trace_file, "\n");
+    }
+    fflush(trace_file);
   }
 
   void output_sol(const solution& S)

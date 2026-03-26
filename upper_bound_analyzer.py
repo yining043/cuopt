@@ -20,6 +20,7 @@ class TrialRecord:
     basin_id: Any
     is_new_discovery: bool
     is_feasible: bool = True
+    inserted: bool = True
 
 
 @dataclass
@@ -46,6 +47,11 @@ class ExperimentResults:
     checkpoints: np.ndarray = field(default_factory=lambda: np.array([]))
     time_multipliers: np.ndarray = field(default_factory=lambda: np.array([]))
     trial_multipliers: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Skip strategy description (for plot labels)
+    skip_label: str = "dup-only"
+    n_skipped_dup: int = 0
+    n_skipped_quality: int = 0
 
 
 def _resample_step(
@@ -78,6 +84,7 @@ class UpperBoundAnalyzer:
                 basin_id=d["basin_id"],
                 is_new_discovery=d["is_new_discovery"],
                 is_feasible=d.get("is_feasible", True),
+                inserted=d.get("inserted", True),
             )
             for d in data
         ]
@@ -88,14 +95,31 @@ class UpperBoundAnalyzer:
         overhead_ratio: float = 0.0,
         n_checkpoints: int = 50,
         dt: float = 0.1,
+        skip_margin_pct: float | None = None,
+        top_k_basins: int | None = None,
+        keep_best_pct: float | None = None,
+        ancestry_basins: set | None = None,
+        skip_not_inserted: bool = False,
     ) -> ExperimentResults:
         """Run all four experiments.
 
         Args:
-            overhead_ratio: Fraction of trial duration still paid on repeated basins
+            overhead_ratio: Fraction of trial duration still paid on skipped trials
                 (0.0 = ideal oracle / theoretical upper bound).
             n_checkpoints: Number of checkpoints for multiplier curve.
             dt: Time resolution for convergence curves.
+            skip_margin_pct: (Strategy A) Skip trials whose cost exceeds
+                ``best_so_far * (1 + margin/100)``.  Causal — only uses info
+                available up to the current trial.
+            top_k_basins: (Strategy B) Retrospectively keep only the top-K
+                lowest-cost unique basins; skip trials leading to all others.
+            keep_best_pct: (Strategy C) Retrospectively keep only the best P%
+                of unique basins by cost; skip the rest.
+            ancestry_basins: (Strategy D) Set of basin costs that belong to
+                the best solution's ancestry tree.  Trials whose basin is
+                not in this set are skipped.
+            skip_not_inserted: (Strategy E) Skip trials whose offspring was
+                not inserted/replaced into the population (retrospective).
         """
         assert self.trials, "No trials loaded. Call load_logs() first."
         res = ExperimentResults()
@@ -114,10 +138,80 @@ class UpperBoundAnalyzer:
                 seen.add(t.basin_id)
             unique_count[i] = len(seen)
 
-        # Timelines
-        # Oracle skips all redundant trials (feasible or infeasible)
+        # ── Compute can_skip mask ──
         base_times = np.cumsum(durations)
-        can_skip = ~is_new
+        can_skip_dup = ~is_new                        # duplicate trials
+        can_skip_quality = np.zeros(n, dtype=bool)    # quality-based skip
+
+        # Strategy A: causal margin-based skip
+        if skip_margin_pct is not None:
+            margin = skip_margin_pct / 100.0
+            running_best = np.inf
+            for i in range(n):
+                if feasible[i]:
+                    if costs[i] > running_best * (1 + margin):
+                        can_skip_quality[i] = True
+                    running_best = min(running_best, costs[i])
+
+        # Strategies B & C share basin-cost ranking (retrospective)
+        if top_k_basins is not None or keep_best_pct is not None:
+            basin_best: dict[Any, float] = {}
+            for t in self.trials:
+                if t.is_feasible:
+                    bid = t.basin_id
+                    if bid not in basin_best or t.final_cost < basin_best[bid]:
+                        basin_best[bid] = t.final_cost
+            ranked = sorted(basin_best.items(), key=lambda x: x[1])
+
+            keep_ids: set[Any] | None = None
+
+            if top_k_basins is not None:
+                keep_ids = {bid for bid, _ in ranked[:top_k_basins]}
+
+            if keep_best_pct is not None:
+                k = max(1, int(len(ranked) * keep_best_pct / 100.0))
+                pct_ids = {bid for bid, _ in ranked[:k]}
+                keep_ids = pct_ids if keep_ids is None else keep_ids & pct_ids
+
+            if keep_ids is not None:
+                for i, t in enumerate(self.trials):
+                    if t.is_feasible and t.basin_id not in keep_ids:
+                        can_skip_quality[i] = True
+
+        # Strategy D: ancestry-based skip (retrospective)
+        if ancestry_basins is not None:
+            cost_precision = 4
+            for i, t in enumerate(self.trials):
+                if t.is_feasible:
+                    rounded = round(float(t.basin_id), cost_precision) \
+                        if isinstance(t.basin_id, (int, float)) else t.basin_id
+                    if rounded not in ancestry_basins:
+                        can_skip_quality[i] = True
+
+        # Strategy E: skip trials not inserted into the population
+        if skip_not_inserted:
+            for i, t in enumerate(self.trials):
+                if not t.inserted:
+                    can_skip_quality[i] = True
+
+        can_skip = can_skip_dup | can_skip_quality
+
+        # Build descriptive label
+        label_parts: list[str] = []
+        if skip_margin_pct is not None:
+            label_parts.append(f"margin>{skip_margin_pct}%")
+        if top_k_basins is not None:
+            label_parts.append(f"top-{top_k_basins}")
+        if keep_best_pct is not None:
+            label_parts.append(f"best-{keep_best_pct}%")
+        if ancestry_basins is not None:
+            label_parts.append(f"ancestry({len(ancestry_basins)})")
+        if skip_not_inserted:
+            label_parts.append("pop-only")
+        res.skip_label = "dup + " + " + ".join(label_parts) if label_parts else "dup-only"
+        res.n_skipped_dup = int(can_skip_dup.sum())
+        res.n_skipped_quality = int((can_skip_quality & ~can_skip_dup).sum())
+
         oracle_dur = np.where(can_skip, durations * overhead_ratio, durations)
         oracle_times = np.cumsum(oracle_dur)
 
@@ -281,7 +375,8 @@ class UpperBoundAnalyzer:
         m1 = np.isfinite(base_c)
         ax.plot(t[m1], base_c[m1], label="Baseline", color="tab:blue", linewidth=1.5)
         m2 = np.isfinite(ora_c)
-        ax.plot(t[m2], ora_c[m2], label="Oracle (upper bound)", color="tab:orange", linewidth=1.5)
+        ora_label = f"Oracle ({res.skip_label})"
+        ax.plot(t[m2], ora_c[m2], label=ora_label, color="tab:orange", linewidth=1.5)
         if hgs_cost is not None:
             ax.axhline(hgs_cost, color="red", linestyle="--", linewidth=1.5,
                        label=f"HGS ({hgs_cost:.2f})")
@@ -294,14 +389,29 @@ class UpperBoundAnalyzer:
             if hgs_cost is not None:
                 y_min = min(y_min, hgs_cost)
                 y_max = max(y_max, hgs_cost)
-            # ax.set_ylim(y_min - margin, y_max + margin)
-            ax.set_ylim(17.15, 17.3)
+            ax.set_ylim(y_min - margin, 39.5) # y_max + margin
+            # ax.set_ylim(37.0, 37.)
         if wall_time_max is not None:
             ax.set_xlim(0, wall_time_max)
         ax.set_xlabel("Wall-clock Time")
         ax.set_ylabel("Best Cost Found")
         ax.set_title("Performance–Time Convergence")
-        ax.legend()
+        ax.legend(loc="upper right")
+        # Time to reach final best cost (baseline's last result)
+        final_best = np.nanmin(base_c) if len(base_c) else np.nan
+        if np.isfinite(final_best) and len(t) > 0:
+            hit_b = np.where(base_c <= final_best)[0]
+            hit_o = np.where(ora_c <= final_best)[0]
+            t_baseline = float(t[hit_b[0]]) if len(hit_b) else float(t[-1])
+            t_oracle = float(t[hit_o[0]]) if len(hit_o) else float(t[-1])
+            pct = (t_oracle / t_baseline * 100.0) if t_baseline > 0 else 0.0
+            time_txt = (f"Baseline time to final: {t_baseline:.2f}s\n"
+                        f"Oracle time to final: {t_oracle:.2f}s ({pct:.1f}%)")
+        else:
+            time_txt = (f"Baseline total: {res.baseline_total_time:.2f}s, "
+                        f"Oracle total: {res.oracle_total_time:.2f}s")
+        ax.text(0.98, 0.28, time_txt, transform=ax.transAxes, fontsize=9,
+                va="top", ha="right", bbox=dict(boxstyle="round", facecolor="white", alpha=0.85))
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         fig.savefig(path, dpi=dpi, bbox_inches="tight")
@@ -321,9 +431,9 @@ class UpperBoundAnalyzer:
             base_u = np.append(base_u, base_u[-1])
             ora_u = np.append(ora_u, ora_u[-1])
         ax.plot(t, base_u, label="Baseline", color="tab:blue", linewidth=1.5)
-        # Oracle stops at oracle_total_time (no new optima → no need to keep running)
         mask_ora = t <= res.oracle_total_time
-        ax.plot(t[mask_ora], ora_u[mask_ora], label="Oracle (upper bound)", color="tab:orange", linewidth=1.5)
+        ora_label = f"Oracle ({res.skip_label})"
+        ax.plot(t[mask_ora], ora_u[mask_ora], label=ora_label, color="tab:orange", linewidth=1.5)
         if wall_time_max is not None:
             ax.set_xlim(0, wall_time_max)
         ax.set_xlabel("Wall-clock Time")
@@ -572,10 +682,14 @@ def logs_from_run_cuopt_log_file(
     filepath: str,
     steps_to_time_ratio: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
-    """Parse run_cuopt text log into analyzer logs.
+    """Parse run_cuopt text log into analyzer logs (streaming).
 
     Detects [INFEASIBLE] tag per iteration. A trial is feasible if its last
     iteration is feasible. basin_id = best feasible cost within the trial.
+
+    Also parses ``[POP] add_solution: INSERTED/REPLACED/REJECTED`` lines
+    (printed by verbose population) to determine whether the trial's
+    offspring entered the population.
 
     Time calibration: if *steps_to_time_ratio* is ``None`` (default), the
     function tries to extract the actual time limit from the log's
@@ -583,34 +697,47 @@ def logs_from_run_cuopt_log_file(
     ``time_limit / total_steps`` so that the synthetic timeline matches the
     real wall-clock duration.  Falls back to ``1e-3`` when no summary is found.
     """
-    text = Path(filepath).read_text(encoding="utf-8", errors="replace")
     cost_re = re.compile(r"cost\s+before:\s*[\d.e+-]+\s*,\s*cost\s+after:\s*([\d.e+-]+)", re.I)
     break_re = re.compile(r"\[search\s+#\d+\]|#\s*---\s*break\s*---", re.I)
+    pop_insert_re = re.compile(r"\[POP\] add_solution: (INSERTED|REPLACED|REJECTED)")
 
-    # Each trial element: list of (cost, is_feasible) tuples
-    trials: List[List[tuple]] = []
-    current: List[tuple] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if break_re.search(line):
-            if current:
-                trials.append(current)
-                current = []
-            continue
-        m = cost_re.search(line)
-        if m:
-            feas = "[INFEASIBLE]" not in line
-            current.append((float(m.group(1)), feas))
+    # Each trial: (list of (cost, is_feasible), inserted_flag)
+    trials: List[tuple] = []   # [(iters, inserted), ...]
+    current: List[tuple] = []  # [(cost, is_feasible), ...]
+    current_inserted: bool = True  # default True (if no [POP] line found)
+
+    time_limit_s: float | None = None
+
+    with open(filepath, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if break_re.search(line):
+                if current:
+                    trials.append((current, current_inserted))
+                    current = []
+                    current_inserted = True
+                continue
+            m = cost_re.search(line)
+            if m:
+                feas = "[INFEASIBLE]" not in line
+                current.append((float(m.group(1)), feas))
+                continue
+            mp = pop_insert_re.search(line)
+            if mp:
+                current_inserted = mp.group(1) in ("INSERTED", "REPLACED")
+                continue
+            if time_limit_s is None:
+                tl = re.search(r"Time limit:\s*([\d.]+)\s*s", line)
+                if tl:
+                    time_limit_s = float(tl.group(1))
+
     if current:
-        trials.append(current)
+        trials.append((current, current_inserted))
 
-    # Determine steps_to_time_ratio: auto-calibrate from log summary if not
-    # explicitly provided.
     if steps_to_time_ratio is None:
-        total_steps = sum(len(t) for t in trials)
-        tl_match = re.search(r"Time limit:\s*([\d.]+)\s*s", text)
-        if tl_match and total_steps > 0:
-            steps_to_time_ratio = float(tl_match.group(1)) / total_steps
+        total_steps = sum(len(iters) for iters, _ in trials)
+        if time_limit_s is not None and total_steps > 0:
+            steps_to_time_ratio = time_limit_s / total_steps
         else:
             steps_to_time_ratio = 1e-3
 
@@ -618,7 +745,7 @@ def logs_from_run_cuopt_log_file(
     wall_clock = 0.0
     logs: List[Dict[str, Any]] = []
 
-    for trial_id, iters in enumerate(trials):
+    for trial_id, (iters, inserted) in enumerate(trials):
         steps = len(iters)
         duration = steps * steps_to_time_ratio
         wall_clock += duration
@@ -642,6 +769,7 @@ def logs_from_run_cuopt_log_file(
             "basin_id": final_cost,
             "is_new_discovery": is_new,
             "is_feasible": trial_feasible,
+            "inserted": inserted,
         })
     return logs
 
@@ -660,6 +788,74 @@ def _regroup_by_cost(logs: List[Dict[str, Any]]) -> None:
             seen.add(cost)
         else:
             entry["is_new_discovery"] = False
+
+
+def parse_lineage_from_log(
+    filepath: str,
+    scale: float = 1.0,
+    cost_precision: int = 4,
+) -> Dict[float, set]:
+    """Parse [EVOLVE] lines from a verbose C++ log to build a lineage map.
+
+    Returns a dict ``{child_basin_cost: {parent_cost_1, parent_cost_2, ...}}``.
+    Costs are scaled by ``1/scale`` and rounded to ``cost_precision`` decimals
+    to match the trial log representation.
+
+    Handles ``recombine FAILED`` / ``SKIPPED`` cases where no child line
+    follows a parent line — the pending parents are discarded when the next
+    parent line or a FAILED/SKIPPED line is encountered.
+    """
+    parent_re = re.compile(
+        r"\[EVOLVE\]\s+step=\d+\s+parents:\s+basin_A=([\d.e+-]+)\s+basin_B=([\d.e+-]+)"
+    )
+    child_re = re.compile(
+        r"\[EVOLVE\]\s+crossover.*?new_basin=([\d.e+-]+)"
+    )
+    no_child_re = re.compile(
+        r"\[EVOLVE\]\s+(recombine FAILED|recombine.*?SKIPPED)"
+    )
+
+    lineage: Dict[float, set] = {}
+    pending_parents: tuple | None = None
+
+    with open(filepath, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if "[EVOLVE]" not in line:
+                continue
+            mp = parent_re.search(line)
+            if mp:
+                pa = round(float(mp.group(1)) / scale, cost_precision)
+                pb = round(float(mp.group(2)) / scale, cost_precision)
+                pending_parents = (pa, pb)
+                continue
+            mc = child_re.search(line)
+            if mc and pending_parents is not None:
+                child = round(float(mc.group(1)) / scale, cost_precision)
+                lineage.setdefault(child, set()).update(pending_parents)
+                pending_parents = None
+                continue
+            if no_child_re.search(line):
+                pending_parents = None
+
+    return lineage
+
+
+def compute_ancestry(
+    lineage: Dict[float, set],
+    target: float,
+    cost_precision: int = 4,
+) -> set:
+    """BFS from *target* basin through the lineage map to collect all ancestors."""
+    target = round(target, cost_precision)
+    ancestry: set = {target}
+    queue = [target]
+    while queue:
+        current = queue.pop()
+        for parent in lineage.get(current, set()):
+            if parent not in ancestry:
+                ancestry.add(parent)
+                queue.append(parent)
+    return ancestry
 
 
 def _generate_dummy_logs(n_trials=200, base_duration=0.1, n_unique_basins=50, seed=42):
@@ -728,33 +924,44 @@ if __name__ == "__main__":
                         help="X-axis upper limit for time-based plots")
     parser.add_argument("--dpi", type=int, default=150,
                         help="Figure resolution")
-    parser.add_argument("--solution_pkl", type=str, default="/home/jieyi/hgs_cvrp100_uniform.pkl", #"/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl",
+    parser.add_argument("--solution_pkl", type=str, default="/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl", #"/home/jieyi/hgs_cvrp100_uniform.pkl",
                         help="Path to HGS solution pkl (for auto HGS cost).")
-    parser.add_argument("--instance_index", type=int, default=0,
+    parser.add_argument("--instance_index", type=int, default=9,
                         help="Instance index into the solution pkl.")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Divide all costs by this value (e.g. 100 for raw C++ log)")
+    parser.add_argument("--skip_margin_pct", type=float, default=None,
+                        help="(Strategy A) Skip new basins whose cost exceeds "
+                             "best_so_far × (1+margin/100). Causal.")
+    parser.add_argument("--top_k_basins", type=int, default=None,
+                        help="(Strategy B) Retrospectively keep only the K best "
+                             "unique basins; skip the rest.")
+    parser.add_argument("--keep_best_pct", type=float, default=None,
+                        help="(Strategy C) Retrospectively keep only the best P%% "
+                             "of unique basins; skip the rest.")
+    parser.add_argument("--ancestry", action="store_true",
+                        help="(Strategy D) Keep only basins in the best solution's "
+                             "ancestry tree. Requires [EVOLVE] lines in --log or --lineage_log.")
+    parser.add_argument("--lineage_log", type=str, default=None,
+                        help="Path to verbose C++ log containing [EVOLVE] lines "
+                             "(for --ancestry). Defaults to --log if not specified.")
+    parser.add_argument("--skip_not_inserted", action="store_true",
+                        help="(Strategy E) Skip trials whose offspring was not inserted "
+                             "into the population. Requires [EVOLVE] insertion_rank lines.")
     parser.add_argument("--no_plot", action="store_true")
     parser.add_argument("--steps_to_time", type=float, default=None,
                         help="Steps-to-time conversion ratio (default: auto-calibrate "
                              "from log's Time limit, fallback 1e-3)")
     args = parser.parse_args()
 
-    # Decide default output dir: if user did not override --out_dir (still '.'),
-    # place figures in a sibling 'ub' directory next to the main input log.
-    auto_out_root: Path | None = None
+    # Determine the "base path" for auto output dir (resolved after run_analysis).
+    _auto_base_path: str | None = None
     if args.out_dir == ".":
-        base_path: str | None = None
-        if args.baseline_csv:
-            base_path = args.baseline_csv
-        elif args.upper_bound_log:
-            base_path = args.upper_bound_log
-        elif args.log:
-            base_path = args.log
-        elif args.points_json:
-            base_path = args.points_json
-        if base_path:
-            auto_out_root = Path(base_path).resolve().parent / f"ub_{str(int(args.wall_time_max))}"
+        for candidate in (args.baseline_csv, args.upper_bound_log,
+                          args.log, args.points_json):
+            if candidate:
+                _auto_base_path = candidate
+                break
 
     if args.baseline_csv:
         logs = logs_from_baseline_csv(args.baseline_csv)
@@ -809,12 +1016,49 @@ if __name__ == "__main__":
             json.dump(logs, f, indent=2)
         print(f"Saved trial log to {args.save_log}")
 
+    # Strategy D: ancestry
+    ancestry_set: set | None = None
+    if args.ancestry:
+        lineage_path = args.lineage_log or args.log
+        if lineage_path is None:
+            print("[upper_bound_analyzer] ERROR: --ancestry requires --log or --lineage_log "
+                  "with [EVOLVE] lines.")
+        else:
+            lineage = parse_lineage_from_log(lineage_path, scale=args.scale)
+            print(f"[upper_bound_analyzer] Parsed lineage: "
+                  f"{len(lineage)} child basins from {lineage_path}")
+            feasible_costs = [e["final_cost"] for e in logs
+                              if e.get("is_feasible", True)]
+            if feasible_costs:
+                best = min(feasible_costs)
+                ancestry_set = compute_ancestry(lineage, best)
+                print(f"  Best basin cost: {best:.4f}, "
+                      f"ancestry tree size: {len(ancestry_set)} basins")
+            else:
+                print("  WARNING: no feasible trials found; ancestry disabled.")
+
     analyzer = UpperBoundAnalyzer()
     analyzer.load_logs(logs)
-    analyzer.run_analysis(overhead_ratio=args.overhead)
+    res = analyzer.run_analysis(
+        overhead_ratio=args.overhead,
+        skip_margin_pct=args.skip_margin_pct,
+        top_k_basins=args.top_k_basins,
+        keep_best_pct=args.keep_best_pct,
+        ancestry_basins=ancestry_set,
+        skip_not_inserted=args.skip_not_inserted,
+    )
+    print(f"[upper_bound_analyzer] Strategy: {res.skip_label}")
+    print(f"  Trials: {len(analyzer.trials)}, "
+          f"Skipped: {res.n_skipped_dup} dup + {res.n_skipped_quality} quality, "
+          f"Redundancy: {res.final_redundancy:.1%}")
+    print(f"  Baseline time: {res.baseline_total_time:.2f}s, "
+          f"Oracle time: {res.oracle_total_time:.2f}s "
+          f"({res.oracle_total_time / res.baseline_total_time:.1%})")
 
-    if auto_out_root is not None:
-        args.out_dir = str(auto_out_root)
+    if _auto_base_path is not None:
+        suffix = res.skip_label.replace(" ", "").replace("+", "_")
+        wt = f"_{int(args.wall_time_max)}" if args.wall_time_max else ""
+        args.out_dir = str(Path(_auto_base_path).resolve().parent / f"ub_{suffix}{wt}")
 
     if not args.no_plot:
         if args.combined:

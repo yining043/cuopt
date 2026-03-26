@@ -18,6 +18,8 @@ import math
 import os
 import random
 import re
+import socket
+import subprocess
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import threading
@@ -167,7 +169,7 @@ def build_series(pts, break_mode: str, max_segments, xshift: float,
 
 def _plot_one_figure(named_points, labels, break_mode, segments, xshift, dpi,
                      ymin, ymax, data_key, use_percentage, ylabel, out_path,
-                     hlines=None, feasible_only=True):
+                     hlines=None, feasible_only=True, y_ref_cost=None):
     """Render one figure to *out_path*.
 
     Args:
@@ -196,6 +198,13 @@ def _plot_one_figure(named_points, labels, break_mode, segments, xshift, dpi,
             data_key=data_key,
             use_percentage=use_percentage,
         )
+        if y_ref_cost is not None and y_ref_cost != 0:
+            ys = [
+                ((float(y) / float(y_ref_cost)) * 100.0)
+                if y is not None and not (isinstance(y, float) and math.isnan(y))
+                else y
+                for y in ys
+            ]
         if xs:
             lab = labels[idx] if (labels and idx < len(labels)) else name
             plt.plot(xs, ys, marker=".", linewidth=1.2, label=lab)
@@ -308,12 +317,13 @@ def _plot_best_so_far_interval(config_curves, out_path, out_path_pct,
                     padded[i, len(pct):] = pct[-1]
             mean_y = np.nanmean(padded, axis=0)
             std_y = np.nanstd(padded, axis=0)
-            x = np.arange(1, max_len + 1, dtype=float)
+            # Normalize each config's x-axis by its own total iterations so all curves end at 100%.
+            x = (np.arange(1, max_len + 1, dtype=float) / float(max_len)) * 100.0
             c = colors[idx % len(colors)]
             ax.plot(x, mean_y, color=c, linewidth=1.5, label=cfg_name)
             ax.fill_between(x, mean_y - std_y, mean_y + std_y, color=c, alpha=0.25)
         ax.axhline(100.0, color='red', linestyle='--', linewidth=1.5, label="HGS (100%)")
-        ax.set_xlabel("Cumulative Iteration")
+        ax.set_xlabel("Iteration Progress (%)")
         ax.set_ylabel("Best So Far Cost (% of HGS)")
         ax.legend()
         ax.grid(True)
@@ -829,9 +839,12 @@ def load_embedder_and_classifier(checkpoint_path, classifier_path, problem_size,
     }
     embedder = SolutionEmbedder(model_params).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device)
-    embedder.encoder.load_state_dict(ckpt["encoder_state"])
+    if "embedder_state" in ckpt:
+        embedder.load_state_dict(ckpt["embedder_state"])
+    elif "encoder_state" in ckpt:
+        embedder.encoder.load_state_dict(ckpt["encoder_state"])
+        print("WARNING: legacy checkpoint has encoder_state only; pos_encoder weights are randomly initialized")
     embedder.eval()
-    # Skip torch.compile(embedder.forward): forward uses numpy in position encoding (basesin/basecos), causing "cudagraph partition due to non gpu ops"
     print(f"Loaded embedder from {checkpoint_path} (stage {ckpt.get('stage', '?')}, epoch {ckpt.get('epoch', '?')})")
 
     with open(classifier_path, "rb") as f:
@@ -979,6 +992,23 @@ def _parse_offset_ms_from_capture(text):
     return sum(values), max(values), counts
 
 
+def _wait_unix_socket_ready(socket_path, timeout_s=20.0):
+    """Wait until a Unix socket is connectable."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        if os.path.exists(socket_path):
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                client.settimeout(0.2)
+                client.connect(socket_path)
+                client.close()
+                return True
+            except OSError:
+                client.close()
+        time.sleep(0.1)
+    return False
+
+
 def run_experiment(
     data_path=None,
     problem_path=None,
@@ -1000,6 +1030,10 @@ def run_experiment(
     callback_timeout=30.0,
     device="cuda",
     log_path=None,
+    trace_dir=None,
+    use_landscape_diversity=False,
+    landscape_checkpoint_path=None,
+    landscape_socket_dir="/tmp",
 ):
     """Run cuOpt solver on CVRP instances.
 
@@ -1023,6 +1057,21 @@ def run_experiment(
         raise ValueError("Provide either --problem_path/--solution_path (pkl) or --data_path (txt)")
 
     raw_dist = pairwise_euclidean_distance(raw_nodes)
+
+    # Set up evolution trace directory (for weights + routes visualization)
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+        os.environ["CUOPT_TRACE_DIR"] = trace_dir
+        import numpy as np
+        coords = raw_nodes[0].numpy()  # (n+1, 2) first instance
+        coords_path = os.path.join(trace_dir, "coords.csv")
+        with open(coords_path, "w") as cf:
+            cf.write("node_id,x,y\n")
+            for nid in range(coords.shape[0]):
+                cf.write(f"{nid},{coords[nid, 0]:.8f},{coords[nid, 1]:.8f}\n")
+        print(f"[trace] Saved {coords.shape[0]} node coordinates to {coords_path}", flush=True)
+    else:
+        os.environ.pop("CUOPT_TRACE_DIR", None)
 
     # Load embedding model and classifier if needed
     embedder, classifier = None, None
@@ -1065,86 +1114,164 @@ def run_experiment(
     offset_value_counts = {}
     if log_path and need_callback:
         open(log_path, "w").close()
+
+    # Optional: automatic landscape diversity via embedding_server.py
+    landscape_proc = None
+    landscape_socket_path = None
+    prev_metric_env = os.environ.get("CUOPT_DIVERSITY_METRIC")
+    prev_socket_env = os.environ.get("CUOPT_EMBEDDING_SOCKET")
+    if use_landscape_diversity:
+        if not problem_path:
+            raise ValueError("--problem_path is required when --landscape_diversity is enabled")
+        if not landscape_checkpoint_path:
+            raise ValueError("--landscape_checkpoint is required when --landscape_diversity is enabled")
+        server_script = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "embedding_server.py")
+        )
+        if not os.path.isfile(server_script):
+            raise FileNotFoundError(f"embedding_server.py not found: {server_script}")
+        os.makedirs(landscape_socket_dir, exist_ok=True)
+        os.environ["CUOPT_DIVERSITY_METRIC"] = "landscape"
+    else:
+        os.environ.pop("CUOPT_DIVERSITY_METRIC", None)
+        os.environ.pop("CUOPT_EMBEDDING_SOCKET", None)
+
     with tqdm(total=total, desc="Solving with cuOpt") as pbar:
-        for i in range(n_instances):
-            raw_cost_value = raw_cost[i].item()
-            hgs_costs[i] = raw_cost_value
-            run_costs = []
-            inst_es = 0
-            inst_iters = 0
-            inst_trials = 0
+        try:
+            for i in range(n_instances):
+                abs_index = start_index + i
+                if use_landscape_diversity:
+                    if landscape_proc is not None:
+                        landscape_proc.terminate()
+                        try:
+                            landscape_proc.wait(timeout=5.0)
+                        except subprocess.TimeoutExpired:
+                            landscape_proc.kill()
+                            landscape_proc.wait(timeout=5.0)
+                        landscape_proc = None
+                    landscape_socket_path = os.path.join(
+                        landscape_socket_dir, f"cuopt_embedding_{abs_index}.sock"
+                    )
+                    launch_cmd = [
+                        sys.executable,
+                        server_script,
+                        "--checkpoint",
+                        landscape_checkpoint_path,
+                        "--instance_pkl",
+                        problem_path,
+                        "--instance_index",
+                        str(abs_index),
+                        "--socket_path",
+                        landscape_socket_path,
+                        "--device",
+                        device,
+                    ]
+                    landscape_proc = subprocess.Popen(launch_cmd)
+                    if not _wait_unix_socket_ready(landscape_socket_path, timeout_s=20.0):
+                        raise RuntimeError(
+                            f"embedding server not ready for instance {abs_index}: {landscape_socket_path}"
+                        )
+                    os.environ["CUOPT_EMBEDDING_SOCKET"] = landscape_socket_path
+                    print(
+                        f"[landscape] instance={abs_index}, socket={landscape_socket_path}, "
+                        f"pid={landscape_proc.pid}",
+                        flush=True,
+                    )
 
-            # Set up CVRPEnv for this instance (embedding mode)
-            env = None
-            if embedder is not None:
-                env = setup_env_for_instance(i, raw_nodes, raw_demand, raw_cap, device=device)
+                raw_cost_value = raw_cost[i].item()
+                hgs_costs[i] = raw_cost_value
+                run_costs = []
+                inst_es = 0
+                inst_iters = 0
+                inst_trials = 0
 
-            # Build callback class per instance (env is instance-specific)
-            CallbackCls = _make_callback_class(
-                scale=scale, early_stop=use_callback,
-                early_stop_base=early_stop_base,
-                embedder=embedder, env=env, classifier=classifier,
-                check_interval=check_interval, classifier_type=classifier_type,
-                callback_timeout=callback_timeout,
-                demands=raw_demand[i].numpy(),
-                capacity=raw_cap[i].item(),
-            ) if need_callback else None
+                # Set up CVRPEnv for this instance (embedding mode)
+                env = None
+                if embedder is not None:
+                    env = setup_env_for_instance(i, raw_nodes, raw_demand, raw_cap, device=device)
 
-            for k in range(n_runs):
-                callback = CallbackCls() if need_callback else None
-                model = get_cuopt_model(i, raw_dist, raw_demand, raw_cap, n_vehicles, scale)
-                if need_callback:
-                    solution, captured = _run_solver_capture_stdout(model, time_limit, callback, log_path=log_path if k == 0 and i == 0 else None)
-                    if log_path and (i > 0 or k > 0):
-                        with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
-                            lf.write(captured)
-                    run_sum, run_max, run_counts = _parse_offset_ms_from_capture(captured)
-                    total_offset_cpp_ms += run_sum
-                    if run_max > max_offset_cpp_ms:
-                        max_offset_cpp_ms = run_max
-                    for x, c in run_counts.items():
-                        offset_value_counts[x] = offset_value_counts.get(x, 0) + c
+                # Build callback class per instance (env is instance-specific)
+                CallbackCls = _make_callback_class(
+                    scale=scale, early_stop=use_callback,
+                    early_stop_base=early_stop_base,
+                    embedder=embedder, env=env, classifier=classifier,
+                    check_interval=check_interval, classifier_type=classifier_type,
+                    callback_timeout=callback_timeout,
+                    demands=raw_demand[i].numpy(),
+                    capacity=raw_cap[i].item(),
+                ) if need_callback else None
+
+                for k in range(n_runs):
+                    callback = CallbackCls() if need_callback else None
+                    model = get_cuopt_model(i, raw_dist, raw_demand, raw_cap, n_vehicles, scale)
+                    if need_callback:
+                        solution, captured = _run_solver_capture_stdout(model, time_limit, callback, log_path=log_path if k == 0 and i == 0 else None)
+                        if log_path and (i > 0 or k > 0):
+                            with open(log_path, "a", encoding="utf-8", errors="replace") as lf:
+                                lf.write(captured)
+                        run_sum, run_max, run_counts = _parse_offset_ms_from_capture(captured)
+                        total_offset_cpp_ms += run_sum
+                        if run_max > max_offset_cpp_ms:
+                            max_offset_cpp_ms = run_max
+                        for x, c in run_counts.items():
+                            offset_value_counts[x] = offset_value_counts.get(x, 0) + c
+                    else:
+                        print(f"[run_cuopt] Instance {i} Run {k}: calling solver (time_limit={time_limit}s)...", file=sys.stderr, flush=True)
+                        solution = solve_cuopt(model, time_limit, callback=callback)
+                        print(f"[run_cuopt] Instance {i} Run {k}: solver returned.", file=sys.stderr, flush=True)
+
+                    if solution:
+                        cost = solution.get_total_objective() / scale
+                        run_costs.append(cost)
+                        gap = ((cost - raw_cost_value) / raw_cost_value) * 100
+                        es_info = f" | EarlyStops: {callback.n_early_stops}" if callback else ""
+                        print(f"[Instance {i} Run {k}] Cost: {cost:.2f} | Best Known: {raw_cost_value:.2f} | Gap: {gap:.2f}%{es_info}", flush=True)
+                    else:
+                        print(f"[Instance {i} Run {k}] No feasible solution.", flush=True)
+
+                    if callback:
+                        inst_es += callback.n_early_stops
+                        inst_iters += callback.n_iterations
+                        inst_trials += callback.n_trials
+                        total_callback_time_ms += callback._total_callback_time_ms
+
+                    # Collect callback data
+                    if collect_data and callback and callback.points:
+                        label = f"inst{i}" if n_runs == 1 else f"inst{i}_run{k}"
+                        all_run_points.append((label, list(callback.points)))
+
+                    pbar.update(1)
+
+                early_stop_counts.append(inst_es)
+                iteration_counts.append(inst_iters)
+                trial_counts.append(inst_trials)
+
+                if run_costs:
+                    best = min(run_costs)
+                    best_gap = ((best - raw_cost_value) / raw_cost_value) * 100
+                    best_costs.append(best)
+                    best_gaps.append(best_gap)
+                    if n_runs > 1:
+                        print(f"[Instance {i}] Best of {n_runs} runs: {best:.2f} | Gap: {best_gap:.2f}%")
                 else:
-                    print(f"[run_cuopt] Instance {i} Run {k}: calling solver (time_limit={time_limit}s)...", file=sys.stderr, flush=True)
-                    solution = solve_cuopt(model, time_limit, callback=callback)
-                    print(f"[run_cuopt] Instance {i} Run {k}: solver returned.", file=sys.stderr, flush=True)
-
-                if solution:
-                    cost = solution.get_total_objective() / scale
-                    run_costs.append(cost)
-                    gap = ((cost - raw_cost_value) / raw_cost_value) * 100
-                    es_info = f" | EarlyStops: {callback.n_early_stops}" if callback else ""
-                    print(f"[Instance {i} Run {k}] Cost: {cost:.2f} | Best Known: {raw_cost_value:.2f} | Gap: {gap:.2f}%{es_info}", flush=True)
-                else:
-                    print(f"[Instance {i} Run {k}] No feasible solution.", flush=True)
-
-                if callback:
-                    inst_es += callback.n_early_stops
-                    inst_iters += callback.n_iterations
-                    inst_trials += callback.n_trials
-                    total_callback_time_ms += callback._total_callback_time_ms
-
-                # Collect callback data
-                if collect_data and callback and callback.points:
-                    label = f"inst{i}" if n_runs == 1 else f"inst{i}_run{k}"
-                    all_run_points.append((label, list(callback.points)))
-
-                pbar.update(1)
-
-            early_stop_counts.append(inst_es)
-            iteration_counts.append(inst_iters)
-            trial_counts.append(inst_trials)
-
-            if run_costs:
-                best = min(run_costs)
-                best_gap = ((best - raw_cost_value) / raw_cost_value) * 100
-                best_costs.append(best)
-                best_gaps.append(best_gap)
-                if n_runs > 1:
-                    print(f"[Instance {i}] Best of {n_runs} runs: {best:.2f} | Gap: {best_gap:.2f}%")
+                    best_costs.append(None)
+                    best_gaps.append(None)
+        finally:
+            if landscape_proc is not None:
+                landscape_proc.terminate()
+                try:
+                    landscape_proc.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    landscape_proc.kill()
+                    landscape_proc.wait(timeout=5.0)
+            if prev_metric_env is None:
+                os.environ.pop("CUOPT_DIVERSITY_METRIC", None)
             else:
-                best_costs.append(None)
-                best_gaps.append(None)
+                os.environ["CUOPT_DIVERSITY_METRIC"] = prev_metric_env
+            if prev_socket_env is None:
+                os.environ.pop("CUOPT_EMBEDDING_SOCKET", None)
+            else:
+                os.environ["CUOPT_EMBEDDING_SOCKET"] = prev_socket_env
 
     if need_callback:
         print(
@@ -1176,6 +1303,36 @@ def _write_log(named_points, hgs_costs, filepath):
                     prev_was_break = False
                 f.write(f"cost before: {p.get('before', 0)}, cost after: {p['after']}\n")
     print(f"Saved log to: {filepath}")
+
+
+def _load_labeled_log(filepath):
+    """Load a log written by _write_log and recover (named_points, hgs_costs)."""
+    raw = open(filepath, "r", encoding="utf-8", errors="ignore").read()
+    header_re = re.compile(r"^# === (.+?) \(HGS: ([^)]+)\) ===\s*$", re.M)
+
+    matches = list(header_re.finditer(raw))
+    if not matches:
+        return [], {}
+
+    named_points = []
+    hgs_costs = {}
+    for i, m in enumerate(matches):
+        label = m.group(1).strip()
+        hgs_str = m.group(2).strip()
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        body = raw[body_start:body_end]
+        pts = parse_points(body)
+        named_points.append((label, pts))
+
+        inst_m = re.search(r"inst(\d+)", label)
+        if inst_m:
+            inst_idx = int(inst_m.group(1))
+            try:
+                hgs_costs[inst_idx] = float(hgs_str)
+            except ValueError:
+                pass
+    return named_points, hgs_costs
 
 
 def _timestamp_dir():
@@ -1261,13 +1418,20 @@ class _TeeStdout:
 
 def cmd_solve(args):
     """Execute the 'solve' subcommand. With --log, stdout (including C++ solver) is tee'd to the log file."""
-    effective_out = os.path.join(args.out_dir, "curves", str(args.start_index) + "_tl_" + str(int(args.time_limit)) + "_" + _timestamp_dir())
+    effective_out = os.path.join(args.out_dir, "curves", args.problem_path.split("/")[-1].split(".")[0] + "_" + str(args.start_index) + "_tl_" + str(int(args.time_limit)) + "_" + _timestamp_dir())
     log_path = None
     if args.log is not None:
         os.makedirs(effective_out, exist_ok=True)
         log_path = os.path.join(effective_out, os.path.basename(args.log) or "log.txt")
 
     need_collect = args.plot or args.save_upper_bound_log
+    # Enable evolution tracing when --trace is set
+    trace_dir = effective_out if getattr(args, "trace", False) else None
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+    if args.landscape_diversity and not args.landscape_checkpoint:
+        args.landscape_checkpoint = args.checkpoint
+
     run_kwargs = dict(
         data_path=args.data_path,
         problem_path=args.problem_path,
@@ -1288,13 +1452,39 @@ def cmd_solve(args):
         classifier_type=args.classifier_type,
         callback_timeout=args.callback_timeout,
         device=args.device,
+        log_path=log_path,
+        trace_dir=trace_dir,
+        use_landscape_diversity=args.landscape_diversity,
+        landscape_checkpoint_path=args.landscape_checkpoint,
+        landscape_socket_dir=args.landscape_socket_dir,
     )
+
+    # Launch live trace visualizer in background (before solver starts)
+    _live_viz_proc = None
+    if trace_dir:
+        _viz_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visualize_evolution_live.py")
+        if os.path.isfile(_viz_script):
+            import subprocess
+            _live_viz_proc = subprocess.Popen(
+                [sys.executable, _viz_script,
+                 "--trace_dir", trace_dir, "--output_dir", trace_dir,
+                 "--live", "--poll_interval", "3"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            print(f"[trace] Live visualizer started (pid={_live_viz_proc.pid}), "
+                  f"updating {trace_dir}/weights_evolution.png + route_latest.png", flush=True)
 
     if log_path is not None:
         with _TeeStdout(log_path):
             costs, gaps, all_run_points, hgs_costs, *_ = run_experiment(**run_kwargs)
     else:
         costs, gaps, all_run_points, hgs_costs, *_ = run_experiment(**run_kwargs)
+
+    # Stop live visualizer
+    if _live_viz_proc is not None:
+        _live_viz_proc.terminate()
+        _live_viz_proc.wait(timeout=5)
+        print(f"[trace] Live visualizer stopped.", flush=True)
 
     if log_path is not None:
         print(f"Saved log (terminal output) to: {log_path}", flush=True)
@@ -1337,6 +1527,21 @@ def cmd_solve(args):
             print(f"Saved upper-bound trial log to: {out_path}")
         except Exception as e:
             print(f"[WARN] Failed to save upper_bound_log: {e}")
+
+    # Run evolution trace visualization (post-hoc)
+    if trace_dir and os.path.isfile(os.path.join(trace_dir, "trace.csv")):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visualize_evolution_live.py")
+        if os.path.isfile(script):
+            import subprocess
+            print(f"[trace] Running evolution visualization on {trace_dir}/ ...", flush=True)
+            subprocess.run([
+                sys.executable, script,
+                "--trace_dir", trace_dir,
+                "--output_dir", trace_dir,
+            ], check=False)
+            print(f"[trace] Visualization outputs in: {trace_dir}/", flush=True)
+        else:
+            print(f"[trace] Visualization script not found: {script}", file=sys.stderr)
 
 
 def cmd_plot(args):
@@ -1668,9 +1873,10 @@ def cmd_curves(args):
             named_points=named_points, labels=None,
             break_mode="none", segments=0, xshift=0.0, dpi=args.dpi,
             ymin=args.ymin, ymax=args.ymax,
-            data_key='after', use_percentage=True, ylabel="Cost after",
+            data_key='after', use_percentage=True, ylabel="Cost after (% of HGS)",
             out_path=os.path.join(effective_out, "after_pct.png"),
             hlines=[(100.0, "HGS (100%)")] if hgs_val else None,
+            y_ref_cost=hgs_val,
         )
     else:
         plot_from_points(
@@ -1689,6 +1895,129 @@ def cmd_curves(args):
     print(f"\nCurves saved to {effective_out}/ (log.txt, after.png, best_so_far.png, after_pct.png, best_so_far_pct.png)")
 
 
+def cmd_landscape_curves(args):
+    """Compare baseline vs landscape diversity over repeated runs and plot mean±std curves."""
+    run_stamp = _timestamp_dir()
+    curves_root = os.path.join(args.out_dir, "curves")
+    os.makedirs(curves_root, exist_ok=True)
+    configs = [
+        ("baseline", False),
+        ("landscape", True),
+    ]
+    labels = [c[0] for c in configs]
+    named_points = []
+    hgs_costs = None
+
+    if args.load_log:
+        named_points, hgs_costs = _load_labeled_log(args.load_log)
+        if not named_points:
+            raise ValueError(f"No labeled runs found in log: {args.load_log}")
+        effective_out = os.path.join(curves_root, f"landscape_replot_{run_stamp}")
+        os.makedirs(effective_out, exist_ok=True)
+        print(f"Loaded log from: {args.load_log}")
+    else:
+        landscape_ckpt = args.landscape_checkpoint or args.checkpoint
+        if not landscape_ckpt:
+            raise ValueError(
+                "--landscape_checkpoint or --checkpoint is required for landscape_curves "
+                "(unless --load_log is provided)"
+            )
+
+        for cfg_name, use_landscape in configs:
+            print(f"\n--- {cfg_name} ---")
+            _, _, all_run_points, hgs_costs, *_ = run_experiment(
+                data_path=args.data_path,
+                problem_path=args.problem_path,
+                solution_path=args.solution_path,
+                time_limit=args.time_limit,
+                n_instances=args.n_instances,
+                start_index=args.start_index,
+                problem_type=args.problem_type,
+                scale=args.scale,
+                n_vehicles=args.n_vehicles,
+                n_runs=args.n_runs,
+                use_callback=False,
+                collect_data=True,
+                early_stop_base="random",
+                checkpoint_path=args.checkpoint,
+                classifier_path=args.classifier_pkl,
+                check_interval=1,
+                classifier_type="threshold",
+                device=args.device,
+                use_landscape_diversity=use_landscape,
+                landscape_checkpoint_path=landscape_ckpt,
+                landscape_socket_dir=args.landscape_socket_dir,
+            )
+            for label, points in all_run_points:
+                named_points.append((f"{cfg_name}_{label}", points))
+
+        if not named_points:
+            print("No data collected. Check problem/solution paths.")
+            return
+
+        effective_out = os.path.join(curves_root, f"landscape_{run_stamp}")
+        os.makedirs(effective_out, exist_ok=True)
+        # Keep legacy log in run folder for backward compatibility.
+        _write_log(named_points, hgs_costs, os.path.join(effective_out, "log.txt"))
+
+    # Save timestamped combined log directly under curves/.
+    combined_log_path = os.path.join(curves_root, f"log_{run_stamp}.txt")
+    _write_log(named_points, hgs_costs, combined_log_path)
+
+    # Also save per-setting logs for convenient reload/inspection.
+    for cfg_name in labels:
+        cfg_points = [(lab, pts) for lab, pts in named_points if lab.startswith(f"{cfg_name}_")]
+        if cfg_points:
+            cfg_log_path = os.path.join(effective_out, f"{cfg_name}.log.txt")
+            _write_log(cfg_points, hgs_costs, cfg_log_path)
+
+    n_per_config = args.n_instances * args.n_runs
+    config_curves = {}
+    for j, cfg_name in enumerate(labels):
+        start = j * n_per_config
+        end = start + n_per_config
+        if end <= len(named_points):
+            config_curves[cfg_name] = [named_points[k][1] for k in range(start, end)]
+
+    hgs_val = None
+    if hgs_costs and 0 in hgs_costs:
+        hgs_val = hgs_costs[0]
+
+    _plot_best_so_far_interval(
+        config_curves,
+        out_path=os.path.join(effective_out, "best_so_far.png"),
+        out_path_pct=os.path.join(effective_out, "best_so_far_pct.png"),
+        dpi=args.dpi,
+        ymin=args.ymin,
+        ymax=args.ymax,
+        hgs_cost=hgs_val,
+        colors=["#1f77b4", "#d62728"],
+        feasible_only=not args.include_infeasible,
+    )
+
+    _plot_one_figure(
+        named_points=named_points,
+        labels=None,
+        break_mode="none",
+        segments=0,
+        xshift=0.0,
+        dpi=args.dpi,
+        ymin=args.ymin,
+        ymax=args.ymax,
+        data_key="after",
+        use_percentage=True,
+        ylabel="Cost after (% of HGS)",
+        out_path=os.path.join(effective_out, "after_pct.png"),
+        hlines=[(100.0, "HGS (100%)")] if hgs_val else None,
+        y_ref_cost=hgs_val,
+    )
+    print(
+        f"\nLandscape comparison curves saved to {effective_out}/ "
+        f"(best_so_far.png, best_so_far_pct.png, after_pct.png). "
+        f"Combined log: {combined_log_path}"
+    )
+
+
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main():
@@ -1702,10 +2031,19 @@ def main():
     sp = sub.add_parser("solve", help="Run cuOpt solver on CVRP instances")
     sp.add_argument("--data_path", default=None, type=str,
                     help="Path to txt dataset file (original format)")
-    sp.add_argument("--problem_path", default="/home/jieyi/CaR-constraint/data/CVRP/cvrp1000_uniform_LV0.pkl", type=str,
+    sp.add_argument("--problem_size", type=int, default=100, help="CVRP instance size (100 or 1000)")
+    sp.add_argument("--problem_path", type=str, default=None,
                     help="Path to CVRP problem pkl file")
-    sp.add_argument("--solution_path", default="/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl", type=str,
+    sp.add_argument("--solution_path", type=str, default=None,
                     help="Path to HGS solution pkl file")
+    # sp.add_argument("--problem_path", default="/home/jieyi/CaR-constraint/data/CVRP/cvrp1000_uniform_LV0.pkl", type=str,
+    #                 help="Path to CVRP problem pkl file")
+    # sp.add_argument("--solution_path", default="/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl", type=str,
+    #                 help="Path to HGS solution pkl file")
+    # sp.add_argument("--problem_path", default="/home/jieyi/cvrp100_uniform.pkl", type=str,
+    #                 help="Path to CVRP problem pkl file")
+    # sp.add_argument("--solution_path", default="/home/jieyi/hgs_cvrp100_uniform.pkl", type=str,
+    #                 help="Path to HGS solution pkl file")
     sp.add_argument("--time_limit", type=float, default=5, help="Time limit per instance (seconds)")
     sp.add_argument("--n_instances", type=int, default=1, help="Number of instances to run")
     sp.add_argument("--start_index", type=int, default=60, help="Starting instance index")
@@ -1732,6 +2070,12 @@ def main():
     sp.add_argument("--callback_timeout", type=float, default=30.0,
                     help="Max seconds for early-stop callback; on timeout solver continues (default 30)")
     sp.add_argument("--device", type=str, default="cuda", help="Torch device for embedder (default: cuda)")
+    sp.add_argument("--landscape_diversity", action="store_true",
+                    help="Use landscape-aware diversity metric in C++ and auto-manage embedding server per instance.")
+    sp.add_argument("--landscape_checkpoint", type=str, default=None,
+                    help="Path to checkpoint for landscape diversity embedding server (defaults to --checkpoint).")
+    sp.add_argument("--landscape_socket_dir", type=str, default="/tmp",
+                    help="Directory for per-instance Unix socket files (default: /tmp).")
     # Auto-plot options
     sp.add_argument("--plot", action='store_true', help="Auto-plot convergence after solving")
     sp.add_argument("--log", type=str, default=None, help="Save log to this file (for later re-plotting)")
@@ -1754,6 +2098,8 @@ def main():
     sp.add_argument("--ymax", type=float, default=None, help="Y-axis upper bound (auto from HGS if omitted)")
     sp.add_argument("--include-infeasible", action="store_true",
                     help="Include infeasible points in best_so_far / best_so_far_pct (default: feasible only).")
+    sp.add_argument("--trace", action="store_true",
+                    help="Enable evolution tracing: write weights & route data to trace.csv for visualization.")
 
     # ---- plot ----
     pp = sub.add_parser("plot", help="Plot cost curves from solver log files")
@@ -1840,7 +2186,45 @@ def main():
     cv.add_argument("--include-infeasible", action="store_true",
                     help="Include infeasible points in best_so_far / best_so_far_pct (default: feasible only).")
 
+    # ---- landscape_curves ----
+    lc = sub.add_parser(
+        "landscape_curves",
+        help="Compare baseline vs landscape diversity and plot mean±std curves",
+    )
+    lc.add_argument("--data_path", default=None, type=str)
+    lc.add_argument("--problem_path", default="/home/jieyi/cvrp100_uniform.pkl", type=str)
+    lc.add_argument("--solution_path", default="/home/jieyi/hgs_cvrp100_uniform.pkl", type=str)
+    lc.add_argument("--time_limit", type=float, default=5)
+    lc.add_argument("--n_instances", type=int, default=1)
+    lc.add_argument("--start_index", type=int, default=0)
+    lc.add_argument("--problem_type", type=str, default="CVRP")
+    lc.add_argument("--n_vehicles", type=int, default=21)
+    lc.add_argument("--scale", type=float, default=1e2)
+    lc.add_argument("--n_runs", type=int, default=20, help="Runs per config (default: 20)")
+    lc.add_argument("--checkpoint", type=str, default=None, help="Optional fallback checkpoint path")
+    lc.add_argument("--landscape_checkpoint", type=str, required=False,
+                    help="Checkpoint used by embedding_server for landscape diversity")
+    lc.add_argument("--load_log", type=str, default=None,
+                    help="Path to a previously saved landscape log.txt; if set, skip solving and replot only.")
+    lc.add_argument("--landscape_socket_dir", type=str, default="/tmp")
+    lc.add_argument("--classifier_pkl", type=str, default=None, help="Unused here; kept for signature compatibility")
+    lc.add_argument("--device", type=str, default="cuda")
+    lc.add_argument("--out_dir", type=str, default=".")
+    lc.add_argument("--dpi", type=int, default=160)
+    lc.add_argument("--ymin", type=float, default=None)
+    lc.add_argument("--ymax", type=float, default=None)
+    lc.add_argument("--include-infeasible", action="store_true")
+
     args = parser.parse_args()
+    if hasattr(args, "problem_size"):
+        if args.problem_size == 100:
+            args.problem_path = "/home/jieyi/cvrp100_uniform.pkl"
+            args.solution_path = "/home/jieyi/hgs_cvrp100_uniform.pkl"
+        elif args.problem_size == 1000:
+            args.problem_path = "/home/jieyi/CaR-constraint/data/CVRP/cvrp1000_uniform_LV0.pkl"
+            args.solution_path = "/home/jieyi/CaR-constraint/data/CVRP/hgs_cvrp1000_uniform_LV0.pkl"
+        else:
+            raise ValueError(f"Invalid problem size: {args.problem_size}")
 
     if args.command == "solve":
         cmd_solve(args)
@@ -1850,6 +2234,8 @@ def main():
         cmd_compare(args)
     elif args.command == "curves":
         cmd_curves(args)
+    elif args.command == "landscape_curves":
+        cmd_landscape_curves(args)
     else:
         parser.print_help()
 
