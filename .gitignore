@@ -81,3 +81,5 @@ compare*/
 *.md
 *.log
 oracle_out/*
+*.mmd
+*.jsonl*.log
