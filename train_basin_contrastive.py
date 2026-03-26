@@ -385,7 +385,8 @@ def _embed_val_triplets_2d(
                     continue
                 else:
                     sols = [val]
-                emb = embed_solutions(embedder, sols, env, basin_info_cache)
+                # Use the same cache object passed to env.load for this instance.
+                emb = embed_solutions(embedder, sols, env, basin_cache)
                 for j in range(emb.size(0)):
                     all_emb.append(emb[j])
                     all_inst_ids.append(inst_idx)
