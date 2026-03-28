@@ -216,6 +216,8 @@ class local_search_t {
                         const Container& container, 
                         size_t limit, 
                         Accessor accessor);
+  /** Prints doubles with full precision (not via the i_t/%d path). */
+  void print_collection(const char* prefix, const std::vector<double>& values, size_t limit);
   void sort_move_candidates_by_cost(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_sliding_search(solution_t<i_t, f_t, REQUEST>& sol);
   bool run_two_opt_search(solution_t<i_t, f_t, REQUEST>& sol);

@@ -164,7 +164,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--callback-top-frac",
         type=float,
-        default=0.3,
+        default=0.1,
         help="Callback：在 pred 最小的 ceil(frac×K_valid) 条 trail 中随机选一条（默认 0.3=前30%%）",
     )
 
