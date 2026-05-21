@@ -48,12 +48,14 @@ public:
   // @param objective      Current objective cost value
   // @param iteration      Current iteration number
   // @param early_stop_out OUTPUT - Set to true to stop local search early
+  // @param phase          0 = regular LS step, 1 = cycle_finder step (default 0 for backwards compat)
   virtual void customize_early_stop(
     const std::vector<i_t>* solution_flat,
     i_t num_routes,
     f_t objective,
     i_t iteration,
-    bool* early_stop_out
+    bool* early_stop_out,
+    i_t phase = 0
   ) = 0;
 
   callback_type_t get_type() const override {

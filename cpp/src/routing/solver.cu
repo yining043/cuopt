@@ -42,10 +42,31 @@
 #include <thrust/tuple.h>
 #include <thrust/unique.h>
 #include <chrono>
+#include <atomic>
 #include <limits>
 #include <numeric>
 
 namespace cuopt {
+namespace detail {
+// Definition of abort_solve_flag function (cython wrapper has unresolved reference to it).
+// 4/10 era: this didn't exist; 5/3 added it for "depth ES aborts entire solve" behavior.
+// We keep the definition (so cython links) but timer.hpp doesn't read it (kept at HEAD = no read).
+// Net effect: cython sets the flag, no one reads it → harmless.
+__attribute__((visibility("default"))) std::atomic<bool>& abort_solve_flag()
+{
+  static std::atomic<bool> val{false};
+  return val;
+}
+
+// Embedding-IPC nanosecond accumulator (4/1 era code in adapted_sol.cuh references this).
+// Used to track total time spent on embedding IPC for time-compensation accounting.
+__attribute__((visibility("default"))) std::atomic<long long>& embedding_ipc_ns()
+{
+  static std::atomic<long long> val{0};
+  return val;
+}
+}  // namespace detail
+
 namespace routing {
 
 template <typename i_t, typename f_t>

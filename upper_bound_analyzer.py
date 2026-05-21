@@ -52,6 +52,9 @@ class ExperimentResults:
     skip_label: str = "dup-only"
     n_skipped_dup: int = 0
     n_skipped_quality: int = 0
+    n_false_skipped: int = 0
+    n_missed_skips: int = 0
+    n_actual_skipped: int = 0
 
 
 def _resample_step(
@@ -100,6 +103,9 @@ class UpperBoundAnalyzer:
         keep_best_pct: float | None = None,
         ancestry_basins: set | None = None,
         skip_not_inserted: bool = False,
+        false_skip_prob: float = 0.0,
+        miss_skip_prob: float = 0.0,
+        random_seed: int | None = None,
     ) -> ExperimentResults:
         """Run all four experiments.
 
@@ -120,6 +126,11 @@ class UpperBoundAnalyzer:
                 not in this set are skipped.
             skip_not_inserted: (Strategy E) Skip trials whose offspring was
                 not inserted/replaced into the population (retrospective).
+            false_skip_prob: With probability E, wrongly skip a trial that
+                would otherwise be kept (simulates false positive pruning).
+            miss_skip_prob: With probability E, fail to skip a trial that
+                would ideally be skipped (simulates false negative pruning).
+            random_seed: RNG seed for error simulation.
         """
         assert self.trials, "No trials loaded. Call load_logs() first."
         res = ExperimentResults()
@@ -194,7 +205,19 @@ class UpperBoundAnalyzer:
                 if not t.inserted:
                     can_skip_quality[i] = True
 
-        can_skip = can_skip_dup | can_skip_quality
+        ideal_skip = can_skip_dup | can_skip_quality
+        can_skip = ideal_skip.copy()
+        false_skip_mask = np.zeros(n, dtype=bool)
+        miss_skip_mask = np.zeros(n, dtype=bool)
+        if false_skip_prob > 0.0 or miss_skip_prob > 0.0:
+            rng = np.random.default_rng(random_seed)
+            if false_skip_prob > 0.0:
+                p_fp = float(np.clip(false_skip_prob, 0.0, 1.0))
+                false_skip_mask = (~ideal_skip) & (rng.random(n) < p_fp)
+            if miss_skip_prob > 0.0:
+                p_fn = float(np.clip(miss_skip_prob, 0.0, 1.0))
+                miss_skip_mask = ideal_skip & (rng.random(n) < p_fn)
+            can_skip = (ideal_skip | false_skip_mask) & ~miss_skip_mask
 
         # Build descriptive label
         label_parts: list[str] = []
@@ -208,9 +231,16 @@ class UpperBoundAnalyzer:
             label_parts.append(f"ancestry({len(ancestry_basins)})")
         if skip_not_inserted:
             label_parts.append("pop-only")
+        if false_skip_prob > 0.0:
+            label_parts.append(f"fp@{false_skip_prob * 100:.1f}%")
+        if miss_skip_prob > 0.0:
+            label_parts.append(f"fn@{miss_skip_prob * 100:.1f}%")
         res.skip_label = "dup + " + " + ".join(label_parts) if label_parts else "dup-only"
         res.n_skipped_dup = int(can_skip_dup.sum())
         res.n_skipped_quality = int((can_skip_quality & ~can_skip_dup).sum())
+        res.n_false_skipped = int(false_skip_mask.sum())
+        res.n_missed_skips = int(miss_skip_mask.sum())
+        res.n_actual_skipped = int(can_skip.sum())
 
         oracle_dur = np.where(can_skip, durations * overhead_ratio, durations)
         oracle_times = np.cumsum(oracle_dur)
@@ -222,6 +252,17 @@ class UpperBoundAnalyzer:
             if feasible[i]:
                 running_best = min(running_best, costs[i])
             best_cost[i] = running_best
+
+        oracle_best_cost = np.full(n, np.inf)
+        oracle_running_best = np.inf
+        oracle_unique_count = np.zeros(n, dtype=int)
+        oracle_seen: set[Any] = set()
+        for i, t in enumerate(self.trials):
+            if (not can_skip[i]) and feasible[i]:
+                oracle_running_best = min(oracle_running_best, costs[i])
+                oracle_seen.add(t.basin_id)
+            oracle_best_cost[i] = oracle_running_best
+            oracle_unique_count[i] = len(oracle_seen)
 
         res.baseline_total_time = float(base_times[-1])
         res.oracle_total_time = float(oracle_times[-1])
@@ -238,12 +279,13 @@ class UpperBoundAnalyzer:
 
         # ── Plot 2: Best Cost vs Time ──
         res.baseline_cost_series = _resample_step(base_times, best_cost, grid, default=np.inf)
-        res.oracle_cost_series = _resample_step(oracle_times, best_cost, grid, default=np.inf)
+        res.oracle_cost_series = _resample_step(oracle_times, oracle_best_cost, grid, default=np.inf)
 
         # ── Plot 3: Unique Basins vs Time ──
         unique_f = unique_count.astype(float)
         res.baseline_unique_series = _resample_step(base_times, unique_f, grid, default=0.0)
-        res.oracle_unique_series = _resample_step(oracle_times, unique_f, grid, default=0.0)
+        oracle_unique_f = oracle_unique_count.astype(float)
+        res.oracle_unique_series = _resample_step(oracle_times, oracle_unique_f, grid, default=0.0)
 
         # ── Plot 4: Multiplier ──
         checkpoints = np.linspace(
@@ -295,6 +337,196 @@ class UpperBoundAnalyzer:
 
         self.results = res
         return res
+
+    @staticmethod
+    def _first_hit_time(t: np.ndarray, series: np.ndarray, target: float) -> float:
+        if len(t) == 0:
+            return 0.0
+        mask = np.isfinite(series) & (series <= target)
+        if np.any(mask):
+            return float(t[np.where(mask)[0][0]])
+        return float(t[-1])
+
+    def plot_false_skip_sweep(
+        self,
+        error_grid: Sequence[float],
+        repeats: int,
+        overhead_ratio: float,
+        skip_margin_pct: float | None,
+        top_k_basins: int | None,
+        keep_best_pct: float | None,
+        ancestry_basins: set | None,
+        skip_not_inserted: bool,
+        seed: int,
+        wall_time_max: float | None,
+        out_path: str | Path,
+        error_kind: str = "fp",
+        dpi: int = 150,
+    ) -> None:
+        if error_kind not in {"fp", "fn"}:
+            raise ValueError(f"Unsupported error_kind: {error_kind}")
+        x_label = "False positive rate E (%)" if error_kind == "fp" else "False negative rate E (%)"
+        sweep_title = "False-skip robustness" if error_kind == "fp" else "Missed-skip robustness"
+
+        # Reference: perfect oracle (E=0)
+        ref = self.run_analysis(
+            overhead_ratio=overhead_ratio,
+            skip_margin_pct=skip_margin_pct,
+            top_k_basins=top_k_basins,
+            keep_best_pct=keep_best_pct,
+            ancestry_basins=ancestry_basins,
+            skip_not_inserted=skip_not_inserted,
+            false_skip_prob=0.0,
+            miss_skip_prob=0.0,
+        )
+        ref_t = ref.time_grid
+        ref_ora = ref.oracle_cost_series
+        ref_base = ref.baseline_cost_series
+        if wall_time_max is not None:
+            wt_mask = ref_t <= wall_time_max
+            ref_ora_win = np.where(wt_mask & np.isfinite(ref_ora), ref_ora, np.inf)
+            ref_base_win = np.where(wt_mask & np.isfinite(ref_base), ref_base, np.inf)
+        else:
+            ref_ora_win = ref_ora
+            ref_base_win = ref_base
+        ref_final_cost = float(np.min(ref_ora_win)) if np.any(np.isfinite(ref_ora_win)) else np.inf
+        if wall_time_max is not None:
+            ref_hit = np.where((ref_t <= wall_time_max) & np.isfinite(ref_ora) & (ref_ora <= ref_final_cost))[0]
+            ref_time_to_final = float(ref_t[ref_hit[0]]) if len(ref_hit) else float(wall_time_max) * 1.1
+        else:
+            ref_time_to_final = self._first_hit_time(ref_t, ref_ora, ref_final_cost)
+        base_final = float(np.min(ref_base_win)) if np.any(np.isfinite(ref_base_win)) else np.inf
+        if wall_time_max is not None:
+            base_hit = np.where((ref_t <= wall_time_max) & np.isfinite(ref_base) & (ref_base <= base_final))[0]
+            base_time_to_best = float(ref_t[base_hit[0]]) if len(base_hit) else float(wall_time_max) * 1.1
+        else:
+            base_time_to_best = self._first_hit_time(ref_t, ref_base, base_final)
+        print(f"[sweep] Reference oracle (E=0): final_cost={ref_final_cost:.4f}, "
+              f"time_to_final={ref_time_to_final:.2f}s, "
+              f"baseline_final={base_final:.4f}"
+              f"{f' (window={wall_time_max}s)' if wall_time_max else ''}")
+
+        xs: list[float] = []
+        all_time_to_ref: list[list[float]] = []
+        all_final_costs: list[list[float]] = []
+
+        for idx, e in enumerate(error_grid):
+            e_clamped = float(np.clip(e, 0.0, 1.0))
+            time_to_refs: list[float] = []
+            final_costs: list[float] = []
+
+            n_repeats = 1 if e_clamped == 0.0 else max(1, int(repeats))
+            for r in range(n_repeats):
+                cur_seed = int(seed + 100003 * idx + r)
+                res = self.run_analysis(
+                    overhead_ratio=overhead_ratio,
+                    skip_margin_pct=skip_margin_pct,
+                    top_k_basins=top_k_basins,
+                    keep_best_pct=keep_best_pct,
+                    ancestry_basins=ancestry_basins,
+                    skip_not_inserted=skip_not_inserted,
+                    false_skip_prob=e_clamped if error_kind == "fp" else 0.0,
+                    miss_skip_prob=e_clamped if error_kind == "fn" else 0.0,
+                    random_seed=cur_seed,
+                )
+                t = res.time_grid
+                ora = res.oracle_cost_series
+                if wall_time_max is not None:
+                    wm = t <= wall_time_max
+                    ora_win = np.where(wm & np.isfinite(ora), ora, np.inf)
+                else:
+                    ora_win = ora
+                ora_final = float(np.min(ora_win)) if np.any(np.isfinite(ora_win)) else np.inf
+
+                if wall_time_max is not None:
+                    hit = np.where((t <= wall_time_max) & np.isfinite(ora) & (ora <= ref_final_cost))[0]
+                    t_hit = float(t[hit[0]]) if len(hit) else float(wall_time_max) * 1.1
+                else:
+                    t_hit = self._first_hit_time(t, ora, ref_final_cost)
+                time_to_refs.append(t_hit)
+                final_costs.append(ora_final)
+
+            if not time_to_refs:
+                continue
+            xs.append(e_clamped * 100.0)
+            all_time_to_ref.append(time_to_refs)
+            all_final_costs.append(final_costs)
+
+        if not xs:
+            print("[upper_bound_analyzer] WARNING: no valid points for false-skip sweep.")
+            return
+
+        def _band_plot(
+            ax: plt.Axes, xs: list[float],
+            all_vals: list[list[float]], scale: float,
+            color: str, ylabel: str, title: str,
+        ) -> None:
+            means = np.array([np.mean(v) for v in all_vals]) * scale
+            stds = np.array([np.std(v) for v in all_vals]) * scale
+            mins = np.array([np.min(v) for v in all_vals]) * scale
+            maxs = np.array([np.max(v) for v in all_vals]) * scale
+            xarr = np.array(xs)
+
+            ax.fill_between(xarr, mins, maxs, alpha=0.10, color=color, label="min–max")
+            ax.fill_between(xarr, means - stds, means + stds, alpha=0.25, color=color, label="±1σ")
+            ax.plot(xarr, means, marker="o", markersize=4, linewidth=1.8, color=color, label="mean", zorder=5)
+            for i, vals in enumerate(all_vals):
+                ax.scatter([xs[i]] * len(vals),
+                           np.array(vals) * scale,
+                           s=12, color=color, alpha=0.3, edgecolors="none", zorder=3)
+            ax.set_xlabel(x_label)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            ax.legend(fontsize=8, loc="best")
+            ax.grid(True, alpha=0.3)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
+
+        _band_plot(axes[0], xs, all_time_to_ref, scale=1.0, color="tab:blue",
+                   ylabel="Time to reach oracle(E=0) cost (s)",
+                   title="Time to Reach Perfect Oracle Cost")
+        axes[0].axhline(ref_time_to_final, color="black", linestyle="--",
+                        linewidth=1.4, alpha=0.9,
+                        label=f"oracle(E=0) best-in-window time ({ref_time_to_final:.2f}s)",
+                        zorder=6)
+        axes[0].axhline(base_time_to_best, color="black", linestyle=":",
+                        linewidth=1.4, alpha=0.9,
+                        label=f"baseline best-in-window time ({base_time_to_best:.2f}s)",
+                        zorder=6)
+        if wall_time_max is not None:
+            axes[0].axhline(float(wall_time_max), color="black", linestyle="-.",
+                            linewidth=1.4, alpha=0.9,
+                            label=f"wall_time_max ({wall_time_max:g}s)",
+                            zorder=6)
+            panel_max = max(
+                float(np.max([np.max(v) for v in all_time_to_ref])),
+                ref_time_to_final,
+                base_time_to_best,
+                float(wall_time_max),
+            )
+            axes[0].set_ylim(0.0, max(panel_max * 1.12, 0.1))
+        axes[0].legend(fontsize=8, loc="upper left")
+
+        _band_plot(axes[1], xs, all_final_costs, scale=1.0, color="tab:orange",
+                   ylabel="Oracle final cost",
+                   title="Oracle Final Cost vs Error")
+        axes[1].axhline(ref_final_cost, color="tab:orange", linestyle="--",
+                        linewidth=1, alpha=0.5, label=f"E=0 ({ref_final_cost:.4f})")
+        axes[1].axhline(base_final, color="tab:blue", linestyle=":",
+                        linewidth=1, alpha=0.5, label=f"baseline ({base_final:.4f})")
+        axes[1].legend(fontsize=8, loc="best")
+
+        title = f"{sweep_title} (repeats={max(1, int(repeats))}"
+        if wall_time_max is not None:
+            title += f", wall_time_max={wall_time_max:g}s"
+        title += ")"
+        fig.suptitle(title)
+        fig.tight_layout()
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {out_path}")
 
     # ------------------------------------------------------------------
     # Plotting
@@ -373,10 +605,10 @@ class UpperBoundAnalyzer:
             base_c = np.append(base_c, base_c[-1])
             ora_c = np.append(ora_c, ora_c[-1])
         m1 = np.isfinite(base_c)
-        ax.plot(t[m1], base_c[m1], label="Baseline", color="tab:blue", linewidth=1.5)
         m2 = np.isfinite(ora_c)
         ora_label = f"Oracle ({res.skip_label})"
-        ax.plot(t[m2], ora_c[m2], label=ora_label, color="tab:orange", linewidth=1.5)
+        ax.plot(t[m2], ora_c[m2], label=ora_label, color="tab:orange", linewidth=2.5, alpha=0.5)
+        ax.plot(t[m1], base_c[m1], label="Baseline", color="tab:blue", linewidth=1.5, linestyle="--")
         if hgs_cost is not None:
             ax.axhline(hgs_cost, color="red", linestyle="--", linewidth=1.5,
                        label=f"HGS ({hgs_cost:.2f})")
@@ -389,7 +621,7 @@ class UpperBoundAnalyzer:
             if hgs_cost is not None:
                 y_min = min(y_min, hgs_cost)
                 y_max = max(y_max, hgs_cost)
-            ax.set_ylim(y_min - margin, 39.5) # y_max + margin
+            ax.set_ylim(y_min - margin, y_max + margin)
             # ax.set_ylim(37.0, 37.)
         if wall_time_max is not None:
             ax.set_xlim(0, wall_time_max)
@@ -397,16 +629,23 @@ class UpperBoundAnalyzer:
         ax.set_ylabel("Best Cost Found")
         ax.set_title("Performance–Time Convergence")
         ax.legend(loc="upper right")
-        # Time to reach final best cost (baseline's last result)
-        final_best = np.nanmin(base_c) if len(base_c) else np.nan
+        # Time to reach final best cost within visible window
+        if wall_time_max is not None:
+            vis = t <= wall_time_max
+            vis_base = np.where(vis & np.isfinite(base_c), base_c, np.inf)
+            vis_ora = np.where(vis & np.isfinite(ora_c), ora_c, np.inf)
+        else:
+            vis_base, vis_ora = base_c, ora_c
+        final_best = np.nanmin(vis_base) if np.any(np.isfinite(vis_base)) else np.nan
         if np.isfinite(final_best) and len(t) > 0:
-            hit_b = np.where(base_c <= final_best)[0]
-            hit_o = np.where(ora_c <= final_best)[0]
+            hit_b = np.where(vis_base <= final_best)[0]
+            hit_o = np.where(vis_ora <= final_best)[0]
             t_baseline = float(t[hit_b[0]]) if len(hit_b) else float(t[-1])
             t_oracle = float(t[hit_o[0]]) if len(hit_o) else float(t[-1])
             pct = (t_oracle / t_baseline * 100.0) if t_baseline > 0 else 0.0
-            time_txt = (f"Baseline time to final: {t_baseline:.2f}s\n"
-                        f"Oracle time to final: {t_oracle:.2f}s ({pct:.1f}%)")
+            time_txt = (f"Baseline best in window: {final_best:.4f}\n"
+                        f"Baseline time to best: {t_baseline:.2f}s\n"
+                        f"Oracle time to best: {t_oracle:.2f}s ({pct:.1f}%)")
         else:
             time_txt = (f"Baseline total: {res.baseline_total_time:.2f}s, "
                         f"Oracle total: {res.oracle_total_time:.2f}s")
@@ -948,6 +1187,21 @@ if __name__ == "__main__":
     parser.add_argument("--skip_not_inserted", action="store_true",
                         help="(Strategy E) Skip trials whose offspring was not inserted "
                              "into the population. Requires [EVOLVE] insertion_rank lines.")
+    parser.add_argument("--false_skip_prob", type=float, default=0.0,
+                        help="False positive skip probability E in [0,1]. "
+                             "With prob E, a would-be-kept trial is mistakenly skipped.")
+    parser.add_argument("--miss_skip_prob", type=float, default=0.0,
+                        help="False negative skip probability E in [0,1]. "
+                             "With prob E, a would-be-skipped trial is mistakenly kept.")
+    parser.add_argument("--false_skip_grid", type=str, default=None,
+                        help="Comma-separated E list for robustness sweep, e.g. "
+                             "'0,0.01,0.02,0.05,0.1'.")
+    parser.add_argument("--miss_skip_grid", type=str, default=None,
+                        help="Comma-separated E list for false-negative robustness sweep.")
+    parser.add_argument("--false_skip_repeats", type=int, default=5,
+                        help="Monte-Carlo repeats per E for *_skip_grid.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Base random seed for false-skip simulation.")
     parser.add_argument("--no_plot", action="store_true")
     parser.add_argument("--steps_to_time", type=float, default=None,
                         help="Steps-to-time conversion ratio (default: auto-calibrate "
@@ -1046,10 +1300,15 @@ if __name__ == "__main__":
         keep_best_pct=args.keep_best_pct,
         ancestry_basins=ancestry_set,
         skip_not_inserted=args.skip_not_inserted,
+        false_skip_prob=args.false_skip_prob,
+        miss_skip_prob=args.miss_skip_prob,
+        random_seed=args.seed,
     )
     print(f"[upper_bound_analyzer] Strategy: {res.skip_label}")
     print(f"  Trials: {len(analyzer.trials)}, "
-          f"Skipped: {res.n_skipped_dup} dup + {res.n_skipped_quality} quality, "
+          f"Skipped: {res.n_skipped_dup} dup + {res.n_skipped_quality} quality"
+          f" + {res.n_false_skipped} false-skip - {res.n_missed_skips} missed-skip, "
+          f"Actual skipped: {res.n_actual_skipped}, "
           f"Redundancy: {res.final_redundancy:.1%}")
     print(f"  Baseline time: {res.baseline_total_time:.2f}s, "
           f"Oracle time: {res.oracle_total_time:.2f}s "
@@ -1076,3 +1335,51 @@ if __name__ == "__main__":
                 hgs_cost=hgs_cost,
                 dpi=args.dpi,
             )
+
+    if args.false_skip_grid:
+        try:
+            error_grid = [float(x.strip()) for x in args.false_skip_grid.split(",") if x.strip() != ""]
+        except ValueError as exc:
+            raise ValueError(f"Invalid --false_skip_grid: {args.false_skip_grid}") from exc
+        if not error_grid:
+            raise ValueError("--false_skip_grid is empty after parsing.")
+        sweep_path = Path(args.out_dir) / "plot5_false_skip_sweep.png"
+        analyzer.plot_false_skip_sweep(
+            error_grid=error_grid,
+            repeats=args.false_skip_repeats,
+            overhead_ratio=args.overhead,
+            skip_margin_pct=args.skip_margin_pct,
+            top_k_basins=args.top_k_basins,
+            keep_best_pct=args.keep_best_pct,
+            ancestry_basins=ancestry_set,
+            skip_not_inserted=args.skip_not_inserted,
+            seed=args.seed,
+            wall_time_max=args.wall_time_max,
+            out_path=sweep_path,
+            error_kind="fp",
+            dpi=args.dpi,
+        )
+
+    if args.miss_skip_grid:
+        try:
+            error_grid = [float(x.strip()) for x in args.miss_skip_grid.split(",") if x.strip() != ""]
+        except ValueError as exc:
+            raise ValueError(f"Invalid --miss_skip_grid: {args.miss_skip_grid}") from exc
+        if not error_grid:
+            raise ValueError("--miss_skip_grid is empty after parsing.")
+        sweep_path = Path(args.out_dir) / "plot6_miss_skip_sweep.png"
+        analyzer.plot_false_skip_sweep(
+            error_grid=error_grid,
+            repeats=args.false_skip_repeats,
+            overhead_ratio=args.overhead,
+            skip_margin_pct=args.skip_margin_pct,
+            top_k_basins=args.top_k_basins,
+            keep_best_pct=args.keep_best_pct,
+            ancestry_basins=ancestry_set,
+            skip_not_inserted=args.skip_not_inserted,
+            seed=args.seed,
+            wall_time_max=args.wall_time_max,
+            out_path=sweep_path,
+            error_kind="fn",
+            dpi=args.dpi,
+        )

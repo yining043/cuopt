@@ -35,6 +35,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -297,6 +299,11 @@ struct solve {
       }
     }
     working_population.threshold = diversity_levels.back();
+    double fixed_threshold = 0.0;
+    if (get_landscape_threshold_override(fixed_threshold)) {
+      working_population.threshold = fixed_threshold;
+      reserve_population.threshold = fixed_threshold;
+    }
     recombine_stats.reset();
 
     if (injection_info.has_info()) { injection_info.load_solutions(); }
@@ -384,8 +391,51 @@ struct solve {
     return metric != nullptr && std::string(metric) == "landscape";
   }
 
+  int get_legacy_threshold_index_shift() const
+  {
+    if (use_landscape_similarity_metric()) return 0;
+    const char* value = std::getenv("CUOPT_LEGACY_THRESHOLD_INDEX_SHIFT");
+    if (value == nullptr || value[0] == '\0') return 0;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed   = std::strtol(value, &end_ptr, 10);
+    if (end_ptr == value || errno == ERANGE) return 0;
+    parsed = std::clamp<long>(parsed, -1000, 1000);
+    return static_cast<int>(parsed);
+  }
+
+  int apply_legacy_threshold_index_shift(int threshold_index) const
+  {
+    if (diversity_levels.empty()) return threshold_index;
+    int shift = get_legacy_threshold_index_shift();
+    if (shift == 0) return threshold_index;
+    int hi = static_cast<int>(diversity_levels.size()) - 1;
+    return std::clamp(threshold_index + shift, 0, hi);
+  }
+
+  bool get_landscape_threshold_override(double& threshold) const
+  {
+    if (!use_landscape_similarity_metric()) return false;
+    const char* value = std::getenv("CUOPT_LANDSCAPE_THRESHOLD");
+    if (value == nullptr || value[0] == '\0') return false;
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    double parsed = std::strtod(value, &end_ptr);
+    if (end_ptr == value || errno == ERANGE || !std::isfinite(parsed)) { return false; }
+
+    threshold = std::clamp(parsed, 0.0, 0.99);
+    return true;
+  }
+
   void adjust_reserve_threshold()
   {
+    double fixed_threshold = 0.0;
+    if (get_landscape_threshold_override(fixed_threshold)) {
+      reserve_population.threshold = fixed_threshold;
+      return;
+    }
     const double max_diversity_threshold = 0.99;
     double reserve_time_ratio =
       (timer.elapsed_time() - reserve_start_time) / (timer.get_time_limit() - reserve_start_time);
@@ -407,14 +457,25 @@ struct solve {
       int threshold_index         = (p->is_cvrp() && !landscape_metric)
                                       ? std::max(3, find_initial_diversity(from_islands, true))
                                       : find_initial_diversity(from_islands, true);
+      if (!landscape_metric) {
+        threshold_index = apply_legacy_threshold_index_shift(threshold_index);
+      }
       reserve_population.threshold = landscape_metric
                                        ? diversity_levels[threshold_index]
                                        : std::max<double>(0.8, diversity_levels[threshold_index]);
+      double fixed_threshold = 0.0;
+      if (get_landscape_threshold_override(fixed_threshold)) {
+        reserve_population.threshold = fixed_threshold;
+      }
       benchmark_print("Resetting the reserve diversity level %d reserve treshold %f: \n",
                       threshold_index,
                       reserve_population.threshold);
     } else {
       reserve_population.threshold = 0.99;
+      double fixed_threshold = 0.0;
+      if (get_landscape_threshold_override(fixed_threshold)) {
+        reserve_population.threshold = fixed_threshold;
+      }
       benchmark_print(
         "Generated only one island, so updating reserve "
         "diversity threshold to %f. We should just "
@@ -448,6 +509,8 @@ struct solve {
       int threshold_index = find_initial_diversity(solutions, true);
       reserve_threshold   = diversity_levels[threshold_index];
     }
+    double fixed_threshold = 0.0;
+    if (get_landscape_threshold_override(fixed_threshold)) { reserve_threshold = fixed_threshold; }
     reserve_population.threshold     = reserve_threshold;
     reserve_population.max_solutions = default_reserve_population_size;
     working_population.max_solutions = default_reserve_population_size;
@@ -704,7 +767,14 @@ struct solve {
       int threshold_index = (p->is_cvrp() && !use_landscape_similarity_metric())
                               ? 1
                               : find_initial_diversity(working_vector, use_average);
+      if (!use_landscape_similarity_metric()) {
+        threshold_index = apply_legacy_threshold_index_shift(threshold_index);
+      }
       working_population.threshold = diversity_levels[threshold_index];
+      double fixed_threshold = 0.0;
+      if (get_landscape_threshold_override(fixed_threshold)) {
+        working_population.threshold = fixed_threshold;
+      }
       if (!p->is_cvrp()) { threshold_index = std::min(4, std::max(2, threshold_index)); }
       populate_working_population();
 
@@ -888,6 +958,15 @@ struct solve {
   int find_initial_diversity(std::vector<solution>& sols, bool avg)
   {
     raft::common::nvtx::range fun_scope("find_initial_diversity");
+
+    // Batch pre-fetch all embeddings in one IPC call before the O(n²) loop
+    {
+      std::vector<solution*> sol_ptrs;
+      sol_ptrs.reserve(sols.size());
+      for (auto& s : sols) { sol_ptrs.push_back(&s); }
+      solution::batch_ensure_embeddings(sol_ptrs);
+    }
+
     int threshold_index = 0;
     double average      = 0.0;
     double max          = 0.0;
@@ -925,7 +1004,10 @@ struct solve {
   {
     raft::common::nvtx::range fun_scope("generate_initial");
     bool first_gen       = true;
-    size_t start_index   = std::min<size_t>(3, diversity_levels.size() - 1);
+    int start_index      = static_cast<int>(std::min<size_t>(3, diversity_levels.size() - 1));
+    if (!use_landscape_similarity_metric()) {
+      start_index = apply_legacy_threshold_index_shift(start_index);
+    }
     auto next_injection  = 0;
     auto injection_state = false;
     auto min_island_size = p->is_cvrp()
@@ -985,8 +1067,16 @@ struct solve {
                   << std::endl;
       }
       islands_size--;
-      // Set small diversity is introduced inside the islands
-      double threshold = diversity_levels[std::min<size_t>(3, diversity_levels.size() - 1)];
+      // Set small diversity inside islands. In landscape mode, allow explicit
+      // threshold override so initial islands follow the same threshold policy
+      // as reserve/working/improve stages.
+      int island_threshold_index = static_cast<int>(std::min<size_t>(3, diversity_levels.size() - 1));
+      if (!use_landscape_similarity_metric()) {
+        island_threshold_index = apply_legacy_threshold_index_shift(island_threshold_index);
+      }
+      double threshold = diversity_levels[island_threshold_index];
+      double fixed_threshold = 0.0;
+      if (get_landscape_threshold_override(fixed_threshold)) { threshold = fixed_threshold; }
       initial_islands.push_back(population<allocator, solution, problem>(
         threshold, pop_size, final_weights, p, pool_allocator));
 
@@ -1031,7 +1121,8 @@ struct solve {
 
         bool is_feasible_before_improve = temp_pair.first.is_feasible();
 
-        auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time());
+        auto offset = lm.improve(temp_pair.first, final_weights, timer.remaining_time(),
+                                 /*run_cycle_finder=*/true, /*enable_callback=*/true);
         timer.add_offset(offset);
         improvement_timer.add_offset(offset);
         island_creation_timer.add_offset(offset);
@@ -1150,6 +1241,10 @@ struct solve {
       int valid_start_threshold_index =
         std::min(start_threshold_index, (int)step_lengths.size() - 1);
       p.threshold = diversity_levels[valid_start_threshold_index];
+      double fixed_threshold = 0.0;
+      if (get_landscape_threshold_override(fixed_threshold)) {
+        p.threshold = fixed_threshold;
+      }
       benchmark_print("time elapsed: %f \n", timer.elapsed_time());
       benchmark_print("Improvement steps: %d\n", step_lengths[valid_start_threshold_index]);
       p.add_solutions_to_island(timer.elapsed_time(), reserve_population);

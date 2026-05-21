@@ -33,7 +33,8 @@ public:
     i_t num_routes,
     f_t objective,
     i_t iteration,
-    bool* early_stop_out
+    bool* early_stop_out,
+    i_t phase = 0
   ) override
   {
     PyObject* pycl = (PyObject*)this->pyCallbackClass;
@@ -44,15 +45,16 @@ public:
       PyList_SetItem(py_solution_flat, i, PyLong_FromLong((*solution_flat)[i]));
     }
 
-    // Call Python method: customize_early_stop(solution_flat, objective, num_routes, iteration) -> bool
+    // Call Python method: customize_early_stop(solution_flat, objective, num_routes, iteration, phase) -> bool
     PyObject* result = PyObject_CallMethod(
       pycl,
       "customize_early_stop",
-      "Odii",
+      "Odiii",
       py_solution_flat,
       (double)objective,
       (int)num_routes,
-      (int)iteration
+      (int)iteration,
+      (int)phase
     );
 
     Py_DECREF(py_solution_flat);
@@ -63,6 +65,7 @@ public:
     }
 
     // Extract early_stop from result (should be bool)
+    // NOTE: 4/10 era did NOT have abort_solve_flag write here. We're matching that.
     if (PyBool_Check(result)) {
       *early_stop_out = (result == Py_True);
     }

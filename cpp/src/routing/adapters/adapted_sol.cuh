@@ -17,7 +17,17 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "../diversity/helpers.hpp"
+
+// Forward decl: embedding_ipc_ns is defined in src/routing/solver.cu so callers
+// (this file) can fetch_add to it. Originally added in 4/1-era code for IPC timing.
+namespace cuopt {
+namespace detail {
+__attribute__((visibility("default"))) std::atomic<long long>& embedding_ipc_ns();
+}  // namespace detail
+}  // namespace cuopt
 #include "../diversity/macros.hpp"
 #include "../local_search/compute_compatible.cuh"
 #include "../problem/problem.cuh"
@@ -27,11 +37,14 @@
 #include "adapted_nodes.cuh"
 
 #include "adapted_nodes.cuh"
+#include "../../utilities/timer.hpp"
 
 #include <raft/util/cudart_utils.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -48,6 +61,8 @@ namespace cuopt::routing::detail {
 // Connects to the Python embedding_server.py via Unix domain socket.
 // ---------------------------------------------------------------------------
 class EmbeddingSocketClient {
+  using steady_clock = std::chrono::steady_clock;
+
  public:
   static EmbeddingSocketClient& instance()
   {
@@ -57,25 +72,54 @@ class EmbeddingSocketClient {
 
   bool is_available() const { return fd_ >= 0; }
 
+  void invalidate()
+  {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+  }
+
   std::vector<float> request_embedding(const std::vector<int>& route_solution)
   {
+    auto batch = request_embeddings_batch({route_solution});
+    if (batch.empty()) return {};
+    return std::move(batch[0]);
+  }
+
+  // Send N solutions in one IPC round-trip, get N embeddings back.
+  std::vector<std::vector<float>> request_embeddings_batch(
+    const std::vector<std::vector<int>>& solutions)
+  {
+    if (solutions.empty()) return {};
+
+    const char* cur_path = std::getenv("CUOPT_EMBEDDING_SOCKET");
+    if (cur_path != nullptr && socket_path_ != cur_path) {
+      invalidate();
+    }
     if (fd_ < 0) {
       reconnect();
       if (fd_ < 0) return {};
     }
 
-    // Build request: "0 5 3 0 7 2 0\n"
+    const size_t N = solutions.size();
+    auto t0 = steady_clock::now();
+
+    // Build request: "BATCH N\n<sol1>\n<sol2>\n...\n"
     std::string msg;
-    msg.reserve(route_solution.size() * 4);
-    for (size_t i = 0; i < route_solution.size(); ++i) {
-      if (i > 0) msg += ' ';
-      msg += std::to_string(route_solution[i]);
-    }
+    msg.reserve(N * 400);
+    msg += "BATCH ";
+    msg += std::to_string(N);
     msg += '\n';
+    for (auto& sol : solutions) {
+      for (size_t i = 0; i < sol.size(); ++i) {
+        if (i > 0) msg += ' ';
+        msg += std::to_string(sol[i]);
+      }
+      msg += '\n';
+    }
 
     // Send
     {
-      const char* ptr  = msg.c_str();
+      const char* ptr   = msg.c_str();
       ssize_t remaining = static_cast<ssize_t>(msg.size());
       while (remaining > 0) {
         ssize_t n = ::write(fd_, ptr, remaining);
@@ -85,24 +129,43 @@ class EmbeddingSocketClient {
       }
     }
 
-    // Read response until newline
+    // Read N response lines
     std::string response;
-    char buf[8192];
-    while (true) {
+    char buf[65536];
+    size_t lines_received = 0;
+    while (lines_received < N) {
       ssize_t n = ::read(fd_, buf, sizeof(buf) - 1);
       if (n <= 0) { reconnect(); return {}; }
       response.append(buf, n);
-      if (response.find('\n') != std::string::npos) break;
+      lines_received = 0;
+      for (char c : response) {
+        if (c == '\n') ++lines_received;
+      }
     }
 
-    // Parse: "0.123 -0.456 ...\n"
+    // Accumulate IPC duration
+    auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      steady_clock::now() - t0).count();
+    cuopt::detail::embedding_ipc_ns().fetch_add(elapsed_ns, std::memory_order_relaxed);
+
     if (response.rfind("ERROR", 0) == 0) return {};
-    std::vector<float> emb;
-    emb.reserve(128);
-    std::istringstream iss(response);
-    float val;
-    while (iss >> val) { emb.push_back(val); }
-    return emb;
+
+    // Parse N embeddings
+    std::vector<std::vector<float>> results;
+    results.reserve(N);
+    std::istringstream stream(response);
+    std::string line;
+    while (std::getline(stream, line) && results.size() < N) {
+      if (line.empty()) continue;
+      if (line.rfind("ERROR", 0) == 0) { results.emplace_back(); continue; }
+      std::vector<float> emb;
+      emb.reserve(128);
+      std::istringstream iss(line);
+      float val;
+      while (iss >> val) { emb.push_back(val); }
+      results.push_back(std::move(emb));
+    }
+    return results;
   }
 
  private:
@@ -375,6 +438,19 @@ struct adapted_sol_t {
     return metric != nullptr && std::strcmp(metric, "landscape") == 0;
   }
 
+  static bool similarity_trace_enabled()
+  {
+    const char* value = std::getenv("CUOPT_LOG_SIMILARITY");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+  }
+
+  static void trace_similarity_value(const char* mode, double similarity)
+  {
+    if (!similarity_trace_enabled()) return;
+    printf("[SIM_TRACE][VALUE] mode=%s sim=%.6f\n", mode, similarity);
+    fflush(stdout);
+  }
+
   double calculate_legacy_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
   {
     // always do symmetric measure if it is a CVRP or if there are unserviced nodes
@@ -422,6 +498,40 @@ struct adapted_sol_t {
     if (!embedding_.empty()) { l2_normalize_inplace(embedding_); }
   }
 
+  // Pre-fetch embeddings for multiple solutions in one batched IPC call.
+  // Solutions that already have cached embeddings are skipped.
+  template <typename SolPtr>
+  static void batch_ensure_embeddings(const std::vector<SolPtr>& sols)
+  {
+    if (!use_landscape_similarity_metric()) return;
+
+    // Collect indices of solutions that need embedding computation
+    std::vector<size_t> need_idx;
+    need_idx.reserve(sols.size());
+    for (size_t i = 0; i < sols.size(); ++i) {
+      if (sols[i]->embedding_.empty()) { need_idx.push_back(i); }
+    }
+    if (need_idx.empty()) return;
+
+    // Build batch of route-format solutions
+    std::vector<std::vector<int>> batch_routes;
+    batch_routes.reserve(need_idx.size());
+    for (size_t idx : need_idx) {
+      batch_routes.push_back(sols[idx]->get_solution_route_format());
+    }
+
+    // Single batched IPC call
+    auto batch_embs = EmbeddingSocketClient::instance().request_embeddings_batch(batch_routes);
+
+    // Distribute results back to the solutions
+    for (size_t k = 0; k < need_idx.size() && k < batch_embs.size(); ++k) {
+      if (!batch_embs[k].empty()) {
+        l2_normalize_inplace(batch_embs[k]);
+        sols[need_idx[k]]->embedding_ = std::move(batch_embs[k]);
+      }
+    }
+  }
+
   static double l2_distance(const std::vector<float>& a, const std::vector<float>& b)
   {
     double sum = 0.0;
@@ -446,13 +556,17 @@ struct adapted_sol_t {
     }
 
     const double distance = l2_distance(embedding_, second.embedding_);
-    return std::clamp(1.0 - 0.5 * distance, 0.0, 1.0);
+    const double sim = std::clamp(1.0 - 0.5 * distance, 0.0, 1.0);
+    trace_similarity_value("landscape", sim);
+    return sim;
   }
 
   double calculate_similarity_radius(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
   {
     if (use_landscape_similarity_metric()) { return calculate_landscape_similarity_radius(second); }
-    return calculate_legacy_similarity_radius(second);
+    const double sim = calculate_legacy_similarity_radius(second);
+    trace_similarity_value("legacy", sim);
+    return sim;
   }
 
   double calculate_similarity_radius_asymetric(const adapted_sol_t<i_t, f_t, REQUEST>& second) const
