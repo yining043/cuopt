@@ -1,47 +1,32 @@
 #!/bin/bash
 
 # =================配置区域=================
-# 1. 显卡 ID 列表 (例如：4张卡并行)
-gpus=(0 1 2)
-
-# 2. 总共要跑的任务数
-total_tasks=15
-
-# 3. 自定义输出文件的前缀名 (例如设置为 "exp_cuopt"，输出就会变成 exp_cuopt_1.txt, exp_cuopt_2.txt...)
-output_prefix="test_latest_model"
+gpus=(2 3)
+total_tasks=4
+prefix="origin"
 # =========================================
 
 num_gpus=${#gpus[@]}
-
-echo "🚀 准备开始：共 $total_tasks 个任务，每次并行 $num_gpus 个..."
-echo "📂 输出文件将命名为: ${output_prefix}_1.txt, ${output_prefix}_2.txt ..."
+echo "🚀 启动: 共 $total_tasks 个任务，$num_gpus 卡并行... 输出前缀: $prefix"
 
 for ((i=1; i<=total_tasks; i++)); do
+    gpu_id=${gpus[$(( (i-1) % num_gpus ))]}
     
-    # 计算分配的 GPU
-    gpu_idx=$(( (i - 1) % num_gpus ))
-    gpu_id=${gpus[$gpu_idx]}
+    echo "  -> 启动任务 $i (GPU: $gpu_id)"
 
-    echo "  -> 启动任务 index=$i (GPU: $gpu_id) -> 写入 ${output_prefix}_${i}.txt"
+    # 备用参数（如需使用，请加到下方命令中，注意不要在带有 \ 的中间插入注释）：
+    # --use \
+    # --v v2 \
+    # --policy outputs/conc_bybrid_new_value_20260326_042847/checkpoint_epoch_200.pt \
 
-    # 执行命令，使用 ${output_prefix} 替换原来的写死的名字
     CUDA_VISIBLE_DEVICES=$gpu_id python run_cuopt.py \
+    --data_path ../../cuopt-examples/data/test_cvrp1000_hgs_n128_C250.txt\
         --index 1 \
         --time 30 \
-	--use \
-	--v v2 \
-        --policy outputs/conc_bybrid_new_value_20260326_042847/checkpoint_epoch_200.pt\
-        > ../cuopt-examples/code/${output_prefix}_${i}.txt &
+        > "./outputs/${prefix}_${i}.txt" &
 
-    # 分批等待逻辑
-    if (( i % num_gpus == 0 )); then
-        if (( i < total_tasks )); then
-            echo "⏳ --- 第 $((i / num_gpus)) 批任务已满，等待当前 ${num_gpus} 个任务跑完... ---"
-            wait
-            echo "✅ 第 $((i / num_gpus)) 批结束，开始下一批！"
-        fi
-    fi
-
+    # 分批等待逻辑：当达到 GPU 数量的整数倍且不是最后一个任务时，触发 wait
+    (( i % num_gpus == 0 && i < total_tasks )) && wait && echo "✅ 批次完成，开始下一批！"
 done
 
 wait

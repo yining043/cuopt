@@ -348,17 +348,17 @@ local_search_t<i_t, f_t, REQUEST>::build_solution_flat(solution_t<i_t, f_t, r_t>
   return solution_flat;
 }
 
-template <typename i_t>
-i_t get_sample_size_vrp(i_t n_of_changed_nodes)
-{
-  return n_of_changed_nodes; //!!!
-  i_t num = 40;
-  if (n_of_changed_nodes < num)
-    num = n_of_changed_nodes;
-  else if (n_of_changed_nodes < num * 2)
-    num = n_of_changed_nodes / 2;
-  return num;
-}
+// template <typename i_t>
+// i_t get_sample_size_vrp(i_t n_of_changed_nodes)
+// {
+//   return n_of_changed_nodes; //!!!
+//   i_t num = 40;
+//   if (n_of_changed_nodes < num)
+//     num = n_of_changed_nodes;
+//   else if (n_of_changed_nodes < num * 2)
+//     num = n_of_changed_nodes / 2;
+//   return num;
+// }
 
 template <typename i_t, typename f_t, request_t REQUEST>
 void local_search_t<i_t, f_t, REQUEST>::print_solution(
@@ -574,8 +574,10 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
       auto pause_begin = clock::now();
+      bool origin = true;
       // #########
-      if (pred_with_NN == false) {
+
+      if (!origin && pred_with_NN == false) {
         // Run full search Oracle
         Sol temp_trail_routes(sol);
         work_node_to_search = full_node_to_search;
@@ -814,7 +816,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       }
 
       // use callback and get best_node_to_search
-      if (pred_with_NN == true) {
+      if (!origin && pred_with_NN == true) {
         
         if (obs_callback) {
           // Step 1: Oracle search to discover anchors
@@ -933,8 +935,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       // }
       // ##########
       // end looking ahead
-      load_to_device_both(best_node_to_search);
-      printf("[iter #%d] size of base nodes to search: %d, size of h_nodes_to_search: %d\n", iter - 2, (int)full_node_to_search.size(), (int)move_candidates.nodes_to_search.h_nodes_to_search.size());
+      if (!origin) { load_to_device_both(best_node_to_search); }
       auto pause_end   = clock::now();
       auto offset = pause_end - pause_begin;
       printf("offset: %ld ms\n", std::chrono::duration_cast<std::chrono::milliseconds>(offset).count());
@@ -942,10 +943,16 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       // #########
 
       // Run the actual search
+      printf("[iter #%d] size of base nodes to search: %d, size of h_nodes_to_search: %d\n", iter - 2, (int)full_node_to_search.size(), (int)move_candidates.nodes_to_search.h_nodes_to_search.size());
       auto cost_before = sol.get_cost(true, move_candidates.weights);
-      // bool move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96, false);
-      bool move_found_here = run_fast_search(sol, true, 96, false, false); //!!!
 
+      bool move_found_here = false;
+      if (origin) {
+        move_found_here = run_fast_search(sol, sol.problem_ptr->is_tsp && iter == 2, 96, false);
+      } else {
+        move_found_here = run_fast_search(sol, true, 96, false, false); //!!!
+      }
+      
       auto cost_after = sol.get_cost(true, move_candidates.weights);
       if (cost_after == cost_before) {
         move_found_here = false; //!!!
