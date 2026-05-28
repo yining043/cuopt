@@ -3,7 +3,7 @@
 # =================配置区域=================
 gpus=(2 3)
 total_tasks=4
-prefix="origin"
+prefix="origin_again"
 # =========================================
 
 num_gpus=${#gpus[@]}
