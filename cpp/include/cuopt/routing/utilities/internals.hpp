@@ -56,10 +56,25 @@ public:
     f_t solution_cost,
     const std::vector<i_t>* trail_masks_flat,
     i_t num_trails,
+    const std::vector<f_t>* trail_rewards,
     std::vector<i_t>* selection_mask_out,
     i_t iteration
   ) = 0;
-  
+
+  // Optional reward feedback after the actual search executes the chosen nodes.
+  // Used by RL callbacks to observe the cost delta of their action.
+  // Default is a no-op so non-RL callbacks are unaffected.
+  // @param cost_before   objective before the actual search
+  // @param cost_after    objective after the actual search
+  // @param move_found    whether the search improved the solution
+  // @param iteration     current iteration number
+  virtual void on_search_result(
+    f_t cost_before,
+    f_t cost_after,
+    bool move_found,
+    i_t iteration
+  ) {}
+
   callback_type_t get_type() const override {
     return callback_type_t::CUSTOMIZE_NODES;
   }

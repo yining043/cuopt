@@ -29,6 +29,8 @@
 #include <thrust/fill.h>
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_set>
 
 #include <vector>
@@ -574,7 +576,8 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       if (time_limit_enabled && local_search_t<i_t, f_t, REQUEST>::check_time_limit()) { break; }
       iter++;
       auto pause_begin = clock::now();
-      bool origin = true;
+      const char* ls_mode = std::getenv("CUOPT_LS_MODE");
+      bool origin = !(ls_mode && std::strcmp(ls_mode, "oracle") == 0);
       // #########
 
       if (!origin && pred_with_NN == false) {
@@ -714,8 +717,8 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
         // ##########
         
         //perform look ahead analysis on different subsets of excuted_anchor
-        const int n_trails = 50;
-        const int n_look_ahead = 5;
+        const int n_trails = 20;
+        const int n_look_ahead = 3;
         std::vector<double> previous_cost(n_look_ahead + 1);
         previous_cost[0] = sol.get_cost(true, move_candidates.weights);
         double best_cost = 1000000000.0;
@@ -849,9 +852,16 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
           }
 
           // Step 2: Run K trails (1 search each, no look-ahead)
-          const int K = 100;
+          // K is overridable via CUOPT_RL_K to trade off probe cost vs action diversity.
+          const char* rl_k_env = std::getenv("CUOPT_RL_K");
+          const int K = (rl_k_env && std::atoi(rl_k_env) > 0) ? std::atoi(rl_k_env) : 100;
           std::vector<i_t> anchor_vec_nn(all_anchor_nn.begin(), all_anchor_nn.end());
           std::vector<i_t> trail_masks_flat(K * N_nodes_w_dummy, 0);
+          // Per-trail probe reward: cost reduction the subset achieved on a copy.
+          // Gives the policy full (all-K) feedback per step instead of only the
+          // executed arm, which is far more sample-efficient for RL.
+          std::vector<f_t> trail_rewards(K, (f_t)0);
+          const f_t base_cost = sol.get_cost(true, move_candidates.weights);
 
           std::unordered_map<i_t, size_t> node_id_to_h_idx;
           node_id_to_h_idx.reserve(full_node_to_search.size());
@@ -874,6 +884,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
             Sol temp_trail(sol);
             load_to_device_both(work_node_list);
             run_fast_search(temp_trail, true, 96, false, false);
+            trail_rewards[t] = base_cost - temp_trail.get_cost(true, move_candidates.weights);
 
             // Store bitmask per anchor: bit0=sliding(1), bit1=vrp(2), bit2=recycle_vrp(4), bit3=two_opt(8)
             auto anchors_exec = get_last_executed_anchors();
@@ -899,7 +910,7 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
 
           obs_callback->customize_nodes_to_search(
               &solution_flat, sol.n_routes, objective,
-              &trail_masks_flat, K, &selection_mask, iter);
+              &trail_masks_flat, K, &trail_rewards, &selection_mask, iter);
 
           if (selection_mask.size() != (size_t)N_nodes_w_dummy) {
             printf("Selection mask size mismatch: %zu != %zu\n", selection_mask.size(), (size_t)N_nodes_w_dummy);
@@ -956,6 +967,12 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       auto cost_after = sol.get_cost(true, move_candidates.weights);
       if (cost_after == cost_before) {
         move_found_here = false; //!!!
+      }
+      // RL reward feedback: report the cost delta of the action just executed.
+      // No-op unless the registered callback implements on_search_result.
+      if (!origin && pred_with_NN && obs_callback) {
+        obs_callback->on_search_result(
+          (f_t)cost_before, (f_t)cost_after, move_found_here, iter);
       }
       if (sol.is_feasible()) {
         printf("[executed] cost before: %f, cost after: %f, move_found: %d\n\n", cost_before, cost_after, move_found_here);

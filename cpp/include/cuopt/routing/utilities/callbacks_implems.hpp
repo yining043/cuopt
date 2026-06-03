@@ -34,6 +34,7 @@ public:
     f_t solution_cost,
     const std::vector<i_t>* trail_masks_flat,
     i_t num_trails,
+    const std::vector<f_t>* trail_rewards,
     std::vector<i_t>* selection_mask_out,
     i_t iteration
   ) override
@@ -49,21 +50,28 @@ public:
     for (size_t i = 0; i < trail_masks_flat->size(); ++i) {
       PyList_SetItem(py_trail_masks, i, PyLong_FromLong((*trail_masks_flat)[i]));
     }
+
+    PyObject* py_trail_rewards = PyList_New(trail_rewards->size());
+    for (size_t i = 0; i < trail_rewards->size(); ++i) {
+      PyList_SetItem(py_trail_rewards, i, PyFloat_FromDouble((double)(*trail_rewards)[i]));
+    }
     
     PyObject* result = PyObject_CallMethod(
       pycl, 
       "customize_nodes_to_search", 
-      "OifOii",
+      "OifOiOi",
       py_solution_flat,
       (int)num_routes,
       (double)solution_cost,
       py_trail_masks,
       (int)num_trails,
+      py_trail_rewards,
       (int)iteration
     );
     
     Py_DECREF(py_solution_flat);
     Py_DECREF(py_trail_masks);
+    Py_DECREF(py_trail_rewards);
     
     if (result == nullptr) {
       PyErr_Print();
@@ -81,7 +89,35 @@ public:
     
     Py_DECREF(result);
   }
-  
+
+  void on_search_result(
+    f_t cost_before,
+    f_t cost_after,
+    bool move_found,
+    i_t iteration
+  ) override
+  {
+    PyObject* pycl = (PyObject*)this->pyCallbackClass;
+    // Only forward to Python if the callback implements the optional hook.
+    if (!PyObject_HasAttrString(pycl, "on_search_result")) { return; }
+
+    PyObject* result = PyObject_CallMethod(
+      pycl,
+      "on_search_result",
+      "ddii",
+      (double)cost_before,
+      (double)cost_after,
+      (int)(move_found ? 1 : 0),
+      (int)iteration
+    );
+
+    if (result == nullptr) {
+      PyErr_Print();
+      return;
+    }
+    Py_DECREF(result);
+  }
+
   PyObject* pyCallbackClass;
 };
 

@@ -30,7 +30,8 @@ class CostPredictorCallback(CustomizeNodesCallback):
         self.top_frac = top_frac
 
     def customize_nodes_to_search(self, solution_flat, num_routes,
-                                  solution_cost, trail_masks_flat, num_trails, iter):
+                                  solution_cost, trail_masks_flat, num_trails,
+                                  trail_rewards, iter):
         max_length = len(trail_masks_flat) // num_trails
         K = num_trails
         # trail_masks_flat contains bitmask ints (0-15), not bools
