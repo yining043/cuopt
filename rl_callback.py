@@ -20,15 +20,38 @@ import torch.nn.functional as F
 from cuopt.routing import CustomizeNodesCallback
 
 
+class RandomSubsetCallback(CustomizeNodesCallback):
+    """Pick one of K probe subsets uniformly at random (random baseline)."""
+
+    def customize_nodes_to_search(self, solution_flat, num_routes,
+                                  solution_cost, trail_masks_flat, num_trails,
+                                  trail_rewards, iter):
+        K = num_trails
+        max_length = len(trail_masks_flat) // K
+        valid = []
+        for t in range(K):
+            base = t * max_length
+            if any(trail_masks_flat[base + i] > 0 for i in range(max_length)):
+                valid.append(t)
+        if not valid:
+            return [0] * max_length
+        idx = random.choice(valid)
+        base = idx * max_length
+        return [trail_masks_flat[base + i] for i in range(max_length)]
+
+
 class RLPolicyCallback(CustomizeNodesCallback):
     def __init__(self, model, coordinates, demand, vehicle_capacity, device,
-                 temperature=1.0, score_sign=-1.0, train=True, epsilon=0.0):
+                 temperature=1.0, score_sign=-1.0, train=True, epsilon=0.0,
+                 tw_features=None):
         super().__init__()
         self.model = model
         self.device = device
         # coordinates: [1, N, 2]; demand: [1, N]; vehicle_capacity: scalar
         self.coordinates = coordinates.to(device)
         self.demand = (demand / vehicle_capacity).to(device)
+        # tw_features: [1, N, k] normalized time-window features (CVRPTW) or None
+        self.tw_features = tw_features.to(device) if tw_features is not None else None
         self.temperature = temperature
         # CostPredictor predicts a cost ratio (lower = better), so default
         # score_sign=-1 turns it into a sensible logit (higher = better arm).
@@ -49,7 +72,8 @@ class RLPolicyCallback(CustomizeNodesCallback):
         demands = self.demand.expand(K, -1)
         cost_0 = torch.full((K,), float(solution_cost),
                             dtype=torch.float32, device=self.device)
-        return sol_tensor, nodes, demands, cost_0
+        tw = self.tw_features.expand(K, -1, -1) if self.tw_features is not None else None
+        return sol_tensor, nodes, demands, cost_0, tw
 
     def customize_nodes_to_search(self, solution_flat, num_routes,
                                   solution_cost, trail_masks_flat, num_trails,
@@ -66,11 +90,11 @@ class RLPolicyCallback(CustomizeNodesCallback):
             self._pending = None
             return [0] * max_length
 
-        sol_tensor, nodes, demands, cost_0 = self._build_arm_inputs(
+        sol_tensor, nodes, demands, cost_0, tw = self._build_arm_inputs(
             solution_flat, solution_cost, trail_masks)
 
         with torch.no_grad():
-            scores = self.model(nodes, demands, sol_tensor, trail_masks, cost_0)  # [K]
+            scores = self.model(nodes, demands, sol_tensor, trail_masks, cost_0, tw_features=tw)  # [K]
             logits = self.score_sign * scores / self.temperature
             logits = logits.masked_fill(~non_empty, float('-inf'))
             probs = F.softmax(logits, dim=0)

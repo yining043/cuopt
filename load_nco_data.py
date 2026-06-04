@@ -1,6 +1,26 @@
 import torch
 from tqdm import tqdm   
 
+
+def load_cvrptw_data(path: str):
+    """Load a cached CVRPTW instance dict produced by gen_cvrptw.py.
+
+    Returns the raw dict with tensors:
+      coords [N,2], demand [N], capacity (int), earliest/latest/service [N],
+      H (float), n_vehicles (int), scale (float).
+    """
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def build_tw_features(inst):
+    """Normalized time-window node features [1, N, 3] = (earliest, latest, service)/H."""
+    H = float(inst["H"])
+    e = inst["earliest"].float() / H
+    l = inst["latest"].float() / H
+    s = inst["service"].float() / H
+    return torch.stack([e, l, s], dim=-1).unsqueeze(0)  # [1, N, 3]
+
+
 def load_raw_data(data_path: str, episode: int = 1, begin_index: int = 0):
     def tow_col_nodeflag(node_flag):
         V = int(len(node_flag) / 2)

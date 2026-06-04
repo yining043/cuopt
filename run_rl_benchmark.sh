@@ -9,6 +9,7 @@ num_gpus=${#gpus[@]}
 runs_per_mode=${RUNS:-8}
 time_limit=${TIME_LIMIT:-2}
 data_path=${DATA_PATH:-../../cuopt-examples/data/test_cvrp1000_hgs_n128_C250.txt}
+data_pt=${DATA_PT:-}
 weights=${WEIGHTS:-outputs/rl_run2/best_policy.pt}
 k=${K:-16}
 epsilon=${EPSILON:-0.1}
@@ -16,7 +17,7 @@ out_dir=${OUT_DIR:-outputs/benchmark_rl_2s}
 
 mkdir -p "$out_dir"
 echo "Benchmark: ${runs_per_mode} x (random + policy + policy_eps)"
-echo "GPUs: ${gpus[*]} | time_limit=${time_limit}s | K=${k} | epsilon=${epsilon} | weights=${weights}"
+echo "GPUs: ${gpus[*]} | time_limit=${time_limit}s | K=${k} | epsilon=${epsilon} | weights=${weights} | data_pt=${data_pt:-none}"
 echo "Output: ${out_dir}/"
 
 task_id=0
@@ -37,6 +38,9 @@ launch() {
     local extra_args=()
     if [ "$mode" = "policy_eps" ]; then
         extra_args=(--epsilon "$epsilon")
+    fi
+    if [ -n "$data_pt" ]; then
+        extra_args+=(--data_pt "$data_pt")
     fi
     CUDA_VISIBLE_DEVICES=$gpu_id python benchmark_rl.py \
         --mode "$mode" \

@@ -11,9 +11,9 @@ import sys
 # ============================================================================
 
 class NodeFeatureEmbedding(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, n_feat=3):
         super().__init__()
-        self.embed = nn.Linear(3, d_model, bias=False)
+        self.embed = nn.Linear(n_feat, d_model, bias=False)
     
     def forward(self, x):
         return self.embed(x)
@@ -241,7 +241,8 @@ class CostPredictor(nn.Module):
                  max_vehicles=21,
                  N=1001,
                  device='cpu',
-                 mode='v2'):
+                 mode='v2',
+                 n_node_feat=3):
         super().__init__()
         
         self.d_model = d_model
@@ -250,8 +251,10 @@ class CostPredictor(nn.Module):
         self.max_length = N + max_vehicles * 4
         self.device = torch.device(device)
         self.mode = mode
+        # 3 = [x, y, demand]; 6 adds [earliest, latest, service] for CVRPTW.
+        self.n_node_feat = n_node_feat
         
-        self.feature_embed = NodeFeatureEmbedding(d_model)
+        self.feature_embed = NodeFeatureEmbedding(d_model, n_feat=n_node_feat)
         self.positional_encoding = self._create_positional_encoding(self.max_length, d_model).to(self.device)
 
         if mode == 'v2':
@@ -298,7 +301,8 @@ class CostPredictor(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe
     
-    def forward(self, nodes_tensor, demands_tensor, current_sol_tensor, selected_tensor, cost_0):
+    def forward(self, nodes_tensor, demands_tensor, current_sol_tensor, selected_tensor, cost_0,
+                tw_features=None):
         """
         Args:
             nodes_tensor:       [B, N, 2] - node coordinates
@@ -306,6 +310,7 @@ class CostPredictor(nn.Module):
             current_sol_tensor: [B, max_length] - current solution
             selected_tensor:    [B, max_length] - anchor type bitmask (0-15: bit0=sliding, bit1=vrp, bit2=recycle_vrp, bit3=two_opt)
             cost_0:             [B] - initial cost (raw value)
+            tw_features:        [B, N, k] - optional time-window features (e.g. earliest/latest/service, normalized). Required when n_node_feat>3.
         
         Returns:
             predicted: [B] - predicted log(cost[0] - cost[-1])
@@ -322,7 +327,10 @@ class CostPredictor(nn.Module):
         
         if demands_tensor.dim() == 2:
             demands_tensor = demands_tensor.unsqueeze(-1)
-        node_embeddings = self.feature_embed(torch.cat([nodes_tensor, demands_tensor], dim=-1))
+        feat = [nodes_tensor, demands_tensor]
+        if tw_features is not None:
+            feat.append(tw_features.to(device))
+        node_embeddings = self.feature_embed(torch.cat(feat, dim=-1))
         node_embeddings = torch.cat([
             node_embeddings, 
             node_embeddings[:, :1, :].repeat(1, max_length - N, 1)

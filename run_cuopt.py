@@ -84,6 +84,41 @@ def get_cuopt_model(index, raw_data_dist, raw_data_demand, raw_data_capacity, n_
     data_model.set_vehicle_locations(depot, depot)
     return data_model
 
+def get_cuopt_model_tw(inst, n_vehicles, scale):
+    """Build a CVRPTW DataModel from a generated instance dict (see gen_cvrptw.py).
+
+    Time windows are validated against the primary cost matrix (no separate
+    transit-time matrix), so earliest/latest/service are already in scaled
+    distance units.
+    """
+    coords = inst["coords"].unsqueeze(0)  # [1, N, 2]
+    dist = pairwise_euclidean_distance(coords)  # [1, N, N]
+    n_locations = coords.shape[1]
+
+    distance_matrix_df = cudf.DataFrame(dist[0].numpy() * scale)
+    location_demand = cudf.Series(inst["demand"].numpy(), dtype=np.int32)
+    vehicle_capacity = cudf.Series([int(inst["capacity"])] * n_vehicles, dtype=np.int32)
+
+    data_model = routing.DataModel(n_locations, n_vehicles)
+    data_model.add_cost_matrix(distance_matrix_df)
+    data_model.add_capacity_dimension("demand", location_demand, vehicle_capacity)
+
+    earliest = cudf.Series(inst["earliest"].numpy(), dtype=np.int32)
+    latest = cudf.Series(inst["latest"].numpy(), dtype=np.int32)
+    service = cudf.Series(inst["service"].numpy(), dtype=np.int32)
+    data_model.set_order_time_windows(earliest, latest)
+    data_model.set_order_service_times(service)
+
+    H = int(round(inst["H"]))
+    veh_earliest = cudf.Series([0] * n_vehicles, dtype=np.int32)
+    veh_latest = cudf.Series([H] * n_vehicles, dtype=np.int32)
+    data_model.set_vehicle_time_windows(veh_earliest, veh_latest)
+
+    depot = cudf.Series([0] * n_vehicles)
+    data_model.set_vehicle_locations(depot, depot)
+    return data_model
+
+
 def run_cuopt(data_model, time_limit, callback=None):
     solver_settings = routing.SolverSettings()
     solver_settings.set_time_limit(time_limit)

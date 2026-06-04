@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--weights", default="outputs/rl_run2/best_policy.pt")
     ap.add_argument("--data_path",
                     default="../../cuopt-examples/data/test_cvrp1000_hgs_n128_C250.txt")
+    ap.add_argument("--data_pt", default=None,
+                    help="Cached CVRPTW instance (.pt). When set, benchmarks CVRPTW with TW features.")
     ap.add_argument("--index", type=int, default=1)
     ap.add_argument("--time_limit", type=float, default=10)
     ap.add_argument("--scale", type=float, default=1e2)
@@ -69,31 +71,54 @@ def main():
     os.environ["CUOPT_LS_MODE"] = "oracle"
     os.environ["CUOPT_RL_K"] = str(args.k)
 
-    raw_nodes, raw_cap, raw_demand, raw_cost, _ = load_raw_data(
-        args.data_path, episode=1, begin_index=args.index)
-    raw_dist = pairwise_euclidean_distance(raw_nodes)
-    coords1 = raw_nodes[0:1]
-    demand1 = raw_demand[0:1]
-    cap = raw_cap[0].item()
-
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    tw_features = None
+    if args.data_pt is not None:
+        from load_nco_data import load_cvrptw_data, build_tw_features
+        from run_cuopt import get_cuopt_model_tw
+        inst = load_cvrptw_data(args.data_pt)
+        coords1 = inst["coords"].unsqueeze(0)
+        demand1 = inst["demand"].unsqueeze(0)
+        cap = inst["capacity"]
+        scale = inst["scale"]
+        n_node_feat = 6
+        max_vehicles = inst["n_vehicles"]
+        tw_features = build_tw_features(inst)
+
+        def build_model():
+            return get_cuopt_model_tw(inst, inst["n_vehicles"], scale)
+    else:
+        raw_nodes, raw_cap, raw_demand, raw_cost, _ = load_raw_data(
+            args.data_path, episode=1, begin_index=args.index)
+        raw_dist = pairwise_euclidean_distance(raw_nodes)
+        coords1 = raw_nodes[0:1]
+        demand1 = raw_demand[0:1]
+        cap = raw_cap[0].item()
+        scale = args.scale
+        n_node_feat = 3
+        max_vehicles = args.n_vehicles
+
+        def build_model():
+            return get_cuopt_model(0, raw_dist, raw_demand, raw_cap, args.n_vehicles, args.scale)
 
     if args.mode == "random":
         callback = RandomSubsetCallback()
     else:
-        model = CostPredictor(device=device, mode=args.model_mode)
+        model = CostPredictor(device=device, mode=args.model_mode, n_node_feat=n_node_feat,
+                              max_vehicles=max_vehicles)
         sd = torch.load(args.weights, map_location=device)
         model.load_state_dict(sd.get("model_state_dict", sd))
         eps = args.epsilon if args.mode == "policy_eps" else 0.0
         callback = RLPolicyCallback(
             model, coords1, demand1, cap, device,
             temperature=args.temperature, score_sign=args.score_sign,
-            train=False, epsilon=eps)
+            train=False, epsilon=eps, tw_features=tw_features)
 
-    model_dm = get_cuopt_model(0, raw_dist, raw_demand, raw_cap, args.n_vehicles, args.scale)
+    model_dm = build_model()
     solution = run_cuopt(model_dm, args.time_limit, callback=callback)
     if solution:
-        cost = solution.get_total_objective() / args.scale
+        cost = solution.get_total_objective() / scale
         print(f"[benchmark] final_cost={cost:.6f} mode={args.mode} seed={args.seed}")
     else:
         print(f"[benchmark] no feasible solution mode={args.mode} seed={args.seed}")
