@@ -1,8 +1,12 @@
-"""Single-run benchmark for RL node-selection (stdout -> plot_avg.py).
+"""Single-run benchmark for RL local-search subset selection.
 
 Modes:
-  random  - uniform random pick among K candidate subsets (random baseline)
-  policy  - trained CostPredictor argmax pick (best_policy.pt)
+  random      - uniform random pick among K candidate subsets
+  policy      - trained CostPredictor pick
+  policy_eps  - epsilon-greedy trained CostPredictor pick
+
+Policy modes default to greedy argmax. Use --selection sample to sample from
+the policy softmax distribution.
 """
 
 import argparse
@@ -46,7 +50,8 @@ class RandomSubsetCallback(CustomizeNodesCallback):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["random", "policy", "policy_eps"], required=True)
-    ap.add_argument("--weights", default="outputs/rl_run2/best_policy.pt")
+    ap.add_argument("--weights", default=None,
+                    help="Checkpoint path for policy modes; required unless --mode=random.")
     ap.add_argument("--data_path",
                     default="../../cuopt-examples/data/test_cvrp1000_hgs_n128_C250.txt")
     ap.add_argument("--data_pt", default=None,
@@ -62,7 +67,11 @@ def main():
     ap.add_argument("--epsilon", type=float, default=0.1,
                     help="epsilon-greedy for policy_eps mode (random arm with prob epsilon)")
     ap.add_argument("--score_sign", type=float, default=-1.0)
+    ap.add_argument("--selection", choices=["greedy", "sample"], default="greedy",
+                    help="Policy arm selection for eval: argmax greedy or softmax sampling.")
     args = ap.parse_args()
+    if args.mode != "random" and not args.weights:
+        ap.error("--weights is required for policy and policy_eps modes")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -70,6 +79,7 @@ def main():
 
     os.environ["CUOPT_LS_MODE"] = "oracle"
     os.environ["CUOPT_RL_K"] = str(args.k)
+    os.environ["CUOPT_RL_REWARD_HORIZON"] = "1"
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -113,15 +123,16 @@ def main():
         callback = RLPolicyCallback(
             model, coords1, demand1, cap, device,
             temperature=args.temperature, score_sign=args.score_sign,
-            train=False, epsilon=eps, tw_features=tw_features)
+            train=False, epsilon=eps, tw_features=tw_features,
+            selection=args.selection)
 
     model_dm = build_model()
     solution = run_cuopt(model_dm, args.time_limit, callback=callback)
     if solution:
         cost = solution.get_total_objective() / scale
-        print(f"[benchmark] final_cost={cost:.6f} mode={args.mode} seed={args.seed}")
+        print(f"[benchmark] final_cost={cost:.6f} mode={args.mode} seed={args.seed} selection={args.selection}")
     else:
-        print(f"[benchmark] no feasible solution mode={args.mode} seed={args.seed}")
+        print(f"[benchmark] no feasible solution mode={args.mode} seed={args.seed} selection={args.selection}")
 
 
 if __name__ == "__main__":

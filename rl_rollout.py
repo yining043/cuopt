@@ -29,6 +29,8 @@ def main():
     ap.add_argument("--scale", type=float, default=1e2)
     ap.add_argument("--n_vehicles", type=int, default=21)
     ap.add_argument("--k", type=int, default=32)
+    ap.add_argument("--reward_horizon", type=int, default=1,
+                    help="C++ full-feedback label horizon; keep 1 for eval/benchmark.")
     ap.add_argument("--model_mode", default="v2")
     ap.add_argument("--score_sign", type=float, default=-1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -93,6 +95,7 @@ def main():
         # random among the valid subsets -> the apples-to-apples baseline.
         os.environ["CUOPT_LS_MODE"] = "oracle"
         os.environ["CUOPT_RL_K"] = str(args.k)
+        os.environ["CUOPT_RL_REWARD_HORIZON"] = str(args.reward_horizon)
         cb = RandomSubsetCallback()
         cuopt_model = build_model()
         t0 = time.time()
@@ -104,6 +107,7 @@ def main():
 
     os.environ["CUOPT_LS_MODE"] = "oracle"
     os.environ["CUOPT_RL_K"] = str(args.k)
+    os.environ["CUOPT_RL_REWARD_HORIZON"] = str(args.reward_horizon)
 
     model = CostPredictor(device=device, mode=args.model_mode, n_node_feat=n_node_feat,
                           max_vehicles=n_vehicles)

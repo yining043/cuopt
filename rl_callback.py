@@ -1,16 +1,13 @@
-"""RL policy callback for cuOpt node-selection.
+"""RL policy callback for cuOpt local-search subset selection.
 
-Reuses the existing `pred_with_NN` path in local_search.cu:
-  1. cuOpt discovers anchors (1 full search) and generates K random subsets,
-     each run once (no look-ahead), producing K executed-anchor bitmasks.
-  2. `customize_nodes_to_search` scores the K masks with CostPredictor, treats
-     the scores as logits over a K-arm action, samples one arm (the action),
-     and returns the chosen mask as the node selection.
-  3. After cuOpt executes the chosen mask in the *real* search, C++ calls
-     `on_search_result` with the cost delta -> the reward for that action.
+The C++ local-search path exposes K candidate node/operator subsets at each
+callback. The policy scores those candidates and returns exactly one subset
+mask for cuOpt to execute on the real incumbent solution.
 
-The look-ahead that made the oracle slow is gone; the RL return over the real
-trajectory replaces it.
+During training, C++ also provides full-feedback labels for every candidate:
+one-step improvements and optional short-horizon lookahead improvements packed
+as [immediate K] + [lookahead K]. The training loop uses the lookahead labels;
+benchmark/eval action selection uses only the policy scores.
 """
 
 import random
@@ -43,8 +40,10 @@ class RandomSubsetCallback(CustomizeNodesCallback):
 class RLPolicyCallback(CustomizeNodesCallback):
     def __init__(self, model, coordinates, demand, vehicle_capacity, device,
                  temperature=1.0, score_sign=-1.0, train=True, epsilon=0.0,
-                 tw_features=None):
+                 tw_features=None, selection="greedy"):
         super().__init__()
+        if selection not in {"greedy", "sample"}:
+            raise ValueError(f"selection must be 'greedy' or 'sample', got {selection!r}")
         self.model = model
         self.device = device
         # coordinates: [1, N, 2]; demand: [1, N]; vehicle_capacity: scalar
@@ -58,6 +57,7 @@ class RLPolicyCallback(CustomizeNodesCallback):
         self.score_sign = score_sign
         self.train = train
         self.epsilon = epsilon
+        self.selection = selection
         self.transitions = []   # finalized (s, a, r) steps for this episode
         self._pending = None    # action awaiting its reward
         self.eps = 1e-6
@@ -83,7 +83,13 @@ class RLPolicyCallback(CustomizeNodesCallback):
         trail_masks = torch.tensor(
             trail_masks_flat, dtype=torch.long, device=self.device
         ).reshape(K, max_length)
-        rewards = torch.tensor(trail_rewards, dtype=torch.float32, device=self.device)  # [K]
+        rewards_raw = torch.tensor(trail_rewards, dtype=torch.float32, device=self.device)
+        if rewards_raw.numel() >= 2 * K:
+            immediate_rewards = rewards_raw[:K]
+            rewards = rewards_raw[K:2 * K]
+        else:
+            immediate_rewards = rewards_raw[:K]
+            rewards = immediate_rewards
 
         non_empty = (trail_masks > 0).any(dim=1)
         if not non_empty.any():
@@ -103,6 +109,8 @@ class RLPolicyCallback(CustomizeNodesCallback):
             elif self.epsilon > 0 and random.random() < self.epsilon:
                 valid_idx = torch.where(non_empty)[0]
                 idx = int(valid_idx[torch.randint(len(valid_idx), (1,))].item())
+            elif self.selection == "sample":
+                idx = int(torch.multinomial(probs, 1).item())
             else:
                 idx = int(torch.argmax(probs).item())
 
@@ -114,7 +122,8 @@ class RLPolicyCallback(CustomizeNodesCallback):
                 'sol': sol_tensor[0].detach().to('cpu'),
                 'masks': trail_masks.detach().to('cpu').to(torch.int16),
                 'valid': non_empty.detach().to('cpu'),
-                'rewards': rewards.detach().to('cpu'),         # [K] probe deltas
+                'rewards': rewards.detach().to('cpu'),         # [K] lookahead deltas
+                'immediate_rewards': immediate_rewards.detach().to('cpu'),
                 'cost_0': float(solution_cost),
                 'idx': idx,
                 'iter': int(iter),

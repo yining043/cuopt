@@ -851,16 +851,21 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
             }
           }
 
-          // Step 2: Run K trails (1 search each, no look-ahead)
+          // Step 2: Run K trails. During training, CUOPT_RL_REWARD_HORIZON can
+          // make each trail label use a short rollout while the policy action
+          // remains the first-step executed-anchor mask.
           // K is overridable via CUOPT_RL_K to trade off probe cost vs action diversity.
           const char* rl_k_env = std::getenv("CUOPT_RL_K");
           const int K = (rl_k_env && std::atoi(rl_k_env) > 0) ? std::atoi(rl_k_env) : 100;
+          const char* rl_horizon_env = std::getenv("CUOPT_RL_REWARD_HORIZON");
+          const int reward_horizon =
+            (rl_horizon_env && std::atoi(rl_horizon_env) > 0) ? std::atoi(rl_horizon_env) : 1;
           std::vector<i_t> anchor_vec_nn(all_anchor_nn.begin(), all_anchor_nn.end());
           std::vector<i_t> trail_masks_flat(K * N_nodes_w_dummy, 0);
-          // Per-trail probe reward: cost reduction the subset achieved on a copy.
-          // Gives the policy full (all-K) feedback per step instead of only the
-          // executed arm, which is far more sample-efficient for RL.
-          std::vector<f_t> trail_rewards(K, (f_t)0);
+          // Full-feedback labels are packed as [immediate K] + [lookahead K].
+          // cuOpt only accepts improving moves, so candidates without an
+          // accepted first-step move keep zero labels.
+          std::vector<f_t> trail_rewards(K * 2, (f_t)0);
           const f_t base_cost = sol.get_cost(true, move_candidates.weights);
 
           std::unordered_map<i_t, size_t> node_id_to_h_idx;
@@ -883,12 +888,13 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
 
             Sol temp_trail(sol);
             load_to_device_both(work_node_list);
-            run_fast_search(temp_trail, true, 96, false, false);
-            trail_rewards[t] = base_cost - temp_trail.get_cost(true, move_candidates.weights);
+            bool move_found_trail = run_fast_search(temp_trail, true, 96, false, false);
 
-            // Store bitmask per anchor: bit0=sliding(1), bit1=vrp(2), bit2=recycle_vrp(4), bit3=two_opt(8)
+            // Store only the first-step action mask. Lookahead continuation is
+            // label generation, not part of the action exposed to the policy.
             auto anchors_exec = get_last_executed_anchors();
             auto ops_exec = get_last_executed_anchor_operator();
+            bool has_first_step_mask = false;
             for (size_t k = 0; k < anchors_exec.size(); ++k) {
               i_t a = anchors_exec[k];
               if (a >= N_nodes_w_dummy) continue;
@@ -899,6 +905,16 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
               if (op == 2) mask = 4;   // recycle_vrp
               if (op == 3) mask = 8;   // two_opt
               trail_masks_flat[t * N_nodes_w_dummy + a] |= mask;
+              if (mask > 0) { has_first_step_mask = true; }
+            }
+
+            if (has_first_step_mask && move_found_trail) {
+              trail_rewards[t] = base_cost - temp_trail.get_cost(true, move_candidates.weights);
+              for (int h = 1; h < reward_horizon && move_found_trail; ++h) {
+                load_to_device_both(full_node_to_search);
+                move_found_trail = run_fast_search(temp_trail, true, 96, false, false);
+              }
+              trail_rewards[K + t] = base_cost - temp_trail.get_cost(true, move_candidates.weights);
             }
           }
 

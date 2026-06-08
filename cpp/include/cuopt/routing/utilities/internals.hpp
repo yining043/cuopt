@@ -48,6 +48,8 @@ public:
   // @param solution_cost          Current objective cost value
   // @param trail_masks_flat       K executed_anchor masks flattened: [K * N_nodes_w_dummy]
   // @param num_trails             Number of trails K
+  // @param trail_rewards          Per-trail labels. Either [K] legacy rewards or
+  //                               [immediate K] + [lookahead K] packed labels.
   // @param selection_mask_out     OUTPUT - Selection mask indexed by node_id
   // @param iteration              Current iteration number
   virtual void customize_nodes_to_search(
@@ -83,4 +85,3 @@ public:
 }  // namespace callbacks
 }  // namespace routing
 }  // namespace cuopt
-
