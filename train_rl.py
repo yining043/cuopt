@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from datetime import datetime
 
 import numpy as np
@@ -37,6 +38,12 @@ import torch
 import torch.nn.functional as F
 
 from model import CostPredictor, load_checkpoint
+
+
+def autocast_context(device, amp_dtype):
+    if device.type != "cuda" or amp_dtype == "none":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +94,13 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
         cost_0 = torch.full((K,), t['cost_0'], dtype=torch.float32, device=device)
         tw = tw_d.expand(K, -1, -1) if tw_d is not None else None
 
-        scores = model(nodes, demands, sol, masks, cost_0, tw_features=tw)
-        logits = (args.score_sign * scores / args.temperature).masked_fill(~valid, float('-inf'))
+        with autocast_context(device, args.amp_dtype):
+            scores = model(nodes, demands, sol, masks, cost_0, tw_features=tw)
+        scores = scores.float()
+        logits = args.score_sign * scores / args.temperature
+        if args.logit_clip > 0:
+            logits = logits.clamp(-args.logit_clip, args.logit_clip)
+        logits = logits.masked_fill(~valid, float('-inf'))
         log_probs = F.log_softmax(logits, dim=0)
         probs = log_probs.exp()
 
@@ -223,6 +235,9 @@ def launch_rollouts(specs, gpus, out_dir, args, weights_path, train, mode_run="p
                 "--model_mode", args.mode,
                 "--score_sign", str(args.score_sign),
                 "--temperature", str(args.temperature),
+                "--logit_clip", str(args.logit_clip),
+                "--selection", args.eval_selection,
+                "--amp_dtype", args.amp_dtype,
                 "--train", str(1 if train else 0),
                 "--seed", str(seed),
             ]
@@ -256,7 +271,7 @@ def launch_rollouts(specs, gpus, out_dir, args, weights_path, train, mode_run="p
 
 
 def eval_policy(gpus, out_dir, args, weights_path):
-    """Average final cost over args.eval_runs stochastic policy runs."""
+    """Average final cost over args.eval_runs policy runs."""
     pol_specs = [(f"eval_pol_{i}", 10000 + i) for i in range(args.eval_runs)]
     pol = launch_rollouts(pol_specs, gpus, out_dir, args, weights_path, train=False,
                           mode_run="policy", progress="evaluate-policy")
@@ -361,13 +376,20 @@ def main():
     parser.add_argument("--k", type=int, default=32, help="K candidate subsets (CUOPT_RL_K)")
     parser.add_argument("--reward_horizon", type=int, default=2,
                         help="training only: full-feedback label rollout depth; eval uses 1")
-    parser.add_argument("--mode", type=str, default="v2", choices=["ratio", "new", "v2"])
+    parser.add_argument("--mode", type=str, default="v2",
+                        choices=["ratio", "new", "v2", "v7", "flashv7"])
     parser.add_argument("--backbone_ckpt", type=str, default=None)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--amp_dtype", choices=["none", "bf16"], default="none",
+                        help="Autocast dtype for policy forward passes.")
+    parser.add_argument("--eval_selection", choices=["greedy", "sample"], default="greedy",
+                        help="Policy arm selection for train-time eval; training always samples.")
     parser.add_argument("--score_sign", type=float, default=-1.0)
     parser.add_argument("--entropy_coef", type=float, default=0.01)
+    parser.add_argument("--logit_clip", type=float, default=0.0,
+                        help="Optional symmetric clamp applied to policy logits after temperature; <=0 disables.")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--update_minibatch", type=int, default=16)
     parser.add_argument("--update_epochs", type=int, default=2,
@@ -394,7 +416,8 @@ def main():
     print(f"[setup] gpus={gpus} master={device} batch_episodes={args.batch_episodes} "
           f"K={args.k} reward_horizon_train={args.reward_horizon} "
           f"reward_horizon_eval=1 update_epochs={args.update_epochs} "
-          f"eval_runs={args.eval_runs} time_limit={args.time_limit}")
+          f"eval_runs={args.eval_runs} eval_selection={args.eval_selection} "
+          f"amp_dtype={args.amp_dtype} time_limit={args.time_limit}")
 
     # Instance data for the master update (coords/demand + optional TW).
     from run_cuopt import pairwise_euclidean_distance  # noqa: F401 (torch-only helper)
@@ -480,9 +503,14 @@ def main():
             **stats,
         }
 
+        # Eval workers load current_weights.pt, so refresh it after the update.
+        save_weights(weights_path)
+
         eval_reasons = []
         if args.eval_every and rnd % args.eval_every == 0:
             eval_reasons.append("periodic")
+        if rnd == args.rounds - 1 and "final" not in eval_reasons:
+            eval_reasons.append("final")
         if top1_new_high:
             prev_s = "none" if prev_best_top1_lookahead == float("-inf") else f"{prev_best_top1_lookahead:.3f}"
             eval_reasons.append(f"top1_lookahead_new_high:{prev_s}->{top1_lookahead:.3f}")

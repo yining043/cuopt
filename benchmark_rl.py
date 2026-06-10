@@ -12,6 +12,7 @@ the policy softmax distribution.
 import argparse
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -64,6 +65,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--model_mode", default="v2")
     ap.add_argument("--temperature", type=float, default=0.5)
+    ap.add_argument("--logit_clip", type=float, default=0.0,
+                    help="Optional symmetric clamp applied to policy logits after temperature; <=0 disables.")
+    ap.add_argument("--amp_dtype", choices=["none", "bf16"], default="none",
+                    help="Autocast dtype for policy forward passes.")
     ap.add_argument("--epsilon", type=float, default=0.1,
                     help="epsilon-greedy for policy_eps mode (random arm with prob epsilon)")
     ap.add_argument("--score_sign", type=float, default=-1.0)
@@ -119,20 +124,32 @@ def main():
                               max_vehicles=max_vehicles)
         sd = torch.load(args.weights, map_location=device)
         model.load_state_dict(sd.get("model_state_dict", sd))
+        model.eval()
         eps = args.epsilon if args.mode == "policy_eps" else 0.0
         callback = RLPolicyCallback(
             model, coords1, demand1, cap, device,
             temperature=args.temperature, score_sign=args.score_sign,
             train=False, epsilon=eps, tw_features=tw_features,
-            selection=args.selection)
+            selection=args.selection, amp_dtype=args.amp_dtype,
+            logit_clip=args.logit_clip)
 
     model_dm = build_model()
+    wall_start = time.perf_counter()
     solution = run_cuopt(model_dm, args.time_limit, callback=callback)
+    wall_time_sec = time.perf_counter() - wall_start
     if solution:
         cost = solution.get_total_objective() / scale
-        print(f"[benchmark] final_cost={cost:.6f} mode={args.mode} seed={args.seed} selection={args.selection}")
+        print(f"[benchmark] final_cost={cost:.6f} mode={args.mode} seed={args.seed} "
+              f"selection={args.selection} temperature={args.temperature} "
+              f"k={args.k} model_mode={args.model_mode} amp_dtype={args.amp_dtype} "
+              f"logit_clip={args.logit_clip} score_sign={args.score_sign} "
+              f"wall_time_sec={wall_time_sec:.3f}")
     else:
-        print(f"[benchmark] no feasible solution mode={args.mode} seed={args.seed} selection={args.selection}")
+        print(f"[benchmark] no feasible solution mode={args.mode} seed={args.seed} "
+              f"selection={args.selection} temperature={args.temperature} "
+              f"k={args.k} model_mode={args.model_mode} amp_dtype={args.amp_dtype} "
+              f"logit_clip={args.logit_clip} score_sign={args.score_sign} "
+              f"wall_time_sec={wall_time_sec:.3f}")
 
 
 if __name__ == "__main__":

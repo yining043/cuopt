@@ -163,7 +163,7 @@ def main():
     ap.add_argument("--out-best", type=str, default="data_best.png")
     ap.add_argument("--ymax", type=float, default=None)
     ap.add_argument("--ymin", type=float, default=0.0)
-    ap.add_argument("--segments", "-s", type=int, default=0)
+    ap.add_argument("--segments", "--seg", "-s", type=int, default=0)
     ap.add_argument("--xshift", type=float, default=0.0)
     ap.add_argument("--break", dest="break_mode", default="time")
     # 新增开关：是否使用绝对迭代次数

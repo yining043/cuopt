@@ -11,6 +11,7 @@ benchmark/eval action selection uses only the policy scores.
 """
 
 import random
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +41,8 @@ class RandomSubsetCallback(CustomizeNodesCallback):
 class RLPolicyCallback(CustomizeNodesCallback):
     def __init__(self, model, coordinates, demand, vehicle_capacity, device,
                  temperature=1.0, score_sign=-1.0, train=True, epsilon=0.0,
-                 tw_features=None, selection="greedy"):
+                 tw_features=None, selection="greedy", amp_dtype="none",
+                 logit_clip=0.0):
         super().__init__()
         if selection not in {"greedy", "sample"}:
             raise ValueError(f"selection must be 'greedy' or 'sample', got {selection!r}")
@@ -58,9 +60,16 @@ class RLPolicyCallback(CustomizeNodesCallback):
         self.train = train
         self.epsilon = epsilon
         self.selection = selection
+        self.amp_dtype = amp_dtype
+        self.logit_clip = float(logit_clip)
         self.transitions = []   # finalized (s, a, r) steps for this episode
         self._pending = None    # action awaiting its reward
         self.eps = 1e-6
+
+    def _autocast_context(self):
+        if self.device.type != "cuda" or self.amp_dtype == "none":
+            return nullcontext()
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
     def _build_arm_inputs(self, solution_flat, solution_cost, trail_masks):
         K, max_length = trail_masks.shape
@@ -99,9 +108,12 @@ class RLPolicyCallback(CustomizeNodesCallback):
         sol_tensor, nodes, demands, cost_0, tw = self._build_arm_inputs(
             solution_flat, solution_cost, trail_masks)
 
-        with torch.no_grad():
+        with torch.no_grad(), self._autocast_context():
             scores = self.model(nodes, demands, sol_tensor, trail_masks, cost_0, tw_features=tw)  # [K]
+            scores = scores.float()
             logits = self.score_sign * scores / self.temperature
+            if self.logit_clip > 0:
+                logits = logits.clamp(-self.logit_clip, self.logit_clip)
             logits = logits.masked_fill(~non_empty, float('-inf'))
             probs = F.softmax(logits, dim=0)
             if self.train:

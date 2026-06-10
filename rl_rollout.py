@@ -34,6 +34,12 @@ def main():
     ap.add_argument("--model_mode", default="v2")
     ap.add_argument("--score_sign", type=float, default=-1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
+    ap.add_argument("--logit_clip", type=float, default=0.0,
+                    help="Optional symmetric clamp applied to policy logits after temperature; <=0 disables.")
+    ap.add_argument("--selection", choices=["greedy", "sample"], default="greedy",
+                    help="Policy action selection when --train=0.")
+    ap.add_argument("--amp_dtype", choices=["none", "bf16"], default="none",
+                    help="Autocast dtype for policy forward passes.")
     ap.add_argument("--train", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -119,7 +125,9 @@ def main():
     cb = RLPolicyCallback(
         model, coords1, demand1, cap, device,
         temperature=args.temperature, score_sign=args.score_sign,
-        train=bool(args.train), tw_features=tw_features)
+        train=bool(args.train), tw_features=tw_features,
+        selection=args.selection, amp_dtype=args.amp_dtype,
+        logit_clip=args.logit_clip)
     cuopt_model = build_model()
     t0 = time.time()
     sol = run_cuopt(cuopt_model, args.time_limit, callback=cb)
