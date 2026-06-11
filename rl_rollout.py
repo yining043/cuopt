@@ -31,6 +31,10 @@ def main():
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--reward_horizon", type=int, default=1,
                     help="C++ full-feedback label horizon; keep 1 for eval/benchmark.")
+    ap.add_argument("--collect_last_sec", type=float, default=0.0,
+                    help="If >0, the oracle/NN probe + callback (data collection / policy "
+                         "action) only runs in the final N seconds of the solve; earlier "
+                         "iterations warm up with plain cuOpt. <=0 keeps whole-solve behavior.")
     ap.add_argument("--model_mode", default="v2")
     ap.add_argument("--score_sign", type=float, default=-1.0)
     ap.add_argument("--temperature", type=float, default=1.0)
@@ -102,6 +106,7 @@ def main():
         os.environ["CUOPT_LS_MODE"] = "oracle"
         os.environ["CUOPT_RL_K"] = str(args.k)
         os.environ["CUOPT_RL_REWARD_HORIZON"] = str(args.reward_horizon)
+        os.environ["CUOPT_RL_COLLECT_LAST_SEC"] = str(args.collect_last_sec)
         cb = RandomSubsetCallback()
         cuopt_model = build_model()
         t0 = time.time()
@@ -114,6 +119,7 @@ def main():
     os.environ["CUOPT_LS_MODE"] = "oracle"
     os.environ["CUOPT_RL_K"] = str(args.k)
     os.environ["CUOPT_RL_REWARD_HORIZON"] = str(args.reward_horizon)
+    os.environ["CUOPT_RL_COLLECT_LAST_SEC"] = str(args.collect_last_sec)
 
     model = CostPredictor(device=device, mode=args.model_mode, n_node_feat=n_node_feat,
                           max_vehicles=n_vehicles)

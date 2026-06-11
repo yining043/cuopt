@@ -564,6 +564,13 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
     move_candidates.nodes_to_search.h_nodes_to_search = nodes_to_search;
     move_candidates.nodes_to_search.n_sampled_nodes = nodes_to_search.size();
   };
+  // RL collection window: when CUOPT_RL_COLLECT_LAST_SEC > 0, the oracle/NN probe
+  // + obs_callback (data collection / policy action) only runs in the final
+  // `collect_last_sec` seconds of the solve. Earlier iterations fall back to plain
+  // cuOpt (warm-up), so the policy is trained/evaluated on the late-stage states it
+  // actually sees near convergence. <=0 (default) keeps the legacy whole-solve mode.
+  const char* rl_collect_env = std::getenv("CUOPT_RL_COLLECT_LAST_SEC");
+  const double rl_collect_last_sec = (rl_collect_env ? std::atof(rl_collect_env) : 0.0);
   while (iter < iter_limit) {
     if constexpr (REQUEST == request_t::VRP) { 
       extract_nodes_to_search(sol, move_candidates);
@@ -578,6 +585,15 @@ std::chrono::steady_clock::duration local_search_t<i_t, f_t, REQUEST>::run_best_
       auto pause_begin = clock::now();
       const char* ls_mode = std::getenv("CUOPT_LS_MODE");
       bool origin = !(ls_mode && std::strcmp(ls_mode, "oracle") == 0);
+      // RL collection window gate: outside the trailing window, force plain cuOpt
+      // (origin) so the probe/callback is skipped and the solution just warms up.
+      // Uses the same elapsed measure as check_time_limit (now - total_offset - start).
+      if (!origin && rl_collect_last_sec > 0.0) {
+        const double elapsed_sec = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - total_offset - start).count();
+        const bool in_collect_window = elapsed_sec >= ((double)time_limit - rl_collect_last_sec);
+        if (!in_collect_window) { origin = true; }
+      }
       // #########
 
       if (!origin && pred_with_NN == false) {

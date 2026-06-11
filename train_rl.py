@@ -61,19 +61,33 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
     `top1_current_acc` tracks the same metric for one-step labels.
     """
     all_steps = []
+    n_low_spread = 0
+    # In-window decision points cuOpt actually collected (the warm-up part of each
+    # solve runs plain cuOpt and never fires the callback, so it contributes 0 here).
+    n_collected_in_window = sum(len(ep) for ep in episodes if ep)
     for ep_trans in episodes:
         if not ep_trans:
             continue
         idxs = list(range(len(ep_trans)))
         if args.max_update_steps_per_ep and len(idxs) > args.max_update_steps_per_ep:
             idxs = list(np.random.choice(idxs, args.max_update_steps_per_ep, replace=False))
-        all_steps.extend(ep_trans[i] for i in idxs)
+        for i in idxs:
+            t = ep_trans[i]
+            # Spread filter: skip decision points whose valid lookahead-reward
+            # range (max-min) is below threshold -- those K probes are nearly
+            # indistinguishable, so they carry little ranking signal for the bandit.
+            if args.min_reward_spread > 0.0:
+                rv = t['rewards'][t['valid']]
+                if rv.numel() < 2 or float(rv.max() - rv.min()) <= args.min_reward_spread:
+                    n_low_spread += 1
+                    continue
+            all_steps.append(t)
 
     if not all_steps:
         return {"loss": 0.0, "entropy": 0.0, "grad_norm": 0.0,
                 "top1_acc": 0.0, "rand_top1": 0.0, "n_update_steps": 0,
                 "n_opt_steps": 0, "top1_lookahead_acc": 0.0,
-                "top1_current_acc": 0.0}
+                "top1_current_acc": 0.0, "n_filtered_low_spread": n_low_spread}
 
     coords_d = coords.to(device)
     dem_d = (demand / cap).to(device)
@@ -111,8 +125,15 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
             adv = rewards - (rv.mean() if rv.numel() > 0 else 0.0)
         adv = adv.masked_fill(~valid, 0.0)
 
+        # Zero out invalid arms in log_probs BEFORE the product. The naive
+        # `probs * log_probs` evaluates 0 * (-inf) = NaN at masked slots; even
+        # though masked_fill fixes the forward value, the NaN still flows through
+        # the backward pass and poisons gradients via log_softmax. Masking the
+        # log-probs first makes those slots contribute exactly 0 in both
+        # directions, so empty arms truly do not participate.
+        safe_log_probs = log_probs.masked_fill(~valid, 0.0)
         J = (probs * adv).sum()
-        entropy = -(probs * log_probs).masked_fill(~valid, 0.0).sum()
+        entropy = -(probs * safe_log_probs).sum()
         loss = -J - args.entropy_coef * entropy
 
         pred_arm = probs.argmax()
@@ -140,7 +161,9 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
         epoch_orders.append(order)
 
     n_opt_planned = sum(len(order) // accum for order in epoch_orders)
-    print(f"  [update] collected_steps={n} -> epochs={update_epochs} "
+    print(f"  [update] collected_in_window={n_collected_in_window} "
+          f"skipped_low_spread={n_low_spread} (spread<= {args.min_reward_spread:g}) "
+          f"-> kept_for_update={n} | epochs={update_epochs} "
           f"train_step_passes={n * update_epochs}, "
           f"accumulate={accum} steps per update -> {n_opt_planned} optimizer steps",
           flush=True)
@@ -183,6 +206,8 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
         "top1_current_acc": total_top1_current / denom,
         "rand_top1": total_rand / denom,
         "n_update_steps": n,
+        "n_collected_in_window": n_collected_in_window,
+        "n_filtered_low_spread": n_low_spread,
         "update_epochs": update_epochs,
         "n_train_step_passes": n * update_epochs,
         "n_opt_steps": n_opt,
@@ -193,14 +218,35 @@ def reinforce_update(model, optimizer, episodes, coords, demand, cap, device, ar
 # Parallel rollout launching
 # ---------------------------------------------------------------------------
 
+def curriculum_time_limit(rnd, args):
+    """Per-round solve time under the optional time curriculum.
+
+    Grows the base --time_limit by --cl_increment seconds every --cl_every rounds,
+    capped at --cl_max_time. Returns the unchanged base when the curriculum is off
+    (cl_increment<=0), so behavior is identical to before unless explicitly enabled.
+    """
+    base = float(args.time_limit)
+    if args.cl_increment <= 0 or args.cl_every <= 0:
+        return base
+    t = base + (rnd // args.cl_every) * args.cl_increment
+    if args.cl_max_time > 0:
+        t = min(t, float(args.cl_max_time))
+    return float(t)
+
+
 def launch_rollouts(specs, gpus, out_dir, args, weights_path, train, mode_run="policy",
-                    progress=None):
+                    progress=None, time_limit=None, collect_last_sec=None):
     """specs: list of (tag, seed). Returns list of result dicts (loaded .pt).
 
     Runs in waves of len(gpus); each worker pinned to one GPU.
     If `progress` (a label string) is set, print one flushed line per finished
     rollout so the live tmux log shows collection/eval advancing.
+
+    `time_limit` / `collect_last_sec` override the args defaults for this call
+    (used by the curriculum + collection-window scheme); None falls back to args.
     """
+    tl = float(args.time_limit if time_limit is None else time_limit)
+    cls = float(args.collect_last_sec if collect_last_sec is None else collect_last_sec)
     results = [None] * len(specs)
     worker_log_dir = os.path.join(out_dir, "worker_logs")
     os.makedirs(worker_log_dir, exist_ok=True)
@@ -227,11 +273,12 @@ def launch_rollouts(specs, gpus, out_dir, args, weights_path, train, mode_run="p
                 "--data_path", args.data_path,
                 "--index", str(args.index),
                 *(["--data_pt", args.data_pt] if args.data_pt else []),
-                "--time_limit", str(args.time_limit),
+                "--time_limit", str(tl),
                 "--scale", str(args.scale),
                 "--n_vehicles", str(args.n_vehicles),
                 "--k", str(args.k),
                 "--reward_horizon", str(reward_horizon),
+                "--collect_last_sec", str(cls),
                 "--model_mode", args.mode,
                 "--score_sign", str(args.score_sign),
                 "--temperature", str(args.temperature),
@@ -270,11 +317,16 @@ def launch_rollouts(specs, gpus, out_dir, args, weights_path, train, mode_run="p
     return results
 
 
-def eval_policy(gpus, out_dir, args, weights_path):
-    """Average final cost over args.eval_runs policy runs."""
+def eval_policy(gpus, out_dir, args, weights_path, time_limit=None):
+    """Average final cost over args.eval_runs policy runs.
+
+    Uses the per-round `time_limit` (curriculum) and the same collection window as
+    training, so eval measures the policy in exactly the regime it is trained on.
+    """
     pol_specs = [(f"eval_pol_{i}", 10000 + i) for i in range(args.eval_runs)]
     pol = launch_rollouts(pol_specs, gpus, out_dir, args, weights_path, train=False,
-                          mode_run="policy", progress="evaluate-policy")
+                          mode_run="policy", progress="evaluate-policy",
+                          time_limit=time_limit, collect_last_sec=args.collect_last_sec)
     pol_costs = [r["final_cost"] for r in pol if r and r["final_cost"] is not None]
     return {
         "eval_policy_mean": float(np.mean(pol_costs)) if pol_costs else None,
@@ -284,15 +336,18 @@ def eval_policy(gpus, out_dir, args, weights_path):
     }
 
 
-def eval_random_baseline(gpus, out_dir, args):
+def eval_random_baseline(gpus, out_dir, args, time_limit=None):
     """Average final cost over args.eval_runs random-subset runs.
 
-    The random baseline is stationary (independent of the policy), so this is
-    computed ONCE and reused as the fixed reference for the gap in every eval.
+    The random baseline is policy-independent but DOES depend on the solve time
+    (and collection window), so under the curriculum it is recomputed per distinct
+    time_limit and cached by the caller; with the curriculum off it is computed once.
+    Uses the same warm-up + last-N-second window as the policy eval for fairness.
     """
     rnd_specs = [(f"eval_rnd_{i}", 30000 + i) for i in range(args.eval_runs)]
     rnd = launch_rollouts(rnd_specs, gpus, out_dir, args, None, train=False,
-                          mode_run="random", progress="evaluate-random")
+                          mode_run="random", progress="evaluate-random",
+                          time_limit=time_limit, collect_last_sec=args.collect_last_sec)
     rnd_costs = [r["final_cost"] for r in rnd if r and r["final_cost"] is not None]
     return {
         "eval_random_mean": float(np.mean(rnd_costs)) if rnd_costs else None,
@@ -334,22 +389,25 @@ def cleanup_round_artifacts(out_dir, rnd):
             _safe_remove(f)
 
 
-def manage_checkpoints(out_dir, rnd, save_every, save_fn):
+def manage_checkpoints(out_dir, rnd, save_every, save_fn, keep_rounds=None):
     """Save this round's policy and prune snapshots per the retention policy.
 
     A snapshot for round r is KEPT if any holds:
       * r < FIRST_N_KEEP                  (first 10 rounds, permanent)
       * r % save_every == 0               (milestone rounds, permanent)
+      * r in keep_rounds                  (rounds that were evaluated, permanent)
       * r > rnd - ROLLING_WINDOW          (within the latest-10 rolling window)
     Anything else is deleted as the rolling window slides forward.
     """
+    keep_rounds = keep_rounds or set()
     save_fn(os.path.join(out_dir, f"policy_round{rnd}.pt"))
     for f in glob.glob(os.path.join(out_dir, "policy_round*.pt")):
         m = re.search(r"policy_round(\d+)\.pt$", os.path.basename(f))
         if not m:
             continue
         r = int(m.group(1))
-        keep = (r < FIRST_N_KEEP) or (r % save_every == 0) or (r > rnd - ROLLING_WINDOW)
+        keep = ((r < FIRST_N_KEEP) or (r % save_every == 0)
+                or (r in keep_rounds) or (r > rnd - ROLLING_WINDOW))
         if not keep:
             try:
                 os.remove(f)
@@ -367,8 +425,8 @@ def main():
     parser.add_argument("--data_pt", default=None,
                         help="Cached CVRPTW instance (.pt). When set, trains CVRPTW with TW features.")
     parser.add_argument("--index", type=int, default=1)
-    parser.add_argument("--time_limit", type=float, default=5)
-    parser.add_argument("--rounds", type=int, default=300)
+    parser.add_argument("--time_limit", type=float, default=2)
+    parser.add_argument("--rounds", type=int, default=150)
     parser.add_argument("--batch_episodes", type=int, default=8, help="rollouts aggregated per update")
     parser.add_argument("--gpus", type=str, default="0,1,2,3")
     parser.add_argument("--scale", type=float, default=1e2)
@@ -376,6 +434,26 @@ def main():
     parser.add_argument("--k", type=int, default=32, help="K candidate subsets (CUOPT_RL_K)")
     parser.add_argument("--reward_horizon", type=int, default=2,
                         help="training only: full-feedback label rollout depth; eval uses 1")
+    parser.add_argument("--collect_last_sec", type=float, default=2.0,
+                        help="If >0, only the final N seconds of each solve run the probe/"
+                             "callback (plain cuOpt warm-up before); passed to rollouts as "
+                             "CUOPT_RL_COLLECT_LAST_SEC. Applies to collection AND eval/random.")
+    parser.add_argument("--cl_increment", type=float, default=1.0,
+                        help="Curriculum: seconds added to the solve time_limit at each bump. "
+                             "0 disables the curriculum.")
+    parser.add_argument("--cl_patience", type=int, default=3,
+                        help="Adaptive curriculum: bump the time_limit once top1_lookahead "
+                             "sets no new (per-level) high for this many consecutive rounds. "
+                             ">0 selects the ADAPTIVE schedule (overrides --cl_every). After "
+                             "each bump the per-level top1 memory is reset.")
+    parser.add_argument("--cl_every", type=int, default=3,
+                        help="Curriculum (fixed schedule, used only when --cl_patience<=0): "
+                             "number of rounds between each +cl_increment bump.")
+    parser.add_argument("--cl_max_time", type=float, default=20.0,
+                        help="Curriculum: cap on the grown time_limit; <=0 means no cap.")
+    parser.add_argument("--min_reward_spread", type=float, default=0.1,
+                        help="Drop decision points whose valid lookahead-reward spread "
+                             "(max-min) <= this threshold. 0 keeps every step.")
     parser.add_argument("--mode", type=str, default="v2",
                         choices=["ratio", "new", "v2", "v7", "flashv7"])
     parser.add_argument("--backbone_ckpt", type=str, default=None)
@@ -392,12 +470,12 @@ def main():
                         help="Optional symmetric clamp applied to policy logits after temperature; <=0 disables.")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--update_minibatch", type=int, default=16)
-    parser.add_argument("--update_epochs", type=int, default=2,
+    parser.add_argument("--update_epochs", type=int, default=5,
                         help="epochs over the collected rollout steps per round")
     parser.add_argument("--max_update_steps_per_ep", type=int, default=256,
                         help="subsample steps per episode for the update (0=use all)")
     parser.add_argument("--eval_runs", type=int, default=8, help="cuOpt runs to average per eval")
-    parser.add_argument("--eval_every", type=int, default=10)
+    parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--save_every", type=int, default=10)
     parser.add_argument("--master_device", type=str, default="cuda:0")
     parser.add_argument("--runname", type=str, default=None)
@@ -460,16 +538,41 @@ def main():
 
     best_eval = float("inf")
     best_top1_lookahead = float("-inf")
-    random_ref = None   # fixed random-subset baseline, computed once at first eval
+    # Adaptive curriculum state. ADAPTIVE mode (cl_patience>0): the solve time grows
+    # by cl_increment whenever top1_lookahead sets no new *per-level* high for
+    # cl_patience consecutive rounds; on each bump the per-level top1 memory and the
+    # patience counter are reset (so each level re-learns from scratch and gets its
+    # own best-top1 checkpoint). cl_patience<=0 falls back to the fixed cl_every
+    # schedule via curriculum_time_limit().
+    cl_adaptive = args.cl_increment > 0 and args.cl_patience > 0
+    current_tl = float(args.time_limit)        # stateful time under adaptive CL
+    cl_level = 0                               # which time-level we are on
+    level_best_top1 = float("-inf")            # best top1 since last switch
+    rounds_since_top1_improve = 0              # patience counter (per level)
+    pending_level_start = True                 # round 0 is the first level's start
+    # Random-subset baseline reference(s). Without the curriculum this holds one
+    # stationary entry; with the curriculum it caches one entry per distinct solve
+    # time so every eval compares against random at the SAME time + window.
+    random_ref_cache = {}
+    # Rounds that triggered an eval: their checkpoints are kept permanently so
+    # any evaluated policy can later be benchmarked / reloaded.
+    evaluated_rounds = set()
     for rnd in range(args.rounds):
         save_weights(weights_path)
 
-        print(f"[round {rnd}] collecting {args.batch_episodes} episodes on gpus={gpus} ...",
+        round_tl = current_tl if cl_adaptive else curriculum_time_limit(rnd, args)
+        is_level_start = pending_level_start
+        pending_level_start = False
+        cl_note = "" if round_tl == args.time_limit else (
+            f" (CL level {cl_level}, time_limit={round_tl:g}s)" if cl_adaptive
+            else f" (curriculum time_limit={round_tl:g})")
+        print(f"[round {rnd}] collecting {args.batch_episodes} episodes on gpus={gpus}{cl_note} ...",
               flush=True)
         t0 = time.time()
         specs = [(f"r{rnd}_e{e}", rnd * 1000 + e) for e in range(args.batch_episodes)]
         rollouts = launch_rollouts(specs, gpus, out_dir, args, weights_path, train=True,
-                                   mode_run="policy", progress=f"collect round {rnd}")
+                                   mode_run="policy", progress=f"collect round {rnd}",
+                                   time_limit=round_tl, collect_last_sec=args.collect_last_sec)
         roll_wall = time.time() - t0
 
         episodes = [r["transitions"] for r in rollouts if r and r.get("transitions")]
@@ -482,14 +585,35 @@ def main():
                                  tw_features=tw_features)
         update_wall = time.time() - t_upd
         top1_lookahead = float(stats.get("top1_lookahead_acc", stats.get("top1_acc", 0.0)))
-        prev_best_top1_lookahead = best_top1_lookahead
-        top1_new_high = stats.get("n_update_steps", 0) > 0 and top1_lookahead > best_top1_lookahead
-        if top1_new_high:
-            best_top1_lookahead = top1_lookahead
-        best_top1_record = None if best_top1_lookahead == float("-inf") else best_top1_lookahead
+        has_steps = stats.get("n_update_steps", 0) > 0
+        if cl_adaptive:
+            # New-high is measured against the PER-LEVEL best (reset on each switch),
+            # so the patience counter and per-level checkpoint restart every level.
+            prev_best_top1_lookahead = level_best_top1
+            top1_new_high = has_steps and top1_lookahead > level_best_top1
+            if top1_new_high:
+                level_best_top1 = top1_lookahead
+                rounds_since_top1_improve = 0
+            elif has_steps:
+                rounds_since_top1_improve += 1
+            best_top1_record = None if level_best_top1 == float("-inf") else level_best_top1
+        else:
+            prev_best_top1_lookahead = best_top1_lookahead
+            top1_new_high = has_steps and top1_lookahead > best_top1_lookahead
+            if top1_new_high:
+                best_top1_lookahead = top1_lookahead
+            best_top1_record = None if best_top1_lookahead == float("-inf") else best_top1_lookahead
+
+        # Decide (but do not yet apply) an adaptive CL time bump for the NEXT round:
+        # triggered when top1 has plateaued for cl_patience rounds and we are below cap.
+        cl_switch = (cl_adaptive and has_steps
+                     and current_tl < args.cl_max_time
+                     and rounds_since_top1_improve >= args.cl_patience)
 
         record = {
             "round": rnd,
+            "round_time_limit": round_tl,
+            "collect_last_sec": args.collect_last_sec,
             "train_cost_mean": float(np.mean(final_costs)) if final_costs else None,
             "train_cost_min": float(np.min(final_costs)) if final_costs else None,
             "best_known": best_known,
@@ -500,15 +624,44 @@ def main():
             "update_wall_s": update_wall,
             "top1_lookahead_new_high": bool(top1_new_high),
             "best_top1_lookahead": best_top1_record,
+            "cl_level": cl_level,
+            "cl_rounds_since_top1_improve": rounds_since_top1_improve,
+            "cl_patience": args.cl_patience if cl_adaptive else None,
             **stats,
         }
 
         # Eval workers load current_weights.pt, so refresh it after the update.
         save_weights(weights_path)
 
+        # Per-level best-top1 checkpoint: under adaptive CL, snapshot the policy
+        # whenever it sets a new per-level top1 high. One file per time-level holds
+        # that level's best-top1 weights (overwritten as it improves within a level),
+        # which is what we later benchmark / compare across levels.
+        if cl_adaptive and top1_new_high:
+            lvl_ckpt = os.path.join(out_dir, f"best_top1_level{cl_level}_t{round_tl:g}s.pt")
+            save_weights(lvl_ckpt)
+            save_weights(os.path.join(out_dir, "best_top1_policy.pt"))
+            print(f"[checkpoint @ round {rnd}] new per-level top1 high "
+                  f"{prev_best_top1_lookahead if prev_best_top1_lookahead != float('-inf') else float('nan'):.3f}"
+                  f"->{top1_lookahead:.3f} (level {cl_level}, time_limit={round_tl:g}s) "
+                  f"saved -> {os.path.basename(lvl_ckpt)}", flush=True)
+
         eval_reasons = []
         if args.eval_every and rnd % args.eval_every == 0:
             eval_reasons.append("periodic")
+        # Force an eval at BOTH ends of every CL level so start-vs-end can be compared
+        # fairly at the SAME solve time: the first round of a level (just after a bump,
+        # or round 0) and the round that triggers the next bump.
+        if cl_adaptive:
+            if is_level_start:
+                eval_reasons.append("cl_level_start")
+            if cl_switch:
+                eval_reasons.append("cl_level_end")
+        elif args.cl_increment > 0 and args.cl_every > 0:
+            if rnd % args.cl_every == 0 and "periodic" not in eval_reasons:
+                eval_reasons.append("cl_level_start")
+            if rnd % args.cl_every == args.cl_every - 1:
+                eval_reasons.append("cl_level_end")
         if rnd == args.rounds - 1 and "final" not in eval_reasons:
             eval_reasons.append("final")
         if top1_new_high:
@@ -517,16 +670,22 @@ def main():
         record["eval_trigger"] = "+".join(eval_reasons) if eval_reasons else None
 
         if eval_reasons:
-            if random_ref is None:
-                print(f"[round {rnd}] computing random baseline ONCE ({args.eval_runs} runs) ...",
+            evaluated_rounds.add(rnd)
+            ref_key = round(round_tl, 3)
+            if ref_key not in random_ref_cache:
+                print(f"[round {rnd}] computing random baseline ({args.eval_runs} runs) "
+                      f"at time_limit={round_tl:g} window={args.collect_last_sec:g} ...",
                       flush=True)
-                random_ref = eval_random_baseline(gpus, out_dir, args)
-                print(f"[baseline] random_mean={random_ref['eval_random_mean']:.4f} "
-                      f"random_minimum={random_ref['eval_random_min']:.4f} (fixed reference)",
+                random_ref_cache[ref_key] = eval_random_baseline(
+                    gpus, out_dir, args, time_limit=round_tl)
+                print(f"[baseline] random_mean={random_ref_cache[ref_key]['eval_random_mean']:.4f} "
+                      f"random_minimum={random_ref_cache[ref_key]['eval_random_min']:.4f} "
+                      f"(reference for time_limit={round_tl:g})",
                       flush=True)
+            random_ref = random_ref_cache[ref_key]
             print(f"[round {rnd}] evaluating ({args.eval_runs} policy runs; "
                   f"trigger={record['eval_trigger']}) ...", flush=True)
-            ev = eval_policy(gpus, out_dir, args, weights_path)
+            ev = eval_policy(gpus, out_dir, args, weights_path, time_limit=round_tl)
             ev.update(random_ref)
             record.update(ev)
             if ev["eval_policy_mean"] is not None and ev["eval_policy_mean"] < best_eval:
@@ -543,6 +702,27 @@ def main():
                   f"random_minimum={ev['eval_random_min']:.4f} "
                   f"gap_vs_random={gap} "
                   f"best_known={best_known:.4f}", flush=True)
+
+        # Apply the adaptive CL bump now (after this round was evaluated as the level
+        # end). Reset the per-level top1 memory + patience so the new level re-learns
+        # and earns its own checkpoint; mark the next round as the new level's start.
+        if cl_switch:
+            old_tl = current_tl
+            current_tl = min(current_tl + args.cl_increment, float(args.cl_max_time))
+            cl_level += 1
+            print(f"[CL-SWITCH @ round {rnd}] top1_lookahead plateaued: "
+                  f"{rounds_since_top1_improve} consecutive rounds with no new high "
+                  f"(level_best_top1={level_best_top1:.3f}). "
+                  f"time_limit {old_tl:g}s -> {current_tl:g}s -> CL level {cl_level}. "
+                  f"resetting per-level top1 memory + patience.", flush=True)
+            record["cl_switch"] = {
+                "round": rnd, "from_time_limit": old_tl, "to_time_limit": current_tl,
+                "new_level": cl_level, "rounds_no_improve": rounds_since_top1_improve,
+                "level_best_top1": level_best_top1,
+            }
+            level_best_top1 = float("-inf")
+            rounds_since_top1_improve = 0
+            pending_level_start = True
 
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
@@ -563,15 +743,22 @@ def main():
               f"eval_trigger={record['eval_trigger']} "
               f"random_top1_accuracy={stats['rand_top1']:.3f} "
               f"grad_norm={stats['grad_norm']:.3f} "
-              f"collected_steps={stats['n_update_steps']} "
-              f"update_epochs={stats.get('update_epochs', 1)} "
+              f"collected_in_window={stats.get('n_collected_in_window', stats['n_update_steps'])} "
+              f"skipped_low_spread={stats.get('n_filtered_low_spread', 0)} "
+              f"kept_for_update={stats['n_update_steps']} "
+              f"round_time_limit={round_tl:g} "
+              + (f"cl_level={record['cl_level']} "
+                 f"no_improve={record['cl_rounds_since_top1_improve']}/{args.cl_patience} "
+                 f"cl_switch={'YES' if cl_switch else 'no'} " if cl_adaptive else "")
+              + f"update_epochs={stats.get('update_epochs', 1)} "
               f"train_step_passes={stats.get('n_train_step_passes', stats['n_update_steps'])} "
               f"optimizer_steps={stats.get('n_opt_steps', 0)} "
               f"rollout_wall_seconds={roll_wall:.0f} "
               f"update_wall_seconds={update_wall:.1f}",
               flush=True)
 
-        manage_checkpoints(out_dir, rnd, args.save_every, save_weights)
+        manage_checkpoints(out_dir, rnd, args.save_every, save_weights,
+                           keep_rounds=evaluated_rounds)
         cleanup_round_artifacts(out_dir, rnd)
 
     print(f"[done] best eval policy cost={best_eval}")
